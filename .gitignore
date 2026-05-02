@@ -1,0 +1,12 @@
+raw_data/
+*.parquet
+*.pyc
+__pycache__/
+*.egg-info/
+.venv/
+.vscode/
+.DS_Store
+*.egg
+dist/
+build/
+referenceScriptsFromAnndataDependentVersion/

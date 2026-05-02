@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0","wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epykit"
+version = "0.1.0"
+description = "MVP Parquet methylation pipeline"
+authors = [ { name = "epykit user" } ]
+requires-python = ">=3.9"
+dependencies = [
+  "polars>=0.20.0",
+  "pyarrow>=11.0.0",
+  "numpy",
+  "scipy",
+  "numba",
+  "pyranges",
+  "statsmodels",
+]
+
+[project.scripts]
+epykit = "epykit.cli:main"

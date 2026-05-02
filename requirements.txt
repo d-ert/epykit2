@@ -1,0 +1,7 @@
+polars>=0.20.0
+pyarrow>=11.0.0
+numpy
+scipy
+numba
+pyranges
+statsmodels
