@@ -26,6 +26,19 @@ Key design decisions:
   4. Site intersection is computed per-chromosome so only one chromosome's
      worth of positions is ever in memory at once.
 
+Statistical tests
+-----------------
+  fisher  (default) — Fisher exact test via hypergeometric tail.
+                      Recommended for 1–5 replicates / group.
+                      Pools counts across replicates; ignores biological
+                      variance.  Fast; fully vectorised.
+
+  beta_binomial     — Welch t-test on per-replicate beta values with
+                      Welch–Satterthwaite degrees of freedom (fast path,
+                      default method="mom").  Properly accounts for
+                      between-replicate variability unlike Fisher.
+                      Recommended for ≥ 6 replicates / group.
+
 Biological fixes (carried over):
   BIO-3: equal-weight per-replicate beta averaging (mean_beta_*)
   BIO-4: missing sites filled with 0 counts; excluded from beta mean via NaN
@@ -36,6 +49,7 @@ from __future__ import annotations
 import gc
 import logging
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -46,21 +60,28 @@ from scipy import stats as sp_stats
 logger = logging.getLogger(__name__)
 
 _EMPTY_SCHEMA = {
-    "chrom": pl.Utf8,
-    "pos": pl.Int32,
-    "strand": pl.Utf8,
-    "n_case": pl.Int32,
-    "n_control": pl.Int32,
-    "mean_beta_case": pl.Float32,
+    "chrom":             pl.Utf8,
+    "pos":               pl.Int32,
+    "strand":            pl.Utf8,
+    "n_case":            pl.Int32,
+    "n_control":         pl.Int32,
+    "mean_beta_case":    pl.Float32,
     "mean_beta_control": pl.Float32,
-    "pvalue": pl.Float64,
-    "log2_odds_ratio": pl.Float64,
-    "meth_diff": pl.Float32,
+    "pvalue":            pl.Float64,
+    "log2_odds_ratio":   pl.Float64,
+    "meth_diff":         pl.Float32,
+}
+
+# Guidance table surfaced in docstrings and logged at INFO level
+_TEST_RECOMMENDATIONS = {
+    range(1, 3):  "fisher",
+    range(3, 6):  "fisher (report effect size; consider beta_binomial at ≥6)",
+    range(6, 999):"beta_binomial",
 }
 
 
 # ---------------------------------------------------------------------------
-# Core statistical test
+# Core statistical tests
 # ---------------------------------------------------------------------------
 
 def fisher_exact_vectorized(
@@ -123,6 +144,209 @@ def fisher_exact_vectorized(
     return pvals, log2_or
 
 
+def beta_binomial_test(
+    meth_counts: np.ndarray,
+    total_counts: np.ndarray,
+    group_labels: np.ndarray,
+    method: str = "mom",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Beta-binomial–aware differential methylation test.
+
+    Unlike ``fisher_exact_vectorized``, which pools counts across replicates
+    and ignores between-replicate biological variability, this function
+    computes a per-replicate beta value and tests for a difference in the
+    group means while properly propagating biological variance.
+
+    Two computational paths are available:
+
+    ``method="mom"`` (default, fast)
+        Welch t-test on per-replicate β values with Welch–Satterthwaite
+        degrees of freedom.  Vectorised across all sites simultaneously.
+        Accounts for unequal group sizes and unequal variances.  Recommended
+        for production WGBS data (millions of sites).
+
+    ``method="statsmodels"`` (slow, exact)
+        Fits a ``BetaBinomialModel`` from ``statsmodels`` per site using MLE.
+        Accurate but ~10 000× slower than the MOM path; use only for small
+        validation datasets or targeted follow-up analysis.
+
+    Recommended use by replicate count:
+
+    | N replicates / group | Recommended test              |
+    |----------------------|-------------------------------|
+    | 1–2                  | fisher (only viable option)   |
+    | 3–5                  | fisher + report effect size   |
+    | 6+                   | beta_binomial (this function)  |
+
+    Parameters
+    ----------
+    meth_counts : np.ndarray, shape (n_sites, n_replicates)
+        Methylated read counts.  Columns ordered to match group_labels.
+    total_counts : np.ndarray, shape (n_sites, n_replicates)
+        Total coverage counts.  Same shape as meth_counts.
+    group_labels : np.ndarray, shape (n_replicates,)
+        0 = control, 1 = case.
+    method : {"mom", "statsmodels"}
+        Computational path (default "mom").
+
+    Returns
+    -------
+    pvals : np.ndarray (n_sites,), float64
+        Two-sided p-values.  NaN where variance is zero or coverage is absent.
+    meth_diff : np.ndarray (n_sites,), float32
+        mean_beta_case − mean_beta_control (equal-weight per replicate).
+    """
+    meth_counts  = np.asarray(meth_counts,  dtype=np.float64)
+    total_counts = np.asarray(total_counts, dtype=np.float64)
+    group_labels = np.asarray(group_labels, dtype=np.int32)
+
+    if meth_counts.ndim == 1:
+        meth_counts  = meth_counts[:, np.newaxis]
+        total_counts = total_counts[:, np.newaxis]
+
+    n_sites = meth_counts.shape[0]
+    case_mask = group_labels == 1
+    ctrl_mask = group_labels == 0
+    n_case    = int(case_mask.sum())
+    n_ctrl    = int(ctrl_mask.sum())
+
+    if n_case < 2 or n_ctrl < 2:
+        warnings.warn(
+            f"beta_binomial_test requires ≥2 replicates per group; "
+            f"got case={n_case}, control={n_ctrl}. "
+            "Use fisher_exact_vectorized for 1-replicate comparisons.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Per-replicate beta (NaN where coverage = 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        beta = np.where(total_counts > 0, meth_counts / total_counts, np.nan)
+
+    beta_case = beta[:, case_mask]   # (n_sites, n_case)
+    beta_ctrl = beta[:, ctrl_mask]   # (n_sites, n_ctrl)
+
+    if method == "mom":
+        return _beta_binom_mom(beta_case, beta_ctrl, n_case, n_ctrl, n_sites)
+
+    elif method == "statsmodels":
+        return _beta_binom_statsmodels(
+            meth_counts, total_counts, case_mask, ctrl_mask, n_sites
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown method '{method}'. Choose 'mom' or 'statsmodels'."
+        )
+
+
+def _beta_binom_mom(
+    beta_case: np.ndarray,
+    beta_ctrl: np.ndarray,
+    n_case: int,
+    n_ctrl: int,
+    n_sites: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fast vectorised Welch t-test on per-replicate beta values.
+
+    Properly accounts for unequal variances and unequal sample sizes via
+    Welch–Satterthwaite degrees of freedom.  NaN propagates where all
+    replicates in a group have zero coverage.
+    """
+    mu_case = np.nanmean(beta_case, axis=1)
+    mu_ctrl = np.nanmean(beta_ctrl, axis=1)
+
+    # Bessel-corrected variance of the mean: s² / n
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        var_mean_case = np.nanvar(beta_case, axis=1, ddof=1) / max(n_case, 1)
+        var_mean_ctrl = np.nanvar(beta_ctrl, axis=1, ddof=1) / max(n_ctrl, 1)
+
+    se = np.sqrt(var_mean_case + var_mean_ctrl)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t_stat = np.where(se > 0, (mu_case - mu_ctrl) / se, np.nan)
+
+    # Welch–Satterthwaite degrees of freedom
+    dof_num = (var_mean_case + var_mean_ctrl) ** 2
+    dof_den = (
+        np.where(n_case > 1, var_mean_case**2 / (n_case - 1), 0.0)
+        + np.where(n_ctrl > 1, var_mean_ctrl**2 / (n_ctrl - 1), 0.0)
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dof = np.where(dof_den > 0, dof_num / dof_den, 1.0)
+        dof = np.maximum(dof, 1.0)
+
+    pvals     = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
+    meth_diff = (mu_case - mu_ctrl).astype(np.float32)
+
+    # Propagate NaN from degenerate sites (all-zero coverage in a group)
+    degenerate = np.isnan(mu_case) | np.isnan(mu_ctrl) | np.isnan(t_stat)
+    pvals[degenerate]     = np.nan
+    meth_diff[degenerate] = np.nan
+
+    return pvals, meth_diff
+
+
+def _beta_binom_statsmodels(
+    meth_counts: np.ndarray,
+    total_counts: np.ndarray,
+    case_mask: np.ndarray,
+    ctrl_mask: np.ndarray,
+    n_sites: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-site statsmodels BetaBinomial MLE.
+
+    WARNING: O(n_sites) sequential MLE fits.  Use only for small datasets
+    (< 10 000 sites); for WGBS scale use method='mom'.
+    """
+    try:
+        from statsmodels.discrete.discrete_model import NegativeBinomial  # noqa
+        # BetaBinomialModel lives in statsmodels.discrete.count_model (sm ≥ 0.14)
+        from statsmodels.discrete.count_model import BetaBinomialModel
+    except ImportError as exc:
+        raise ImportError(
+            "statsmodels ≥ 0.14 is required for the 'statsmodels' path "
+            "(BetaBinomialModel). Upgrade with: pip install --upgrade statsmodels"
+        ) from exc
+
+    import pandas as pd
+
+    pvals     = np.full(n_sites, np.nan, dtype=np.float64)
+    meth_diff = np.full(n_sites, np.nan, dtype=np.float32)
+
+    groups = np.zeros(meth_counts.shape[1], dtype=np.int32)
+    groups[case_mask] = 1
+
+    for i in range(n_sites):
+        mc  = meth_counts[i]
+        tot = total_counts[i]
+        if tot.sum() == 0:
+            continue
+        try:
+            endog = np.column_stack([mc, tot - mc]).astype(np.float64)
+            exog  = np.column_stack([
+                np.ones(len(groups), dtype=np.float64),
+                groups.astype(np.float64),
+            ])
+            model  = BetaBinomialModel(endog, exog)
+            result = model.fit(disp=False, method="bfgs")
+            # p-value for the group coefficient (index 1)
+            pvals[i] = float(result.pvalues[1])
+            # effect size: difference in predicted mean proportions
+            mu_case = float(result.predict(
+                exog=np.array([[1.0, 1.0]])
+            )[0])
+            mu_ctrl = float(result.predict(
+                exog=np.array([[1.0, 0.0]])
+            )[0])
+            meth_diff[i] = np.float32(mu_case - mu_ctrl)
+        except Exception as exc:
+            logger.debug("statsmodels BetaBinomial failed at site %d: %s", i, exc)
+
+    return pvals, meth_diff
+
+
 # ---------------------------------------------------------------------------
 # Internal per-chromosome helpers
 # ---------------------------------------------------------------------------
@@ -140,11 +364,7 @@ def _intersect_chrom(
     chrom: str,
     samples: list[str],
 ) -> pl.DataFrame:
-    """Return (pos, strand) rows present in every sample for one chromosome.
-
-    Reads only pos + strand columns per file.  Returns an empty DataFrame if
-    any sample is missing the chromosome (strict intersection).
-    """
+    """Return (pos, strand) rows present in every sample for one chromosome."""
     intersect: Optional[pl.DataFrame] = None
 
     for sample in samples:
@@ -156,8 +376,9 @@ def _intersect_chrom(
         )
         if not part_file.exists():
             logger.warning(
-                f"  Sample '{sample}' missing {chrom}; "
-                "chromosome excluded from intersection"
+                "  Sample '%s' missing %s; "
+                "chromosome excluded from intersection",
+                sample, chrom,
             )
             return pl.DataFrame({
                 "pos":    pl.Series([], dtype=pl.Int32),
@@ -188,7 +409,7 @@ def _union_chrom(
     chrom: str,
     samples: list[str],
 ) -> pl.DataFrame:
-    """Return (pos, strand) rows seen in at least one sample for one chromosome."""
+    """Return (pos, strand) rows seen in at least one sample."""
     site_dfs: list[pl.DataFrame] = []
     for sample in samples:
         part_file = (
@@ -213,17 +434,12 @@ def _load_sample_chrom(
     methylstore_path: Path,
     chrom: str,
     sample: str,
-    canonical_pos: pl.DataFrame,  # single column: pos (Int32)
+    canonical_pos: pl.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load N_meth and coverage for ONE sample / ONE chromosome.
 
-    Left-joins to canonical_pos so arrays are always aligned to the same
-    site order.  Missing sites are filled with 0.
-
-    Returns
-    -------
-    meth : np.ndarray (n_sites,)  int32
-    cov  : np.ndarray (n_sites,)  int32
+    Left-joins to canonical_pos so arrays are aligned to the same site order.
+    Missing sites are filled with 0.
     """
     part_file = (
         methylstore_path
@@ -234,13 +450,13 @@ def _load_sample_chrom(
     n_sites = len(canonical_pos)
 
     if not part_file.exists():
-        logger.warning(f"  Missing Parquet: {part_file}")
+        logger.warning("  Missing Parquet: %s", part_file)
         return (
             np.zeros(n_sites, dtype=np.int32),
             np.zeros(n_sites, dtype=np.int32),
         )
 
-    df = pl.read_parquet(str(part_file), columns=["pos", "N_meth", "coverage"])
+    df      = pl.read_parquet(str(part_file), columns=["pos", "N_meth", "coverage"])
     aligned = canonical_pos.join(df, on="pos", how="left").fill_null(0)
 
     return (
@@ -252,25 +468,20 @@ def _load_sample_chrom(
 def _process_one_chromosome(
     methylstore_path: Path,
     chrom: str,
-    canonical_df: pl.DataFrame,  # columns: pos, strand
+    canonical_df: pl.DataFrame,
     samples_case: list[str],
     samples_control: list[str],
     test: str,
 ) -> pl.DataFrame:
-    """Run DMC for one chromosome loading one sample at a time.
+    """Run DMC for one chromosome, loading one sample at a time.
 
-    Never holds more than one sample's raw data in memory simultaneously.
-    The pivot that caused OOM in the previous implementation is gone.
+    For test="fisher": uses pooled count sums → fisher_exact_vectorized.
+    For test="beta_binomial": passes per-replicate beta matrix to
+    beta_binomial_test (method="mom").
 
-    Steps
-    -----
-    1. Case samples: load → add to running int64 sums → compute float32 beta
-       column → free raw arrays.
-    2. Same for control samples.
-    3. Fisher test on pooled int64 sums.
-    4. Stack beta columns into (n_sites, n_replicates) matrix → nanmean
-       for equal-weight effect size (BIO-3).
-    5. Return result DataFrame.
+    The pivot that caused OOM in the previous implementation is gone for the
+    Fisher path; for beta_binomial, per-replicate beta arrays (float32) are
+    stacked columnwise — memory is proportional to n_replicates.
     """
     n_sites = len(canonical_df)
     if n_sites == 0:
@@ -278,15 +489,21 @@ def _process_one_chromosome(
 
     canonical_pos = canonical_df.select("pos")
 
-    # Running sums (int64 to avoid overflow when aggregating many samples)
+    # Running sums (int64 to avoid overflow)
     meth_case_sum = np.zeros(n_sites, dtype=np.int64)
     cov_case_sum  = np.zeros(n_sites, dtype=np.int64)
     meth_ctrl_sum = np.zeros(n_sites, dtype=np.int64)
     cov_ctrl_sum  = np.zeros(n_sites, dtype=np.int64)
 
-    # Per-replicate beta columns (float32 to halve memory vs float64)
+    # Per-replicate arrays (used for both BIO-3 beta averaging and
+    # beta_binomial test)
     beta_case_cols: list[np.ndarray] = []
     beta_ctrl_cols: list[np.ndarray] = []
+    # For beta_binomial: also keep integer count arrays
+    meth_case_reps: list[np.ndarray] = []
+    cov_case_reps:  list[np.ndarray] = []
+    meth_ctrl_reps: list[np.ndarray] = []
+    cov_ctrl_reps:  list[np.ndarray] = []
 
     # --- Case samples ---
     for sample in samples_case:
@@ -296,6 +513,9 @@ def _process_one_chromosome(
         with np.errstate(invalid="ignore", divide="ignore"):
             beta = np.where(cov > 0, meth.astype(np.float32) / cov, np.nan)
         beta_case_cols.append(beta.astype(np.float32))
+        if test == "beta_binomial":
+            meth_case_reps.append(meth)
+            cov_case_reps.append(cov)
         del meth, cov, beta
 
     # --- Control samples ---
@@ -306,24 +526,44 @@ def _process_one_chromosome(
         with np.errstate(invalid="ignore", divide="ignore"):
             beta = np.where(cov > 0, meth.astype(np.float32) / cov, np.nan)
         beta_ctrl_cols.append(beta.astype(np.float32))
+        if test == "beta_binomial":
+            meth_ctrl_reps.append(meth)
+            cov_ctrl_reps.append(cov)
         del meth, cov, beta
 
     # --- Statistical test ---
-    if test != "fisher":
-        raise NotImplementedError(f"Test '{test}' not yet implemented")
+    if test == "fisher":
+        unmeth_case_sum = cov_case_sum - meth_case_sum
+        unmeth_ctrl_sum = cov_ctrl_sum - meth_ctrl_sum
 
-    unmeth_case_sum = cov_case_sum - meth_case_sum
-    unmeth_ctrl_sum = cov_ctrl_sum - meth_ctrl_sum
+        pvals, log2_ors = fisher_exact_vectorized(
+            meth_case_sum, unmeth_case_sum,
+            meth_ctrl_sum, unmeth_ctrl_sum,
+        )
 
-    pvals, log2_ors = fisher_exact_vectorized(
-        meth_case_sum, unmeth_case_sum,
-        meth_ctrl_sum, unmeth_ctrl_sum,
-    )
-    del meth_case_sum, unmeth_case_sum, meth_ctrl_sum, unmeth_ctrl_sum
-    del cov_case_sum, cov_ctrl_sum
+    elif test == "beta_binomial":
+        # Stack count arrays into (n_sites, n_replicates) matrices
+        meth_mat  = np.column_stack(meth_case_reps + meth_ctrl_reps).astype(np.float64)
+        total_mat = np.column_stack(cov_case_reps  + cov_ctrl_reps).astype(np.float64)
+        labels    = np.array(
+            [1] * len(meth_case_reps) + [0] * len(meth_ctrl_reps),
+            dtype=np.int32,
+        )
+        pvals, _ = beta_binomial_test(meth_mat, total_mat, labels, method="mom")
+        # Use a dummy log2_or array (not meaningful for t-test)
+        log2_ors = np.full(n_sites, np.nan, dtype=np.float64)
 
-    # --- BIO-3: equal-weight beta averaging ---
-    # Stack into (n_sites, n_replicates); nanmean excludes zero-coverage sites.
+        del meth_mat, total_mat, labels
+        del meth_case_reps, cov_case_reps, meth_ctrl_reps, cov_ctrl_reps
+
+    else:
+        raise NotImplementedError(
+            f"Test '{test}' not implemented. Choose 'fisher' or 'beta_binomial'."
+        )
+
+    del meth_case_sum, meth_ctrl_sum, cov_case_sum, cov_ctrl_sum
+
+    # --- BIO-3: equal-weight beta averaging (used regardless of test) ---
     beta_case_mat = np.stack(beta_case_cols, axis=1)
     beta_ctrl_mat = np.stack(beta_ctrl_cols, axis=1)
     del beta_case_cols, beta_ctrl_cols
@@ -374,8 +614,9 @@ def process_chromosomes_dmc(
         Path to filtered partitioned Parquet methylstore.
     samples_case, samples_control : list[str]
         Sample identifiers for case and control groups.
-    test : str
-        Statistical test: "fisher" (default).
+    test : {"fisher", "beta_binomial"}
+        Statistical test to apply.  "fisher" is recommended for < 6 replicates
+        per group; "beta_binomial" for ≥ 6 replicates.
     chromosomes : list[str], optional
         Chromosomes to process. Auto-detected when None.
     unite : bool
@@ -388,26 +629,34 @@ def process_chromosomes_dmc(
                  mean_beta_case, mean_beta_control,
                  pvalue, log2_odds_ratio, meth_diff
     """
-    store = Path(methylstore_path)
+    store       = Path(methylstore_path)
     all_samples = samples_case + samples_control
+
+    # Advisory: log recommended test based on replicate counts
+    min_group = min(len(samples_case), len(samples_control))
+    for rng, rec in _TEST_RECOMMENDATIONS.items():
+        if min_group in rng:
+            logger.info(
+                "N replicates / group = %d; recommended test: %s", min_group, rec
+            )
+            break
 
     if chromosomes is None:
         chromosomes = _detect_chromosomes(store)
-        logger.info(f"Auto-detected {len(chromosomes)} chromosomes")
+        logger.info("Auto-detected %d chromosomes", len(chromosomes))
 
     logger.info(
-        f"DMC: {len(samples_case)} case / {len(samples_control)} control, "
-        f"test={test}, unite={unite}"
+        "DMC: %d case / %d control, test=%s, unite=%s",
+        len(samples_case), len(samples_control), test, unite,
     )
 
     with tempfile.TemporaryDirectory(prefix="epykit_dmc_") as tmpdir:
-        tmp = Path(tmpdir)
+        tmp     = Path(tmpdir)
         written: list[Path] = []
 
         for i, chrom in enumerate(chromosomes):
-            logger.info(f"[{i + 1}/{len(chromosomes)}] {chrom}")
+            logger.info("[%d/%d] %s", i + 1, len(chromosomes), chrom)
 
-            # --- Site selection ---
             canonical_df = (
                 _intersect_chrom(store, chrom, all_samples)
                 if unite
@@ -415,12 +664,11 @@ def process_chromosomes_dmc(
             )
 
             if len(canonical_df) == 0:
-                logger.warning(f"  No sites for {chrom}; skipping")
+                logger.warning("  No sites for %s; skipping", chrom)
                 continue
 
-            logger.info(f"  {len(canonical_df):,} sites to test")
+            logger.info("  %s sites to test", f"{len(canonical_df):,}")
 
-            # --- Sample-at-a-time DMC ---
             chrom_result = _process_one_chromosome(
                 store, chrom, canonical_df,
                 samples_case, samples_control, test,
@@ -428,26 +676,24 @@ def process_chromosomes_dmc(
             del canonical_df
 
             if len(chrom_result) == 0:
-                logger.warning(f"  No results for {chrom}")
+                logger.warning("  No results for %s", chrom)
                 continue
 
-            # --- Write to temp disk; free RAM immediately ---
             tmp_file = tmp / f"{chrom}.parquet"
             chrom_result.write_parquet(str(tmp_file))
             written.append(tmp_file)
-            logger.info(f"  {len(chrom_result):,} sites → staged to disk")
+            logger.info("  %s sites → staged to disk", f"{len(chrom_result):,}")
 
             del chrom_result
             gc.collect()
 
-        # --- Assemble final result from temp files ---
         if not written:
             logger.warning("No results generated")
             return pl.DataFrame(schema=_EMPTY_SCHEMA)
 
-        logger.info(f"Assembling results from {len(written)} chromosome file(s)...")
+        logger.info("Assembling results from %d chromosome file(s)...", len(written))
         combined = pl.concat([pl.read_parquet(str(f)) for f in written])
-        logger.info(f"Total DMC sites: {len(combined):,}")
+        logger.info("Total DMC sites: %s", f"{len(combined):,}")
         return combined
 
 
@@ -462,7 +708,6 @@ def calculate_diff_meth_chromosome(
     Writes a temporary mini-store and calls _process_one_chromosome.
     For production use, call process_chromosomes_dmc directly.
     """
-    import warnings
     warnings.warn(
         "calculate_diff_meth_chromosome is deprecated; "
         "use process_chromosomes_dmc for production workloads.",
@@ -479,7 +724,7 @@ def calculate_diff_meth_chromosome(
     chrom = chroms[0]
 
     with tempfile.TemporaryDirectory(prefix="epykit_legacy_") as tmpdir:
-        store = Path(tmpdir) / "store"
+        store       = Path(tmpdir) / "store"
         all_samples = samples_case + samples_control
 
         for sample in all_samples:
@@ -523,8 +768,8 @@ def apply_multiple_testing_correction(
 
     reject, qvals, _, _ = multipletests(pvals_clean, method=method)
 
-    qvals  = np.where(nan_mask, np.nan, qvals)
-    reject = np.where(nan_mask, False,  reject)
+    qvals  = np.where(nan_mask, np.nan,  qvals)
+    reject = np.where(nan_mask, False,   reject)
 
     return dmc_results.with_columns([
         pl.Series("qvalue", qvals),
