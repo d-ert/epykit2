@@ -15,6 +15,7 @@ dependencies = [
   "scipy",
   "numba",
   "pyranges",
+  "pyfaidx",
   "statsmodels",
 ]
 

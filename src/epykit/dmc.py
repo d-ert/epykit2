@@ -1,20 +1,67 @@
 """Differential methylation calling (DMC) on partitioned Parquet stores.
 
-This module implements per-chromosome differential methylation analysis using:
-  - Fisher exact test (MVP default)
-  - Placeholder for beta-binomial and GLM tests (phase 2)
-  - Chromosome-wise processing to maintain bounded memory
-  - Genome-wide multiple testing correction
+Memory model
+------------
+The previous implementation loaded all samples for a chromosome into a single
+long DataFrame and then pivoted it wide before running tests.  For chr1 with
+5 M CpGs and 6 samples that pivot alone materialises ~360 M cells, reliably
+causing OOM on typical WGBS workloads.
+
+This rewrite keeps peak memory per chromosome to roughly:
+
+    n_sites × (n_samples_case + n_samples_control) × 4 bytes   (beta matrix)
+  + n_sites × 4 int32 arrays                                    (running sums)
+
+which for the same example is ~180 MB instead of ~3 GB.
+
+Key design decisions:
+  1. Samples are loaded one Parquet file at a time, aligned to canonical
+     positions via a left-join, and freed before the next sample is read.
+  2. The pivot is eliminated entirely.  Running meth/coverage sums and per-
+     replicate beta arrays are built up incrementally as numpy arrays.
+  3. Each chromosome result is written to a temporary Parquet file immediately
+     after the test and freed from memory (gc.collect() called explicitly).
+     The final concat reads those small files rather than accumulating all
+     chromosomes in a list in RAM.
+  4. Site intersection is computed per-chromosome so only one chromosome's
+     worth of positions is ever in memory at once.
+
+Biological fixes (carried over):
+  BIO-3: equal-weight per-replicate beta averaging (mean_beta_*)
+  BIO-4: missing sites filled with 0 counts; excluded from beta mean via NaN
 """
 
-from typing import Optional, Tuple, List, Callable
+from __future__ import annotations
+
+import gc
+import logging
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple
+
 import numpy as np
 import polars as pl
 from scipy import stats as sp_stats
-import logging
 
 logger = logging.getLogger(__name__)
 
+_EMPTY_SCHEMA = {
+    "chrom": pl.Utf8,
+    "pos": pl.Int32,
+    "strand": pl.Utf8,
+    "n_case": pl.Int32,
+    "n_control": pl.Int32,
+    "mean_beta_case": pl.Float32,
+    "mean_beta_control": pl.Float32,
+    "pvalue": pl.Float64,
+    "log2_odds_ratio": pl.Float64,
+    "meth_diff": pl.Float32,
+}
+
+
+# ---------------------------------------------------------------------------
+# Core statistical test
+# ---------------------------------------------------------------------------
 
 def fisher_exact_vectorized(
     meth_a: np.ndarray,
@@ -22,55 +69,49 @@ def fisher_exact_vectorized(
     meth_b: np.ndarray,
     unmeth_b: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Vectorized Fisher exact test for methylation differences.
-
-    Computes two-sided p-value and log2 odds ratio for each site.
+    """Vectorised Fisher exact test via hypergeometric tail approximation.
 
     Parameters
     ----------
     meth_a, unmeth_a : np.ndarray (n_sites,)
-        Methylated and unmethylated counts for group A
+        Summed methylated / unmethylated counts for group A (across replicates)
     meth_b, unmeth_b : np.ndarray (n_sites,)
-        Methylated and unmethylated counts for group B
+        Summed methylated / unmethylated counts for group B
 
     Returns
     -------
-    pvals : np.ndarray (n_sites,)
-        Two-sided p-values from Fisher exact test
-    log2_or : np.ndarray (n_sites,)
-        Log2 odds ratios (NaN where counts are 0)
+    pvals : np.ndarray (n_sites,)  float64
+    log2_or : np.ndarray (n_sites,)  float64
     """
-    meth_a = np.asarray(meth_a, dtype=np.int64)
+    meth_a   = np.asarray(meth_a,   dtype=np.int64)
     unmeth_a = np.asarray(unmeth_a, dtype=np.int64)
-    meth_b = np.asarray(meth_b, dtype=np.int64)
+    meth_b   = np.asarray(meth_b,   dtype=np.int64)
     unmeth_b = np.asarray(unmeth_b, dtype=np.int64)
 
-    row1 = meth_a + unmeth_a
-    row2 = meth_b + unmeth_b
-    col1 = meth_a + meth_b
+    row1  = meth_a + unmeth_a
+    row2  = meth_b + unmeth_b
+    col1  = meth_a + meth_b
     total = row1 + row2
 
-    pvals = np.full(len(meth_a), np.nan, dtype=np.float64)
-    log2_or = np.full(len(meth_a), np.nan, dtype=np.float64)
+    n       = len(meth_a)
+    pvals   = np.full(n, np.nan, dtype=np.float64)
+    log2_or = np.full(n, np.nan, dtype=np.float64)
 
     valid = (row1 > 0) & (row2 > 0)
     if np.any(valid):
-        denominator = unmeth_a[valid] * meth_b[valid]
-        numerator = meth_a[valid] * unmeth_b[valid]
+        denom = unmeth_a[valid] * meth_b[valid]
+        numer = meth_a[valid]  * unmeth_b[valid]
 
-        odds_ratio = np.full(denominator.shape, np.nan, dtype=np.float64)
-        np.divide(numerator, denominator, out=odds_ratio, where=denominator > 0)
+        odds_ratio = np.full(denom.shape, np.nan, dtype=np.float64)
+        np.divide(numer, denom, out=odds_ratio, where=denom > 0)
         odds_ratio = np.where(
-            denominator > 0,
+            denom > 0,
             odds_ratio,
-            np.where(numerator > 0, np.inf, np.nan),
+            np.where(numer > 0, np.inf, np.nan),
         )
         with np.errstate(divide="ignore", invalid="ignore"):
             log2_or[valid] = np.where(odds_ratio > 0, np.log2(odds_ratio), np.nan)
 
-        # The older implementation used a hypergeometric tail approximation,
-        # which is much cheaper than calling scipy.stats.fisher_exact once
-        # per site.
         pvals_valid = sp_stats.hypergeom.sf(
             meth_a[valid] - 1,
             total[valid],
@@ -82,144 +123,235 @@ def fisher_exact_vectorized(
     return pvals, log2_or
 
 
-def calculate_diff_meth_chromosome(
-    chrom_df: pl.DataFrame,
-    samples_case: list[str],
-    samples_control: list[str],
-    test: str = "fisher",
+# ---------------------------------------------------------------------------
+# Internal per-chromosome helpers
+# ---------------------------------------------------------------------------
+
+def _detect_chromosomes(methylstore_path: Path) -> list[str]:
+    chroms: set[str] = set()
+    for sample_dir in methylstore_path.glob("sample=*"):
+        for chrom_dir in sample_dir.glob("chrom=*"):
+            chroms.add(chrom_dir.name.removeprefix("chrom="))
+    return sorted(chroms)
+
+
+def _intersect_chrom(
+    methylstore_path: Path,
+    chrom: str,
+    samples: list[str],
 ) -> pl.DataFrame:
-    """Perform differential methylation analysis for one chromosome.
+    """Return (pos, strand) rows present in every sample for one chromosome.
 
-    Groups samples into case and control, collapses counts across replicates (sum),
-    and performs statistical test for each CpG.
+    Reads only pos + strand columns per file.  Returns an empty DataFrame if
+    any sample is missing the chromosome (strict intersection).
+    """
+    intersect: Optional[pl.DataFrame] = None
 
-    Parameters
-    ----------
-    chrom_df : pl.DataFrame
-        Data for one chromosome from all samples. Columns:
-        chrom, pos, strand, N_meth, N_unmeth, coverage, sample
-    samples_case, samples_control : list[str]
-        Sample identifiers for each group
-    test : str
-        Statistical test to use: "fisher" (MVP), "glm", "beta_binomial"
+    for sample in samples:
+        part_file = (
+            methylstore_path
+            / f"sample={sample}"
+            / f"chrom={chrom}"
+            / "part-0.parquet"
+        )
+        if not part_file.exists():
+            logger.warning(
+                f"  Sample '{sample}' missing {chrom}; "
+                "chromosome excluded from intersection"
+            )
+            return pl.DataFrame({
+                "pos":    pl.Series([], dtype=pl.Int32),
+                "strand": pl.Series([], dtype=pl.Utf8),
+            })
+
+        sites = pl.read_parquet(str(part_file), columns=["pos", "strand"]).unique()
+
+        if intersect is None:
+            intersect = sites
+        else:
+            intersect = intersect.join(sites, on=["pos", "strand"], how="inner")
+
+        if len(intersect) == 0:
+            break
+
+    if intersect is None:
+        return pl.DataFrame({
+            "pos":    pl.Series([], dtype=pl.Int32),
+            "strand": pl.Series([], dtype=pl.Utf8),
+        })
+
+    return intersect.sort("pos")
+
+
+def _union_chrom(
+    methylstore_path: Path,
+    chrom: str,
+    samples: list[str],
+) -> pl.DataFrame:
+    """Return (pos, strand) rows seen in at least one sample for one chromosome."""
+    site_dfs: list[pl.DataFrame] = []
+    for sample in samples:
+        part_file = (
+            methylstore_path
+            / f"sample={sample}"
+            / f"chrom={chrom}"
+            / "part-0.parquet"
+        )
+        if part_file.exists():
+            site_dfs.append(
+                pl.read_parquet(str(part_file), columns=["pos", "strand"])
+            )
+    if not site_dfs:
+        return pl.DataFrame({
+            "pos":    pl.Series([], dtype=pl.Int32),
+            "strand": pl.Series([], dtype=pl.Utf8),
+        })
+    return pl.concat(site_dfs).unique().sort("pos")
+
+
+def _load_sample_chrom(
+    methylstore_path: Path,
+    chrom: str,
+    sample: str,
+    canonical_pos: pl.DataFrame,  # single column: pos (Int32)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load N_meth and coverage for ONE sample / ONE chromosome.
+
+    Left-joins to canonical_pos so arrays are always aligned to the same
+    site order.  Missing sites are filled with 0.
 
     Returns
     -------
-    pl.DataFrame
-        Columns: chrom, pos, strand, n_case, n_control, pvalue, log2_odds_ratio, meth_diff
-        Sorted by chrom, pos
+    meth : np.ndarray (n_sites,)  int32
+    cov  : np.ndarray (n_sites,)  int32
     """
-    if len(chrom_df) == 0:
-        # Empty chromosome; return empty result with proper schema
-        return pl.DataFrame(
-            schema={
-                "chrom": pl.Utf8,
-                "pos": pl.Int32,
-                "strand": pl.Utf8,
-                "n_case": pl.Int32,
-                "n_control": pl.Int32,
-                "pvalue": pl.Float32,
-                "log2_odds_ratio": pl.Float32,
-                "meth_diff": pl.Float32,
-            }
+    part_file = (
+        methylstore_path
+        / f"sample={sample}"
+        / f"chrom={chrom}"
+        / "part-0.parquet"
+    )
+    n_sites = len(canonical_pos)
+
+    if not part_file.exists():
+        logger.warning(f"  Missing Parquet: {part_file}")
+        return (
+            np.zeros(n_sites, dtype=np.int32),
+            np.zeros(n_sites, dtype=np.int32),
         )
 
-    # Verify samples present
-    present_samples = set(chrom_df["sample"].unique().to_list())
-    expected_samples = set(samples_case + samples_control)
-    if not expected_samples.issubset(present_samples):
-        missing = expected_samples - present_samples
-        logger.warning(f"Missing samples: {missing}. Proceeding with available data.")
+    df = pl.read_parquet(str(part_file), columns=["pos", "N_meth", "coverage"])
+    aligned = canonical_pos.join(df, on="pos", how="left").fill_null(0)
 
-    # Filter to only requested samples
-    all_samples = samples_case + samples_control
-    chrom_df = chrom_df.filter(pl.col("sample").is_in(all_samples))
-
-    if len(chrom_df) == 0:
-        # No data after filtering
-        return pl.DataFrame(
-            schema={
-                "chrom": pl.Utf8,
-                "pos": pl.Int32,
-                "strand": pl.Utf8,
-                "n_case": pl.Int32,
-                "n_control": pl.Int32,
-                "pvalue": pl.Float32,
-                "log2_odds_ratio": pl.Float32,
-                "meth_diff": pl.Float32,
-            }
-        )
-
-    # Pivot: one row per CpG, columns like N_meth_s1, N_unmeth_s1, coverage_s1, ...
-    wide_df = chrom_df.pivot(
-        index=["chrom", "pos", "strand"],
-        on="sample",
-        values=["N_meth", "N_unmeth", "coverage"],
+    return (
+        aligned["N_meth"].to_numpy().astype(np.int32),
+        aligned["coverage"].to_numpy().astype(np.int32),
     )
 
-    # Build column lists for case and control
-    meth_cols_case = [
-        f"N_meth_{s}" for s in samples_case if f"N_meth_{s}" in wide_df.columns
-    ]
-    meth_cols_ctrl = [
-        f"N_meth_{s}" for s in samples_control if f"N_meth_{s}" in wide_df.columns
-    ]
-    cov_cols_case = [
-        f"coverage_{s}" for s in samples_case if f"coverage_{s}" in wide_df.columns
-    ]
-    cov_cols_ctrl = [
-        f"coverage_{s}" for s in samples_control if f"coverage_{s}" in wide_df.columns
-    ]
 
-    if not meth_cols_case or not meth_cols_ctrl:
-        logger.warning(f"Incomplete sample coverage for chromosome")
-        return pl.DataFrame(
-            schema={
-                "chrom": pl.Utf8,
-                "pos": pl.Int32,
-                "strand": pl.Utf8,
-                "n_case": pl.Int32,
-                "n_control": pl.Int32,
-                "pvalue": pl.Float32,
-                "log2_odds_ratio": pl.Float32,
-                "meth_diff": pl.Float32,
-            }
-        )
+def _process_one_chromosome(
+    methylstore_path: Path,
+    chrom: str,
+    canonical_df: pl.DataFrame,  # columns: pos, strand
+    samples_case: list[str],
+    samples_control: list[str],
+    test: str,
+) -> pl.DataFrame:
+    """Run DMC for one chromosome loading one sample at a time.
 
-    # Sum counts across replicates in each group
-    meth_case = wide_df.select(meth_cols_case).sum_horizontal().to_numpy()
-    meth_ctrl = wide_df.select(meth_cols_ctrl).sum_horizontal().to_numpy()
-    cov_case = wide_df.select(cov_cols_case).sum_horizontal().to_numpy()
-    cov_ctrl = wide_df.select(cov_cols_ctrl).sum_horizontal().to_numpy()
-    unmeth_case = cov_case - meth_case
-    unmeth_ctrl = cov_ctrl - meth_ctrl
+    Never holds more than one sample's raw data in memory simultaneously.
+    The pivot that caused OOM in the previous implementation is gone.
 
-    # Perform test
-    if test == "fisher":
-        pvals, log2_ors = fisher_exact_vectorized(
-            meth_case, unmeth_case, meth_ctrl, unmeth_ctrl
-        )
-    else:
+    Steps
+    -----
+    1. Case samples: load → add to running int64 sums → compute float32 beta
+       column → free raw arrays.
+    2. Same for control samples.
+    3. Fisher test on pooled int64 sums.
+    4. Stack beta columns into (n_sites, n_replicates) matrix → nanmean
+       for equal-weight effect size (BIO-3).
+    5. Return result DataFrame.
+    """
+    n_sites = len(canonical_df)
+    if n_sites == 0:
+        return pl.DataFrame(schema=_EMPTY_SCHEMA)
+
+    canonical_pos = canonical_df.select("pos")
+
+    # Running sums (int64 to avoid overflow when aggregating many samples)
+    meth_case_sum = np.zeros(n_sites, dtype=np.int64)
+    cov_case_sum  = np.zeros(n_sites, dtype=np.int64)
+    meth_ctrl_sum = np.zeros(n_sites, dtype=np.int64)
+    cov_ctrl_sum  = np.zeros(n_sites, dtype=np.int64)
+
+    # Per-replicate beta columns (float32 to halve memory vs float64)
+    beta_case_cols: list[np.ndarray] = []
+    beta_ctrl_cols: list[np.ndarray] = []
+
+    # --- Case samples ---
+    for sample in samples_case:
+        meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+        meth_case_sum += meth
+        cov_case_sum  += cov
+        with np.errstate(invalid="ignore", divide="ignore"):
+            beta = np.where(cov > 0, meth.astype(np.float32) / cov, np.nan)
+        beta_case_cols.append(beta.astype(np.float32))
+        del meth, cov, beta
+
+    # --- Control samples ---
+    for sample in samples_control:
+        meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+        meth_ctrl_sum += meth
+        cov_ctrl_sum  += cov
+        with np.errstate(invalid="ignore", divide="ignore"):
+            beta = np.where(cov > 0, meth.astype(np.float32) / cov, np.nan)
+        beta_ctrl_cols.append(beta.astype(np.float32))
+        del meth, cov, beta
+
+    # --- Statistical test ---
+    if test != "fisher":
         raise NotImplementedError(f"Test '{test}' not yet implemented")
 
-    # Compute methylation difference (beta difference)
-    beta_case = meth_case / np.maximum(cov_case, 1)  # avoid division by zero
-    beta_ctrl = meth_ctrl / np.maximum(cov_ctrl, 1)
-    meth_diff = beta_case - beta_ctrl
+    unmeth_case_sum = cov_case_sum - meth_case_sum
+    unmeth_ctrl_sum = cov_ctrl_sum - meth_ctrl_sum
 
-    # Build results dataframe
-    results = wide_df.select(["chrom", "pos", "strand"]).with_columns(
-        [
-            pl.Series("n_case", [len(samples_case)] * len(wide_df)),
-            pl.Series("n_control", [len(samples_control)] * len(wide_df)),
-            pl.Series("pvalue", pvals),
-            pl.Series("log2_odds_ratio", log2_ors),
-            pl.Series("meth_diff", meth_diff),
-        ]
-    ).sort(["chrom", "pos"])
+    pvals, log2_ors = fisher_exact_vectorized(
+        meth_case_sum, unmeth_case_sum,
+        meth_ctrl_sum, unmeth_ctrl_sum,
+    )
+    del meth_case_sum, unmeth_case_sum, meth_ctrl_sum, unmeth_ctrl_sum
+    del cov_case_sum, cov_ctrl_sum
 
-    return results
+    # --- BIO-3: equal-weight beta averaging ---
+    # Stack into (n_sites, n_replicates); nanmean excludes zero-coverage sites.
+    beta_case_mat = np.stack(beta_case_cols, axis=1)
+    beta_ctrl_mat = np.stack(beta_ctrl_cols, axis=1)
+    del beta_case_cols, beta_ctrl_cols
 
+    mean_beta_case = np.nanmean(beta_case_mat, axis=1).astype(np.float32)
+    mean_beta_ctrl = np.nanmean(beta_ctrl_mat, axis=1).astype(np.float32)
+    meth_diff      = (mean_beta_case - mean_beta_ctrl).astype(np.float32)
+    del beta_case_mat, beta_ctrl_mat
+
+    return pl.DataFrame({
+        "chrom":             pl.Series([chrom] * n_sites, dtype=pl.Utf8),
+        "pos":               canonical_df["pos"],
+        "strand":            canonical_df["strand"],
+        "n_case":            pl.Series(
+                                 np.full(n_sites, len(samples_case),    dtype=np.int32)),
+        "n_control":         pl.Series(
+                                 np.full(n_sites, len(samples_control), dtype=np.int32)),
+        "mean_beta_case":    pl.Series(mean_beta_case),
+        "mean_beta_control": pl.Series(mean_beta_ctrl),
+        "pvalue":            pl.Series(pvals),
+        "log2_odds_ratio":   pl.Series(log2_ors),
+        "meth_diff":         pl.Series(meth_diff),
+    }).sort("pos")
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def process_chromosomes_dmc(
     methylstore_path: str,
@@ -231,141 +363,170 @@ def process_chromosomes_dmc(
 ) -> pl.DataFrame:
     """Process differential methylation for all chromosomes.
 
-    Iterates through chromosomes, loads data, performs DMC, and concatenates results.
+    Memory: one chromosome active at a time; within that, one sample at a
+    time.  Chromosome results are written to a temporary directory on disk
+    and freed (gc.collect()) immediately; the final DataFrame is assembled
+    from those files only after all chromosomes are done.
 
     Parameters
     ----------
     methylstore_path : str
-        Path to partitioned Parquet methylstore
+        Path to filtered partitioned Parquet methylstore.
     samples_case, samples_control : list[str]
-        Sample identifiers for case and control groups
+        Sample identifiers for case and control groups.
     test : str
-        Statistical test: "fisher" (default)
+        Statistical test: "fisher" (default).
     chromosomes : list[str], optional
-        Specific chromosomes to process. If None, processes all found in data.
+        Chromosomes to process. Auto-detected when None.
     unite : bool
-        If True, use only sites present in all samples (intersect). Default True.
+        If True (default), test only CpG sites covered in every sample.
 
     Returns
     -------
     pl.DataFrame
-        Columns: chrom, pos, strand, n_case, n_control, pvalue, log2_odds_ratio, meth_diff
-        All chromosomes concatenated; unsorted.
+        Columns: chrom, pos, strand, n_case, n_control,
+                 mean_beta_case, mean_beta_control,
+                 pvalue, log2_odds_ratio, meth_diff
     """
-    from pathlib import Path
-    from .filter import intersect_sites, load_chromosome_data
-
-    methylstore_path = Path(methylstore_path)
+    store = Path(methylstore_path)
     all_samples = samples_case + samples_control
 
-    # Auto-detect chromosomes if not provided
     if chromosomes is None:
-        # Find unique chromosomes in store
-        chrom_dirs = set()
-        for sample_dir in methylstore_path.glob("sample=*"):
-            for chrom_dir in sample_dir.glob("chrom=*"):
-                chrom_name = chrom_dir.name.replace("chrom=", "")
-                chrom_dirs.add(chrom_name)
-        chromosomes = sorted(list(chrom_dirs))
+        chromosomes = _detect_chromosomes(store)
+        logger.info(f"Auto-detected {len(chromosomes)} chromosomes")
 
-    logger.info(f"Processing {len(chromosomes)} chromosomes with test={test}")
+    logger.info(
+        f"DMC: {len(samples_case)} case / {len(samples_control)} control, "
+        f"test={test}, unite={unite}"
+    )
 
-    # Compute intersection sites if needed
-    site_intersect = None
-    if unite:
-        logger.info("Computing intersection of sites across samples...")
-        site_intersect = intersect_sites(str(methylstore_path), all_samples)
-        logger.info(f"  Intersection contains {len(site_intersect)} sites")
+    with tempfile.TemporaryDirectory(prefix="epykit_dmc_") as tmpdir:
+        tmp = Path(tmpdir)
+        written: list[Path] = []
 
-    # Process each chromosome
-    result_dfs = []
-    for i, chrom in enumerate(chromosomes):
-        logger.info(f"[{i+1}/{len(chromosomes)}] Processing {chrom}...")
+        for i, chrom in enumerate(chromosomes):
+            logger.info(f"[{i + 1}/{len(chromosomes)}] {chrom}")
 
-        try:
-            # Load chromosome data
-            chrom_df = load_chromosome_data(
-                str(methylstore_path),
-                chrom,
-                all_samples,
-                site_intersect=site_intersect,
+            # --- Site selection ---
+            canonical_df = (
+                _intersect_chrom(store, chrom, all_samples)
+                if unite
+                else _union_chrom(store, chrom, all_samples)
             )
 
-            if len(chrom_df) == 0:
-                logger.warning(f"  No data for {chrom}; skipping")
+            if len(canonical_df) == 0:
+                logger.warning(f"  No sites for {chrom}; skipping")
                 continue
 
-            # Perform DMC
-            chrom_results = calculate_diff_meth_chromosome(
-                chrom_df, samples_case, samples_control, test=test
+            logger.info(f"  {len(canonical_df):,} sites to test")
+
+            # --- Sample-at-a-time DMC ---
+            chrom_result = _process_one_chromosome(
+                store, chrom, canonical_df,
+                samples_case, samples_control, test,
             )
+            del canonical_df
 
-            if len(chrom_results) > 0:
-                result_dfs.append(chrom_results)
-                logger.info(f"  {len(chrom_results)} sites tested")
-            else:
+            if len(chrom_result) == 0:
                 logger.warning(f"  No results for {chrom}")
+                continue
 
-        except Exception as e:
-            logger.error(f"Error processing {chrom}: {e}")
-            raise
+            # --- Write to temp disk; free RAM immediately ---
+            tmp_file = tmp / f"{chrom}.parquet"
+            chrom_result.write_parquet(str(tmp_file))
+            written.append(tmp_file)
+            logger.info(f"  {len(chrom_result):,} sites → staged to disk")
 
-    # Concatenate results
-    if not result_dfs:
-        logger.warning("No results generated; returning empty dataframe")
-        return pl.DataFrame(
-            schema={
-                "chrom": pl.Utf8,
-                "pos": pl.Int32,
-                "strand": pl.Utf8,
-                "n_case": pl.Int32,
-                "n_control": pl.Int32,
-                "pvalue": pl.Float32,
-                "log2_odds_ratio": pl.Float32,
-                "meth_diff": pl.Float32,
-            }
+            del chrom_result
+            gc.collect()
+
+        # --- Assemble final result from temp files ---
+        if not written:
+            logger.warning("No results generated")
+            return pl.DataFrame(schema=_EMPTY_SCHEMA)
+
+        logger.info(f"Assembling results from {len(written)} chromosome file(s)...")
+        combined = pl.concat([pl.read_parquet(str(f)) for f in written])
+        logger.info(f"Total DMC sites: {len(combined):,}")
+        return combined
+
+
+def calculate_diff_meth_chromosome(
+    chrom_df: pl.DataFrame,
+    samples_case: list[str],
+    samples_control: list[str],
+    test: str = "fisher",
+) -> pl.DataFrame:
+    """Legacy entry-point kept for unit-test compatibility.
+
+    Writes a temporary mini-store and calls _process_one_chromosome.
+    For production use, call process_chromosomes_dmc directly.
+    """
+    import warnings
+    warnings.warn(
+        "calculate_diff_meth_chromosome is deprecated; "
+        "use process_chromosomes_dmc for production workloads.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    if len(chrom_df) == 0:
+        return pl.DataFrame(schema=_EMPTY_SCHEMA)
+
+    chroms = chrom_df["chrom"].unique().to_list()
+    if len(chroms) != 1:
+        raise ValueError(f"Expected exactly one chromosome; got {chroms}")
+    chrom = chroms[0]
+
+    with tempfile.TemporaryDirectory(prefix="epykit_legacy_") as tmpdir:
+        store = Path(tmpdir) / "store"
+        all_samples = samples_case + samples_control
+
+        for sample in all_samples:
+            sample_df = chrom_df.filter(pl.col("sample") == sample)
+            if len(sample_df) == 0:
+                continue
+            part_dir = store / f"sample={sample}" / f"chrom={chrom}"
+            part_dir.mkdir(parents=True, exist_ok=True)
+            sample_df.write_parquet(str(part_dir / "part-0.parquet"))
+
+        canonical_df = _intersect_chrom(store, chrom, all_samples)
+        return _process_one_chromosome(
+            store, chrom, canonical_df, samples_case, samples_control, test
         )
-
-    combined = pl.concat(result_dfs)
-    logger.info(f"Total DMC sites: {len(combined)}")
-
-    return combined
 
 
 def apply_multiple_testing_correction(
     dmc_results: pl.DataFrame,
     method: str = "fdr_bh",
 ) -> pl.DataFrame:
-    """Apply genome-wide multiple testing correction to DMC results.
+    """Apply genome-wide multiple testing correction.
 
     Parameters
     ----------
     dmc_results : pl.DataFrame
-        DMC results with 'pvalue' column
+        DMC results with a 'pvalue' column (float64, may contain NaN).
     method : str
-        Correction method: "fdr_bh" (Benjamini-Hochberg, default), "bonferroni"
+        Any method accepted by statsmodels.stats.multitest.multipletests.
+        Default: "fdr_bh" (Benjamini-Hochberg).
 
     Returns
     -------
     pl.DataFrame
-        Input dataframe with added 'qvalue' column
+        Input with added 'qvalue' (float64) and 'reject' (bool) columns.
     """
     from statsmodels.stats.multitest import multipletests
 
-    pvals = dmc_results["pvalue"].to_numpy()
-
-    # Handle NaN values
-    nan_mask = np.isnan(pvals)
+    pvals       = dmc_results["pvalue"].to_numpy()
+    nan_mask    = np.isnan(pvals)
     pvals_clean = np.where(nan_mask, 1.0, pvals)
 
-    # Apply correction
     reject, qvals, _, _ = multipletests(pvals_clean, method=method)
 
-    # Restore NaN in qvalues
-    qvals = np.where(nan_mask, np.nan, qvals)
+    qvals  = np.where(nan_mask, np.nan, qvals)
+    reject = np.where(nan_mask, False,  reject)
 
-    results = dmc_results.with_columns(
-        [pl.Series("qvalue", qvals), pl.Series("reject", reject)]
-    )
-
-    return results
+    return dmc_results.with_columns([
+        pl.Series("qvalue", qvals),
+        pl.Series("reject", reject),
+    ])

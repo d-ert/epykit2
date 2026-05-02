@@ -13,7 +13,14 @@ logging.basicConfig(
 
 def _cmd_convert(args: argparse.Namespace):
     """Handler for 'convert' subcommand."""
-    convert_sample(args.input, args.sample_id, args.output_dir)
+    convert_sample(
+        args.input,
+        args.sample_id,
+        args.output_dir,
+        context=args.context,
+        reference_fasta=args.reference_fasta,
+        merge_cpg=args.merge_cpg,
+    )
 
 
 def _cmd_filter(args: argparse.Namespace):
@@ -87,6 +94,29 @@ def main():
     p_conv.add_argument("--input", required=True, help="Input Bismark .cov or .cov.gz file")
     p_conv.add_argument("--sample-id", required=True, help="Sample identifier")
     p_conv.add_argument("--output-dir", required=True, help="Output Parquet directory")
+    p_conv.add_argument(
+        "--context",
+        choices=["CpG", "CHG", "CHH"],
+        default="CpG",
+        help="Cytosine context (default: CpG)",
+    )
+    p_conv.add_argument(
+        "--reference-fasta",
+        help="Optional reference FASTA for strand inference",
+    )
+    p_conv.add_argument(
+        "--merge-cpg",
+        dest="merge_cpg",
+        action="store_true",
+        help="Merge CpG dyad pairs into canonical sites",
+    )
+    p_conv.add_argument(
+        "--no-merge-cpg",
+        dest="merge_cpg",
+        action="store_false",
+        help="Disable CpG dyad merging",
+    )
+    p_conv.set_defaults(merge_cpg=None)
     p_conv.set_defaults(func=_cmd_convert)
 
     # Filter subcommand
