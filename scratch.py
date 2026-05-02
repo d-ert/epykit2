@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import shutil
 from pathlib import Path
+import polars as pl
 
 from epykit.convert import ensure_converted_sample
 from epykit.dmc import apply_multiple_testing_correction, process_chromosomes_dmc
@@ -21,7 +22,7 @@ from epykit.filter import filter_sites, sample_summary
 
 
 ROOT = Path(__file__).resolve().parent
-SAMPLE_SHEET = ROOT / "small_samplesheet.csv"
+SAMPLE_SHEET = ROOT / "samplesheet.csv"
 RAW_STORE = ROOT / "scratch_store"
 FILTERED_STORE = ROOT / "scratch_store_filtered"
 DMC_OUTPUT = ROOT / "scratch_dmc.parquet"
@@ -87,6 +88,10 @@ def main() -> None:
     )
     results = apply_multiple_testing_correction(results, method="fdr_bh")
     results.write_parquet(str(DMC_OUTPUT))
+
+    sig = results.filter(pl.col('qvalue') < 0.05)
+    sig.write_csv('scratch_dmc.sig.csv')
+
 
     print(f"DMC results written to {DMC_OUTPUT}")
     print(results.head(10))
