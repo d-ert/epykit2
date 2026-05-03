@@ -1,12 +1,4 @@
-"""Scratch script for exercising the full epykit workflow on local sample data.
-
-Verbose logging has been added around the annotation phase to help diagnose
-OOM / early-termination issues.  Every major step prints:
-  - elapsed time
-  - row counts / DataFrame shapes
-  - current RSS memory (requires psutil; falls back to nothing if absent)
-  - full tracebacks on any exception
-"""
+"""Scratch script for exercising the full epykit workflow on local sample data."""
 
 from __future__ import annotations
 
@@ -43,10 +35,10 @@ SAMPLE_SHEET = ROOT / "samplesheet.csv"
 RAW_STORE    = ROOT / "scratch_store"
 FILTERED_STORE = ROOT / "scratch_store_filtered"
 
-DMC_FISHER_OUTPUT    = ROOT / "scratch_dmc.fisher.parquet"
-DMC_BB_OUTPUT        = ROOT / "scratch_dmc.beta_binomial.parquet"
+DMC_FISHER_OUTPUT     = ROOT / "scratch_dmc.fisher.parquet"
+DMC_BB_OUTPUT         = ROOT / "scratch_dmc.beta_binomial.parquet"
 DMC_FISHER_SIG_OUTPUT = ROOT / "scratch_dmc.fisher.sig.csv"
-DMC_BB_SIG_OUTPUT    = ROOT / "scratch_dmc.beta_binomial.sig.csv"
+DMC_BB_SIG_OUTPUT     = ROOT / "scratch_dmc.beta_binomial.sig.csv"
 
 DMR_OUTPUT    = ROOT / "scratch_dmr.parquet"
 SMOOTH_OUTPUT = ROOT / "scratch_smooth.parquet"
@@ -61,7 +53,7 @@ CHH_STORE = ROOT / "scratch_chh_store"
 
 
 # ---------------------------------------------------------------------------
-# Logging helpers (mirror the ones in annotate.py so output looks consistent)
+# Logging helpers
 # ---------------------------------------------------------------------------
 
 def _mem_str() -> str:
@@ -83,9 +75,6 @@ def log_df(label: str, df) -> None:
         if hasattr(df, "estimated_size"):
             mem_mb = df.estimated_size() / 1e6
             log(f"  {label}: {rows:,} rows  {mem_mb:.1f} MB")
-        elif hasattr(df, "memory_usage"):
-            mem_mb = df.memory_usage(deep=True).sum() / 1e6
-            log(f"  {label}: {rows:,} rows  {mem_mb:.1f} MB")
         else:
             log(f"  {label}: {rows:,} rows")
     except Exception:
@@ -97,6 +86,15 @@ def section(title: str) -> None:
     log("=" * 60)
     log(title)
     log("=" * 60)
+
+
+def free(*objects) -> None:
+    """Delete references and run gc.collect(); log RSS before and after."""
+    before = _mem_str()
+    for obj in objects:
+        del obj
+    gc.collect()
+    log(f"  [freed]{before} -> {_mem_str()}")
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +141,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    # Check for psutil upfront
     try:
         import psutil
-        log(f"psutil available — memory tracking enabled")
+        log("psutil available — memory tracking enabled")
     except ImportError:
-        log("psutil not installed — memory numbers will be absent.  "
-            "Run: pip install psutil")
+        log("psutil not installed — memory numbers will be absent.")
 
     samplesheet_path = Path(args.samplesheet)
     rows = _read_samplesheet(samplesheet_path)
@@ -192,10 +188,12 @@ def main() -> None:
     for row in rows:
         samples_by_group.setdefault(row["group"], []).append(row["sample_id"])
 
-    control_samples   = samples_by_group.get("control",   [])
-    treatment_samples = samples_by_group.get("cd55",      [])
+    control_samples   = samples_by_group.get("control", [])
+    treatment_samples = samples_by_group.get("cd55",    [])
     if not control_samples or not treatment_samples:
         raise ValueError(f"Expected control and cd55 groups; got {samples_by_group}")
+
+    all_samples = [r["sample_id"] for r in rows]
 
     # ---------------------------------------------------------------
     section("Phase 2a: DMC (fisher)")
@@ -212,6 +210,12 @@ def main() -> None:
     log_df("dmc_fisher", dmc_fisher)
     print(dmc_fisher.head(10), flush=True)
 
+    # Free Fisher result — it's safely on disk.
+    # Phase 2c (DMR) will read it back from parquet.
+    del dmc_fisher
+    gc.collect()
+    log("Fisher result freed from RAM")
+
     # ---------------------------------------------------------------
     section("Phase 2b: DMC (beta_binomial)")
     # ---------------------------------------------------------------
@@ -226,9 +230,18 @@ def main() -> None:
     log(f"Beta-binomial DMC done in {time.time()-t0:.1f}s")
     log_df("dmc_bb", dmc_bb)
 
+    del dmc_bb
+    gc.collect()
+    log("Beta-binomial result freed from RAM")
+
     # ---------------------------------------------------------------
     section("Phase 2c: DMR calling")
     # ---------------------------------------------------------------
+    # Read Fisher result back from the parquet written in Phase 2a.
+    log("Reading Fisher DMC from disk for DMR calling ...")
+    dmc_fisher = pl.read_parquet(str(DMC_FISHER_OUTPUT))
+    log_df("dmc_fisher (reloaded)", dmc_fisher)
+
     t0 = time.time()
     dmr_results = call_dmr_sliding_window(
         dmc_fisher, window_bp=500, step_bp=250,
@@ -240,16 +253,22 @@ def main() -> None:
     if len(dmr_results) > 0:
         print(dmr_results.head(10), flush=True)
 
+    del dmc_fisher
+    gc.collect()
+    log("Fisher DMC (reloaded) freed from RAM")
+
     # ---------------------------------------------------------------
     section("Phase 2d: BSmooth smoothing")
     # ---------------------------------------------------------------
     t0 = time.time()
-    smooth_samples = [r["sample_id"] for r in rows[: min(3, len(rows))]]
+    smooth_samples = [r["sample_id"] for r in rows[:min(3, len(rows))]]
     smooth_df = smooth_methylation_bsmooth(
         str(FILTERED_STORE), smooth_samples, bandwidth=1000,
     )
     smooth_df.write_parquet(str(SMOOTH_OUTPUT))
     log(f"Smoothing done in {time.time()-t0:.1f}s  rows={len(smooth_df):,}")
+    del smooth_df
+    gc.collect()
 
     # ---------------------------------------------------------------
     section("Phase 3: Annotation")
@@ -260,129 +279,102 @@ def main() -> None:
         gtf_path = Path(args.gtf)
         bed_path = Path(args.cpg_islands_bed)
 
-        # Subset to first 20k DMC sites for the annotation run
-        dmc_annot = dmc_fisher.head(min(20_000, len(dmc_fisher)))
-        log(f"Annotation input subset: {len(dmc_annot):,} sites")
-        log_df("dmc_annot (input to annotation)", dmc_annot)
+        # Read Fisher back from disk; take first 20k for annotation
+        dmc_fisher = pl.read_parquet(str(DMC_FISHER_OUTPUT))
+        dmc_annot  = dmc_fisher.head(min(20_000, len(dmc_fisher)))
+        del dmc_fisher
+        gc.collect()
 
-        # ---- GTF feature annotation --------------------------------
+        log(f"Annotation input subset: {len(dmc_annot):,} sites")
+
         if gtf_path.exists():
             log(f"GTF path: {gtf_path}")
-            log(f"GTF file size: {gtf_path.stat().st_size / 1e6:.1f} MB")
-            log("Starting annotate_features ...")
             t0 = time.time()
             try:
                 dmc_annot = annotate_features(
-                    dmc_annot,
-                    annotation_gtf=str(gtf_path),
-                    promoter_upstream_bp=2_000,
-                    promoter_downstream_bp=200,
+                    dmc_annot, annotation_gtf=str(gtf_path),
+                    promoter_upstream_bp=2_000, promoter_downstream_bp=200,
                 )
-                log(f"annotate_features returned in {time.time()-t0:.1f}s")
-                log_df("dmc_annot (after feature annotation)", dmc_annot)
-                if "feature_type" in dmc_annot.columns:
-                    ft_counts = (
-                        dmc_annot.group_by("feature_type")
-                        .agg(pl.len().alias("n"))
-                        .sort("n", descending=True)
-                    )
-                    log("Feature type breakdown:")
-                    print(ft_counts, flush=True)
+                log(f"annotate_features done in {time.time()-t0:.1f}s")
             except Exception:
                 log(f"ERROR in annotate_features after {time.time()-t0:.1f}s:")
                 traceback.print_exc(file=sys.stdout)
-                sys.stdout.flush()
-                log("Continuing without feature annotation ...")
             finally:
                 gc.collect()
         else:
             log(f"GTF not found at {gtf_path} — skipping feature annotation")
 
-        # ---- CpG island annotation ---------------------------------
         if bed_path.exists():
             log(f"BED path: {bed_path}")
-            log(f"BED file size: {bed_path.stat().st_size / 1e6:.1f} MB")
-            log("Starting annotate_cpg_islands ...")
             t0 = time.time()
             try:
                 dmc_annot = annotate_cpg_islands(dmc_annot, cpg_island_bed=str(bed_path))
-                log(f"annotate_cpg_islands returned in {time.time()-t0:.1f}s")
-                log_df("dmc_annot (after CpG island annotation)", dmc_annot)
-                if "cpg_context" in dmc_annot.columns:
-                    ctx_counts = (
-                        dmc_annot.group_by("cpg_context")
-                        .agg(pl.len().alias("n"))
-                        .sort("n", descending=True)
-                    )
-                    log("CpG context breakdown:")
-                    print(ctx_counts, flush=True)
+                log(f"annotate_cpg_islands done in {time.time()-t0:.1f}s")
             except Exception:
                 log(f"ERROR in annotate_cpg_islands after {time.time()-t0:.1f}s:")
                 traceback.print_exc(file=sys.stdout)
-                sys.stdout.flush()
-                log("Continuing without CpG island annotation ...")
             finally:
                 gc.collect()
         else:
             log(f"BED not found at {bed_path} — skipping CpG island annotation")
 
-        # ---- Write annotated DMC -----------------------------------
         log(f"Writing annotated DMC -> {DMC_ANNOTATED_OUTPUT.name} ...")
         dmc_annot.write_parquet(str(DMC_ANNOTATED_OUTPUT))
         cols_to_print = [c for c in ["chrom", "pos", "gene_id", "feature_type", "cpg_context"]
                          if c in dmc_annot.columns]
         print(dmc_annot.select(cols_to_print).head(10), flush=True)
+        del dmc_annot
+        gc.collect()
 
-        # ---- Annotate DMRs -----------------------------------------
         if len(dmr_results) > 0:
             log(f"Annotating {len(dmr_results):,} DMRs ...")
             dmr_annot = dmr_results
 
             if gtf_path.exists():
-                log("Starting annotate_features (DMRs) ...")
                 t0 = time.time()
                 try:
                     dmr_annot = annotate_features(
-                        dmr_annot,
-                        annotation_gtf=str(gtf_path),
-                        promoter_upstream_bp=2_000,
-                        promoter_downstream_bp=200,
+                        dmr_annot, annotation_gtf=str(gtf_path),
+                        promoter_upstream_bp=2_000, promoter_downstream_bp=200,
                     )
                     log(f"DMR annotate_features done in {time.time()-t0:.1f}s")
                 except Exception:
-                    log(f"ERROR in annotate_features (DMRs) after {time.time()-t0:.1f}s:")
+                    log(f"ERROR in annotate_features (DMRs):")
                     traceback.print_exc(file=sys.stdout)
-                    sys.stdout.flush()
                 finally:
                     gc.collect()
 
             if bed_path.exists():
-                log("Starting annotate_cpg_islands (DMRs) ...")
                 t0 = time.time()
                 try:
                     dmr_annot = annotate_cpg_islands(dmr_annot, cpg_island_bed=str(bed_path))
                     log(f"DMR annotate_cpg_islands done in {time.time()-t0:.1f}s")
                 except Exception:
-                    log(f"ERROR in annotate_cpg_islands (DMRs) after {time.time()-t0:.1f}s:")
+                    log(f"ERROR in annotate_cpg_islands (DMRs):")
                     traceback.print_exc(file=sys.stdout)
-                    sys.stdout.flush()
                 finally:
                     gc.collect()
 
             dmr_annot.write_parquet(str(DMR_ANNOTATED_OUTPUT))
             log(f"Annotated DMR written to {DMR_ANNOTATED_OUTPUT.name}")
+            del dmr_annot
+            gc.collect()
         else:
             log("No DMRs to annotate")
+
+    del dmr_results
+    gc.collect()
 
     # ---------------------------------------------------------------
     section("Phase 4: QC")
     # ---------------------------------------------------------------
-    all_samples = [r["sample_id"] for r in rows]
     t0 = time.time()
     global_qc = global_methylation_report(str(FILTERED_STORE), all_samples)
     global_qc.write_parquet(str(QC_GLOBAL_OUTPUT))
     log(f"Global QC done in {time.time()-t0:.1f}s")
     print(global_qc, flush=True)
+    del global_qc
+    gc.collect()
 
     cov_frames: list[pl.DataFrame] = []
     for sample_id in all_samples:
@@ -393,6 +385,8 @@ def main() -> None:
         coverage_qc.write_parquet(str(QC_COVERAGE_OUTPUT))
         log(f"Coverage QC written to {QC_COVERAGE_OUTPUT.name}")
         print(coverage_qc.head(20), flush=True)
+        del coverage_qc, cov_frames
+        gc.collect()
 
     chh_sample = all_samples[0]
     _prepare_synthetic_chh_store(chh_sample)

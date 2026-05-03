@@ -4,6 +4,19 @@ Phase 3 of the epykit pipeline:
   - annotate_features
   - annotate_cpg_islands
 
+Bug fixes vs previous version
+------------------------------
+FIX-1  pyranges join crash ("Unknown dtype str in a column Feature")
+       pyranges' null_types() cannot handle plain Python object / str
+       dtype columns.  Casting the Feature column to pandas Categorical
+       before constructing the PyRanges object resolves this.  Without
+       this fix the join silently failed and every site was labelled
+       "intergenic".
+
+FIX-2  GTF parsed twice when both DMC and DMR sets are annotated in the
+       same script run.  A module-level cache (_GTF_CACHE) keyed on the
+       canonical file path avoids the 70-second re-parse.
+
 Memory design: per-chromosome join loop — peak memory is bounded by the
 largest single chromosome rather than the whole genome.
 """
@@ -17,6 +30,8 @@ import re
 import sys
 import time
 import traceback
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -32,13 +47,16 @@ _FEATURE_PRIORITY: dict[str, int] = {
 
 _FEAT_COLS = ["Chromosome", "Start", "End", "Strand", "Feature", "gene_id", "gene_name"]
 
+# Module-level GTF cache: path -> (genes_pd, exons_pd)
+# Avoids re-parsing the 8 M-line GTF when annotating both DMC and DMR sets.
+_GTF_CACHE: dict[str, tuple[Any, Any]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
 def _mb() -> str:
-    """Return current RSS memory as a human-readable string, or empty string."""
     try:
         import psutil, os
         rss = psutil.Process(os.getpid()).memory_info().rss
@@ -48,19 +66,17 @@ def _mb() -> str:
 
 
 def _log(msg: str) -> None:
-    """Print to stdout immediately (no buffering) and also send to logger."""
     full = f"[annotate] {msg}{_mb()}"
     print(full, flush=True)
     logger.info(msg)
 
 
 def _df_info(name: str, df) -> str:
-    """Return a short shape/memory summary for a pandas or polars DataFrame."""
     try:
         rows = len(df)
-        if hasattr(df, "memory_usage"):          # pandas
+        if hasattr(df, "memory_usage"):
             mem_mb = df.memory_usage(deep=True).sum() / 1e6
-        elif hasattr(df, "estimated_size"):       # polars
+        elif hasattr(df, "estimated_size"):
             mem_mb = df.estimated_size() / 1e6
         else:
             mem_mb = 0.0
@@ -137,91 +153,68 @@ def _build_intron_df(exons_pd, genes_pd) -> "pd.DataFrame":
 
 def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]:
     """Stream-parse a GTF file, extracting only gene and exon rows.
-    
-    Reads the GTF line-by-line, keeps only 'gene' and 'exon' features,
-    and extracts only necessary columns (Chromosome, Start, End, Strand,
-    gene_id, gene_name). Never materializes the full GTF in memory.
-    
-    Parameters
-    ----------
-    gtf_path : str
-        Path to GTF file (may be gzipped if ends with .gz).
-    
-    Returns
-    -------
-    genes_pd, exons_pd : pd.DataFrame
-        DataFrames with columns: Chromosome, Start, End, Strand, gene_id, gene_name
+
+    Results are cached in _GTF_CACHE keyed by canonical path so that
+    repeated calls (e.g. annotating DMC then DMR) pay the I/O cost once.
     """
     import pandas as pd
-    
-    gene_rows = []
-    exon_rows = []
+
+    cache_key = str(Path(gtf_path).resolve())
+    if cache_key in _GTF_CACHE:
+        _log(f"  GTF cache hit for {cache_key}")
+        return _GTF_CACHE[cache_key]
+
+    gene_rows: list[dict] = []
+    exon_rows: list[dict] = []
     attr_re = re.compile(r'(\w+)\s+"([^"]+)"')
-    
-    # Determine if file is gzipped
+
     is_gzip = gtf_path.endswith('.gz')
     open_fn = gzip.open if is_gzip else open
-    
+
     lines_read = 0
     try:
         with open_fn(gtf_path, 'rt') as f:
             for line in f:
                 lines_read += 1
-                # Skip comments and empty lines
                 if line.startswith('#') or not line.strip():
                     continue
-                
                 parts = line.rstrip('\n').split('\t')
-                # GTF has 9 columns; skip malformed lines
                 if len(parts) < 9:
                     continue
-                
-                # Column indices (0-based): 0=chrom, 2=feature, 3=start, 4=end, 6=strand, 8=attributes
-                chrom = parts[0]
+                chrom   = parts[0]
                 feature = parts[2]
-                start = int(parts[3])
-                end = int(parts[4])
-                strand = parts[6]
-                attributes_str = parts[8]
-                
-                # Only keep gene and exon rows
                 if feature not in ('gene', 'exon'):
                     continue
-                
-                # Parse attributes (column 9) to extract gene_id and gene_name
-                attrs = {}
-                for m in attr_re.finditer(attributes_str):
-                    key, value = m.groups()
-                    attrs[key] = value
-                
-                gene_id = attrs.get('gene_id', '')
+                start  = int(parts[3])
+                end    = int(parts[4])
+                strand = parts[6]
+                attrs  = {}
+                for m in attr_re.finditer(parts[8]):
+                    attrs[m.group(1)] = m.group(2)
+                gene_id   = attrs.get('gene_id', '')
                 gene_name = attrs.get('gene_name', attrs.get('gene_id', ''))
-                
                 row = {
-                    'Chromosome': chrom,
-                    'Start': start,
-                    'End': end,
-                    'Strand': strand,
-                    'gene_id': gene_id,
-                    'gene_name': gene_name,
+                    'Chromosome': chrom, 'Start': start, 'End': end,
+                    'Strand': strand, 'gene_id': gene_id, 'gene_name': gene_name,
                 }
-                
                 if feature == 'gene':
                     gene_rows.append(row)
-                else:  # exon
+                else:
                     exon_rows.append(row)
-    
     except Exception as e:
         _log(f"  ERROR parsing GTF (read {lines_read:,} lines): {e}")
         raise
-    
+
     _log(f"  GTF streaming complete: {lines_read:,} lines read")
     _log(f"  Extracted {len(gene_rows):,} gene rows, {len(exon_rows):,} exon rows")
-    
-    genes_pd = pd.DataFrame(gene_rows) if gene_rows else pd.DataFrame(columns=['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name'])
-    exons_pd = pd.DataFrame(exon_rows) if exon_rows else pd.DataFrame(columns=['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name'])
-    
-    return genes_pd, exons_pd
+
+    _empty_cols = ['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name']
+    genes_pd = pd.DataFrame(gene_rows) if gene_rows else pd.DataFrame(columns=_empty_cols)
+    exons_pd = pd.DataFrame(exon_rows) if exon_rows else pd.DataFrame(columns=_empty_cols)
+
+    result = (genes_pd, exons_pd)
+    _GTF_CACHE[cache_key] = result
+    return result
 
 
 def _pick_best_overlap(joined_df) -> "pd.DataFrame":
@@ -240,7 +233,14 @@ def _annotate_chromosome_chunk(
     chrom_sites: pl.DataFrame,
     chrom_features_df: "pd.DataFrame",
 ) -> "pd.DataFrame":
-    """Run overlap + best-pick for one chromosome. Returns pandas DataFrame."""
+    """Run overlap + best-pick for one chromosome. Returns pandas DataFrame.
+
+    FIX-1: The Feature column must be cast to pandas Categorical before
+    constructing the PyRanges object.  pyranges' null_types() does not
+    handle plain object/str dtype and raises:
+        Exception: Unknown dtype str in a column Feature
+    Casting to Categorical gives pyranges a known dtype it can null-fill.
+    """
     import pyranges as pr
     import pandas as pd
 
@@ -258,7 +258,6 @@ def _annotate_chromosome_chunk(
         _log(f"  {chrom}: no features -> all intergenic")
         return result
 
-    # Build per-chromosome PyRanges objects
     _log(f"  {chrom}: building sites PyRanges ({chunk_n:,} sites)")
     t0 = time.time()
     try:
@@ -274,17 +273,19 @@ def _annotate_chromosome_chunk(
     _log(f"  {chrom}: building features PyRanges ({len(chrom_features_df):,} features)")
     t0 = time.time()
     try:
-        features_pr = pr.PyRanges(chrom_features_df)
+        # FIX-1: cast Feature to Categorical so pyranges can null-fill it
+        feat_df = chrom_features_df.copy()
+        feat_df["Feature"] = feat_df["Feature"].astype("category")
+        features_pr = pr.PyRanges(feat_df)
         _log(f"  {chrom}: features PyRanges built in {time.time()-t0:.1f}s")
     except Exception:
         _log(f"  {chrom}: ERROR building features PyRanges:\n{traceback.format_exc()}")
         return result
 
-    # The join — the historically expensive step
     _log(f"  {chrom}: running join ...")
     t0 = time.time()
     try:
-        joined = sites_pr2.join(features_pr, how="left", suffix="_b")
+        joined    = sites_pr2.join(features_pr, how="left", suffix="_b")
         join_rows = len(joined.df)
         _log(f"  {chrom}: join done in {time.time()-t0:.1f}s  -> {join_rows:,} rows")
         del features_pr
@@ -343,7 +344,11 @@ def annotate_features(
     promoter_upstream_bp: int = 2000,
     promoter_downstream_bp: int = 200,
 ) -> pl.DataFrame:
-    """Annotate DMC / DMR sites with gene-level genomic features."""
+    """Annotate DMC / DMR sites with gene-level genomic features.
+
+    The GTF is parsed once per process and cached; subsequent calls with the
+    same file path skip the 60-90 s streaming step entirely.
+    """
     try:
         import pyranges as pr
     except ImportError as exc:
@@ -362,7 +367,7 @@ def annotate_features(
     t_total = time.time()
 
     # ------------------------------------------------------------------
-    # Step 1: Stream-parse GTF, extract genes + exons only
+    # Step 1: Parse GTF (uses cache after first call)
     # ------------------------------------------------------------------
     _log("Step 1/8: stream-parsing GTF (gene and exon rows only) ...")
     t0 = time.time()
@@ -388,7 +393,7 @@ def annotate_features(
         )
 
     # ------------------------------------------------------------------
-    # Step 2: Deduplicate exons at the gene level
+    # Step 2: Deduplicate exons
     # ------------------------------------------------------------------
     _log("Step 2/8: deduplicating exons ...")
     _exon_key = ["Chromosome", "Start", "End", "Strand", "gene_id"]
@@ -403,8 +408,7 @@ def annotate_features(
         gc.collect()
         _log(f"  exons: {n_before:,} -> {len(exons_pd):,} (removed {n_before - len(exons_pd):,} duplicates)")
     else:
-        _log(f"  WARNING: expected exon columns not all present; skipping dedup. "
-             f"Have: {list(exons_pd.columns)}")
+        _log(f"  WARNING: expected exon columns not all present; skipping dedup.")
 
     # ------------------------------------------------------------------
     # Step 3: Build combined feature DataFrame
@@ -466,10 +470,9 @@ def annotate_features(
     gc.collect()
 
     # ------------------------------------------------------------------
-    # Step 5: Build TSS map (vectorised)
+    # Step 5: Build TSS map
     # ------------------------------------------------------------------
     _log("Step 5/8: building TSS map ...")
-    import pandas as pd  # ensure available after possible earlier failure
     _g = genes_pd[["gene_id", "Start", "End", "Strand"]].drop_duplicates("gene_id")
     tss_values = np.where(
         _g["Strand"].to_numpy() != "-",
@@ -515,9 +518,7 @@ def annotate_features(
             _log(f"  {chrom}: done in {time.time()-t0:.1f}s")
         except Exception:
             _log(f"  {chrom}: UNHANDLED ERROR:\n{traceback.format_exc()}")
-            # Fill with defaults so we don't lose the whole run
-            import pandas as _pd
-            part = _pd.DataFrame({
+            part = pd.DataFrame({
                 "_orig_idx":    chrom_sites["_orig_idx"].to_numpy(),
                 "gene_id":      np.full(chunk_n, "", dtype=object),
                 "gene_name":    np.full(chunk_n, "", dtype=object),
@@ -552,13 +553,11 @@ def annotate_features(
     gene_names    = annot_all["gene_name"].to_numpy(dtype=object)
     feature_types = annot_all["feature_type"].to_numpy(dtype=object)
 
-    n_annotated   = int((gene_ids != "").sum())
-    ft_counts     = {k: int((feature_types == k).sum()) for k in _FEATURE_PRIORITY}
+    n_annotated = int((gene_ids != "").sum())
+    ft_counts   = {k: int((feature_types == k).sum()) for k in _FEATURE_PRIORITY}
     ft_counts["intergenic"] = int((feature_types == "intergenic").sum())
-    _log(f"  annotation summary: {n_annotated:,}/{n:,} sites have a gene  "
-         f"| {ft_counts}")
+    _log(f"  annotation summary: {n_annotated:,}/{n:,} sites have a gene  | {ft_counts}")
 
-    # TSS distance
     if "pos" in sites.columns:
         site_mids = sites["pos"].to_numpy().astype(np.float64)
     else:
@@ -635,8 +634,8 @@ def annotate_cpg_islands(
         dn["_ctx"]  = label
         return pd.concat([up, dn], ignore_index=True)
 
-    shore_df        = _flanks(islands_df, 0,          SHORE_DIST, "shore")
-    shelf_df        = _flanks(islands_df, SHORE_DIST, SHELF_DIST, "shelf")
+    shore_df           = _flanks(islands_df, 0,          SHORE_DIST, "shore")
+    shelf_df           = _flanks(islands_df, SHORE_DIST, SHELF_DIST, "shelf")
     islands_df["_ctx"] = "island"
     _log(f"  flanks built: {len(shore_df):,} shore intervals, {len(shelf_df):,} shelf intervals")
 
