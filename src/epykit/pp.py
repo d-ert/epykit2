@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc as _gc
+from pathlib import Path
+
 import polars as pl
 
 from . import filter as filter_mod
@@ -13,6 +16,18 @@ def _append_store_history(md: MethylData, step: str, path: str, n_sites: int | N
         history = []
     history.append({"step": step, "path": path, "n_sites": n_sites})
     md.uns["_store_history"] = history
+
+
+def _count_parquet_rows(store_dir: str) -> int | None:
+    try:
+        import pyarrow.parquet as pq
+
+        total = 0
+        for path in Path(store_dir).rglob("part-*.parquet"):
+            total += pq.read_metadata(str(path)).num_rows
+        return total
+    except Exception:
+        return None
 
 
 def filter_coverage(
@@ -42,48 +57,35 @@ def filter_coverage(
         "hi_perc": hi_perc,
         "blacklist_bed": blacklist_bed,
     }
-    try:
-        n_sites = None
-        n_sites = int(
-            pl.scan_parquet(f"{out}/sample=*/chrom=*/part-*.parquet")
-            .select(pl.len().alias("n"))
-            .collect()["n"][0]
-        )
+    n_sites = _count_parquet_rows(out)
+    if n_sites is not None:
         md.uns["n_sites_filtered"] = n_sites
         _append_store_history(md, "filtered", out, n_sites)
-    except Exception:
-        pass
 
 
 def unite(md: MethylData, type: str = "intersect") -> None:
-    """Build site-set alignment metadata for downstream DMC processing."""
-    samples = md.obs.get_column("sample_id").to_list()
+    """Record the site-alignment strategy for downstream DMC processing.
+
+    This does **not** materialise the full intersection/union into memory.
+    ``ep.tl.dmc`` passes ``unite=True/False`` directly to
+    ``process_chromosomes_dmc``, which performs the per-chromosome join
+    lazily and in O(n_sites) memory — identical to the old procedural API.
+    Eagerly computing the full intersection here (previously stored in
+    ``md.uns["site_intersect"]``) caused an OOM on whole-genome data because
+    it loaded all 338 M+ rows into RAM at once.
+    """
     if type not in {"intersect", "union"}:
         raise ValueError("type must be 'intersect' or 'union'")
 
-    if type == "intersect":
-        site_df = filter_mod.intersect_sites(md.store, samples)
-        md.uns["site_intersect"] = site_df
-    else:
-        site_df = (
-            pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-            .select(["chrom", "pos", "strand"])
-            .unique()
-            .collect()
-            .sort(["chrom", "pos"])
-        )
-        md.uns["site_union"] = site_df
-
     md._united = True
-    md.uns["unite"] = {"type": type, "n_sites": len(site_df)}
-
+    md.uns["unite"] = {"type": type}
 
 def smooth(
     md: MethylData,
     bandwidth: int = 1000,
     grid_resolution_bp: int | None = None,
 ) -> None:
-    """BSmooth-style smoothing and store results in md.uns['smoothed']."""
+    """BSmooth-style smoothing. Write smoothed output to disk and free RAM."""
     samples = md.obs.get_column("sample_id").to_list()
     smoothed = smooth_methylation_bsmooth(
         methylstore_path=md.store,
@@ -91,8 +93,15 @@ def smooth(
         bandwidth=bandwidth,
         grid_resolution_bp=grid_resolution_bp,
     )
-    md.uns["smoothed"] = smoothed
+
+    # Write to disk immediately and free RAM — matches old scratch.py pattern
+    smooth_path = f"{md.store}_smooth.parquet"
+    smoothed.write_parquet(smooth_path, compression="zstd")
+    del smoothed
+    _gc.collect()
+
     md._smoothed = True
+    md.uns["smooth_path"] = smooth_path
     md.uns["smooth"] = {
         "bandwidth": bandwidth,
         "grid_resolution_bp": grid_resolution_bp,

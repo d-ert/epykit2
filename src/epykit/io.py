@@ -11,11 +11,12 @@ from .methyldata import MethylData
 
 def _count_store_rows(store_dir: str) -> int | None:
     try:
-        return int(
-            pl.scan_parquet(f"{store_dir}/sample=*/chrom=*/part-*.parquet")
-            .select(pl.len().alias("n"))
-            .collect()["n"][0]
-        )
+        import pyarrow.parquet as pq
+
+        total = 0
+        for path in Path(store_dir).rglob("part-*.parquet"):
+            total += pq.read_metadata(str(path)).num_rows
+        return total
     except Exception:
         return None
 

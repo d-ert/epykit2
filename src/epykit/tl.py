@@ -68,7 +68,8 @@ def dmc(
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>']."""
     selected_test = _auto_test(md) if test == "auto" else test
-    unite = md.uns.get("unite", {}).get("type", "intersect") == "intersect"
+    unite_info = md.uns.get("unite")
+    unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
 
     result = process_chromosomes_dmc(
         methylstore_path=md.store,
@@ -98,6 +99,7 @@ def dmr(
     min_sites_significant: int = 3,
     alpha: float = 0.05,
     min_abs_meth_diff: float = 0.1,
+    min_mean_pvalue: float | None = 0.05,
 ) -> None:
     """Run DMR calling using the current DMC result and store in md.uns['dmr']."""
     dmc_df = md.dmc
@@ -113,6 +115,10 @@ def dmr(
         alpha=alpha,
         min_abs_meth_diff=min_abs_meth_diff,
     )
+    # Discard windows where the window-level signal is weak (match old behaviour)
+    if len(dmr_df) > 0 and min_mean_pvalue is not None:
+        dmr_df = dmr_df.filter(pl.col("mean_pvalue") < min_mean_pvalue)
+
     md.uns["dmr"] = dmr_df
     md.uns["dmr_params"] = {
         "window_bp": window_bp,
@@ -121,6 +127,7 @@ def dmr(
         "min_sites_significant": min_sites_significant,
         "alpha": alpha,
         "min_abs_meth_diff": min_abs_meth_diff,
+        "min_mean_pvalue": min_mean_pvalue,
     }
 
 
@@ -128,17 +135,34 @@ def annotate(
     md: MethylData,
     gtf: str | None = None,
     cpg_islands: str | None = None,
+    significant_only: bool = True,
+    alpha: float = 0.05,
     promoter_upstream_bp: int = 2000,
     promoter_downstream_bp: int = 200,
 ) -> None:
-    """Annotate DMC/DMR outputs in place."""
+    """Annotate DMC/DMR outputs.
+
+    By default only significant DMCs are annotated to avoid OOM. Set
+    `significant_only=False` to annotate all sites (not recommended for
+    whole-genome datasets).
+    """
     if not gtf and not cpg_islands:
         raise ValueError("Provide at least one of gtf or cpg_islands")
 
     for key, df in list(md.varm.items()):
         if not key.startswith("dmc"):
             continue
-        ann = df
+
+        # Match old behavior: annotate only significant sites to avoid OOM
+        if significant_only:
+            p_col = "qvalue" if "qvalue" in df.columns else "pvalue"
+            ann = df.filter(pl.col(p_col) < alpha)
+        else:
+            ann = df
+
+        if len(ann) == 0:
+            continue
+
         if gtf:
             ann = annotate_features(
                 ann,
@@ -148,7 +172,9 @@ def annotate(
             )
         if cpg_islands:
             ann = annotate_cpg_islands(ann, cpg_island_bed=cpg_islands)
-        md.varm[key] = ann
+
+        # Store as separate key so full DMC results are preserved
+        md.varm[f"{key}_annotated"] = ann
 
     if "dmr" in md.uns and isinstance(md.uns["dmr"], pl.DataFrame) and gtf:
         md.uns["dmr"] = annotate_features(
@@ -161,6 +187,8 @@ def annotate(
     md.uns["annotation"] = {
         "gtf": gtf,
         "cpg_islands": cpg_islands,
+        "significant_only": significant_only,
+        "alpha": alpha,
         "promoter_upstream_bp": promoter_upstream_bp,
         "promoter_downstream_bp": promoter_downstream_bp,
     }
