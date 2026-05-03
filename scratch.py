@@ -203,7 +203,7 @@ def main() -> None:
     t0 = time.time()
     dmc_fisher = process_chromosomes_dmc(
         str(FILTERED_STORE), treatment_samples, control_samples,
-        test="fisher", unite=True,
+        test="fisher", unite=False,
     )
     dmc_fisher = apply_multiple_testing_correction(dmc_fisher, method="fdr_bh")
     dmc_fisher.write_parquet(str(DMC_FISHER_OUTPUT))
@@ -218,7 +218,7 @@ def main() -> None:
     t0 = time.time()
     dmc_bb = process_chromosomes_dmc(
         str(FILTERED_STORE), treatment_samples, control_samples,
-        test="beta_binomial", unite=True,
+        test="beta_binomial", unite=False,
     )
     dmc_bb = apply_multiple_testing_correction(dmc_bb, method="fdr_bh")
     dmc_bb.write_parquet(str(DMC_BB_OUTPUT))

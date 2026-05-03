@@ -253,8 +253,10 @@ def _beta_binom_mom(
     Welch–Satterthwaite degrees of freedom.  NaN propagates where all
     replicates in a group have zero coverage.
     """
-    mu_case = np.nanmean(beta_case, axis=1)
-    mu_ctrl = np.nanmean(beta_ctrl, axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mu_case = np.nanmean(beta_case, axis=1)
+        mu_ctrl = np.nanmean(beta_ctrl, axis=1)
 
     # Bessel-corrected variance of the mean: s² / n
     with warnings.catch_warnings():
@@ -375,7 +377,7 @@ def _intersect_chrom(
             / "part-0.parquet"
         )
         if not part_file.exists():
-            logger.warning(
+            logger.debug(
                 "  Sample '%s' missing %s; "
                 "chromosome excluded from intersection",
                 sample, chrom,
@@ -450,7 +452,7 @@ def _load_sample_chrom(
     n_sites = len(canonical_pos)
 
     if not part_file.exists():
-        logger.warning("  Missing Parquet: %s", part_file)
+        logger.debug("  Missing Parquet: %s", part_file)
         return (
             np.zeros(n_sites, dtype=np.int32),
             np.zeros(n_sites, dtype=np.int32),
@@ -568,8 +570,10 @@ def _process_one_chromosome(
     beta_ctrl_mat = np.stack(beta_ctrl_cols, axis=1)
     del beta_case_cols, beta_ctrl_cols
 
-    mean_beta_case = np.nanmean(beta_case_mat, axis=1).astype(np.float32)
-    mean_beta_ctrl = np.nanmean(beta_ctrl_mat, axis=1).astype(np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean_beta_case = np.nanmean(beta_case_mat, axis=1).astype(np.float32)
+        mean_beta_ctrl = np.nanmean(beta_ctrl_mat, axis=1).astype(np.float32)
     meth_diff      = (mean_beta_case - mean_beta_ctrl).astype(np.float32)
     del beta_case_mat, beta_ctrl_mat
 

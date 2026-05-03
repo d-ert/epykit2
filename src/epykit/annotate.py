@@ -11,7 +11,9 @@ largest single chromosome rather than the whole genome.
 from __future__ import annotations
 
 import gc
+import gzip
 import logging
+import re
 import sys
 import time
 import traceback
@@ -131,6 +133,95 @@ def _build_intron_df(exons_pd, genes_pd) -> "pd.DataFrame":
     introns["Feature"]     = "intron"
     introns                = introns.rename(columns={"_g_chrom": "Chromosome"})
     return introns[_FEAT_COLS].reset_index(drop=True)
+
+
+def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]:
+    """Stream-parse a GTF file, extracting only gene and exon rows.
+    
+    Reads the GTF line-by-line, keeps only 'gene' and 'exon' features,
+    and extracts only necessary columns (Chromosome, Start, End, Strand,
+    gene_id, gene_name). Never materializes the full GTF in memory.
+    
+    Parameters
+    ----------
+    gtf_path : str
+        Path to GTF file (may be gzipped if ends with .gz).
+    
+    Returns
+    -------
+    genes_pd, exons_pd : pd.DataFrame
+        DataFrames with columns: Chromosome, Start, End, Strand, gene_id, gene_name
+    """
+    import pandas as pd
+    
+    gene_rows = []
+    exon_rows = []
+    attr_re = re.compile(r'(\w+)\s+"([^"]+)"')
+    
+    # Determine if file is gzipped
+    is_gzip = gtf_path.endswith('.gz')
+    open_fn = gzip.open if is_gzip else open
+    
+    lines_read = 0
+    try:
+        with open_fn(gtf_path, 'rt') as f:
+            for line in f:
+                lines_read += 1
+                # Skip comments and empty lines
+                if line.startswith('#') or not line.strip():
+                    continue
+                
+                parts = line.rstrip('\n').split('\t')
+                # GTF has 9 columns; skip malformed lines
+                if len(parts) < 9:
+                    continue
+                
+                # Column indices (0-based): 0=chrom, 2=feature, 3=start, 4=end, 6=strand, 8=attributes
+                chrom = parts[0]
+                feature = parts[2]
+                start = int(parts[3])
+                end = int(parts[4])
+                strand = parts[6]
+                attributes_str = parts[8]
+                
+                # Only keep gene and exon rows
+                if feature not in ('gene', 'exon'):
+                    continue
+                
+                # Parse attributes (column 9) to extract gene_id and gene_name
+                attrs = {}
+                for m in attr_re.finditer(attributes_str):
+                    key, value = m.groups()
+                    attrs[key] = value
+                
+                gene_id = attrs.get('gene_id', '')
+                gene_name = attrs.get('gene_name', attrs.get('gene_id', ''))
+                
+                row = {
+                    'Chromosome': chrom,
+                    'Start': start,
+                    'End': end,
+                    'Strand': strand,
+                    'gene_id': gene_id,
+                    'gene_name': gene_name,
+                }
+                
+                if feature == 'gene':
+                    gene_rows.append(row)
+                else:  # exon
+                    exon_rows.append(row)
+    
+    except Exception as e:
+        _log(f"  ERROR parsing GTF (read {lines_read:,} lines): {e}")
+        raise
+    
+    _log(f"  GTF streaming complete: {lines_read:,} lines read")
+    _log(f"  Extracted {len(gene_rows):,} gene rows, {len(exon_rows):,} exon rows")
+    
+    genes_pd = pd.DataFrame(gene_rows) if gene_rows else pd.DataFrame(columns=['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name'])
+    exons_pd = pd.DataFrame(exon_rows) if exon_rows else pd.DataFrame(columns=['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name'])
+    
+    return genes_pd, exons_pd
 
 
 def _pick_best_overlap(joined_df) -> "pd.DataFrame":
@@ -271,24 +362,19 @@ def annotate_features(
     t_total = time.time()
 
     # ------------------------------------------------------------------
-    # Step 1: Load GTF, extract genes + exons, free GTF immediately
+    # Step 1: Stream-parse GTF, extract genes + exons only
     # ------------------------------------------------------------------
-    _log("Step 1/8: loading GTF ...")
+    _log("Step 1/8: stream-parsing GTF (gene and exon rows only) ...")
     t0 = time.time()
     try:
-        gtf = pr.read_gtf(annotation_gtf, as_df=False)
-        _log(f"  GTF loaded in {time.time()-t0:.1f}s")
-        t0 = time.time()
-        genes_pd = gtf[gtf.Feature == "gene"].df
-        exons_pd = gtf[gtf.Feature == "exon"].df
-        _log(f"  sub-DataFrames extracted in {time.time()-t0:.1f}s")
+        genes_pd, exons_pd = _parse_gtf_streaming(annotation_gtf)
+        _log(f"  GTF parsed in {time.time()-t0:.1f}s")
         _log(f"  {_df_info('genes_pd', genes_pd)}")
         _log(f"  {_df_info('exons_pd (raw)', exons_pd)}")
-        del gtf
         gc.collect()
-        _log("  GTF freed")
+        _log("  Intermediate data freed")
     except Exception:
-        _log(f"FATAL: error loading GTF:\n{traceback.format_exc()}")
+        _log(f"FATAL: error parsing GTF:\n{traceback.format_exc()}")
         raise
 
     if "gene_id" not in genes_pd.columns:

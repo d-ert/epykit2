@@ -231,8 +231,8 @@ def main():
         help="Statistical test: 'fisher' (default) or 'beta_binomial' (≥6 reps)",
     )
     p_dmc.add_argument(
-        "--unite", action="store_true", default=True,
-        help="Use only sites covered in all samples (default: True)",
+        "--no-unite", action="store_false", dest="unite", default=True,
+        help="Include sites seen in at least one sample (default: only sites in all samples)",
     )
     p_dmc.set_defaults(func=_cmd_dmc)
 
