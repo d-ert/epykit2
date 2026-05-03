@@ -20,5 +20,15 @@ dependencies = [
   "psutil>=7.2.2",
 ]
 
+[project.optional-dependencies]
+plotting = [
+  "matplotlib>=3.5",
+  "seaborn>=0.12",
+]
+dev = [
+  "pytest",
+  "pytest-cov",
+]
+
 [project.scripts]
 epykit = "epykit.cli:main"

@@ -14,6 +14,27 @@ This package provides a complete WGBS analysis pipeline:
 
 __version__ = "0.1.0"
 
+from .methyldata import MethylData
+from .io import read_bismark, read_nfcore_methylseq, load
+from . import pp, tl
+from . import pl as _pl_module
+
+
+class _PlottingNamespace:
+    def __getattr__(self, name: str):
+        try:
+            import matplotlib.pyplot  # noqa: F401
+            import seaborn  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "Plotting requires matplotlib and seaborn. Install with: "
+                "pip install epykit[plotting]"
+            ) from exc
+        return getattr(_pl_module, name)
+
+
+pl = _PlottingNamespace()
+
 from .convert import convert_sample
 from .filter import (
     sample_summary,
