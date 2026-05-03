@@ -164,12 +164,14 @@ def _cmd_smooth(args: argparse.Namespace):
     from .dmr import smooth_methylation_bsmooth
 
     samples = args.samples.split(",")
-    result  = smooth_methylation_bsmooth(
-        args.methylstore, samples, bandwidth=args.bandwidth
+    smooth_path = args.output
+    smooth_methylation_bsmooth(
+        args.methylstore,
+        samples,
+        bandwidth=args.bandwidth,
+        output_path=smooth_path,
     )
-    result.write_parquet(args.output)
-    print(f"Smoothed betas written to {args.output}")
-    print(f"Total sites: {len(result):,}")
+    print(f"Smoothed betas written to {smooth_path}")
 
 
 def main():
@@ -297,7 +299,7 @@ def main():
         help="Comma-separated list of sample IDs",
     )
     p_sm.add_argument("--output",    required=True,
-                      help="Output Parquet file with smoothed betas")
+                      help="Output directory for smoothed beta chunks")
     p_sm.add_argument("--bandwidth", type=int, default=1000,
                       help="Smoothing bandwidth in bp (default 1000)")
     p_sm.set_defaults(func=_cmd_smooth)

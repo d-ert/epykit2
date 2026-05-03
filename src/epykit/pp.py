@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc as _gc
 from pathlib import Path
 
 import polars as pl
@@ -42,7 +41,14 @@ def filter_coverage(
     if quantile <= 0 or quantile > 1:
         raise ValueError(f"Invalid hi_perc/quantile value: {hi_perc}")
 
-    out = output_store or f"{md.store}_filtered"
+    # Derive output store path: explicit override, or from analysis_root cache, or legacy behavior
+    if output_store:
+        out = output_store
+    elif md._analysis_root:
+        out = str(Path(md._analysis_root) / ".cache" / "filtered")
+    else:
+        out = f"{md.store}_filtered"
+    
     filter_mod.filter_sites(
         methylstore_path=md.store,
         output_dir=out,
@@ -63,7 +69,7 @@ def filter_coverage(
         _append_store_history(md, "filtered", out, n_sites)
 
 
-def unite(md: MethylData, type: str = "intersect") -> None:
+def unite(md: MethylData, type: str = "union") -> None:
     """Record the site-alignment strategy for downstream DMC processing.
 
     This does **not** materialise the full intersection/union into memory.
@@ -85,20 +91,22 @@ def smooth(
     bandwidth: int = 1000,
     grid_resolution_bp: int | None = None,
 ) -> None:
-    """BSmooth-style smoothing. Write smoothed output to disk and free RAM."""
+    """BSmooth-style smoothing. Write smoothed output to disk chunk-by-chunk."""
     samples = md.obs.get_column("sample_id").to_list()
-    smoothed = smooth_methylation_bsmooth(
+    
+    # Derive smooth path: from analysis_root cache, or legacy behavior
+    if md._analysis_root:
+        smooth_path = str(Path(md._analysis_root) / ".cache" / "smoothed")
+    else:
+        smooth_path = f"{md.store}_smooth"
+
+    smooth_methylation_bsmooth(
         methylstore_path=md.store,
         samples=samples,
         bandwidth=bandwidth,
         grid_resolution_bp=grid_resolution_bp,
+        output_path=smooth_path,
     )
-
-    # Write to disk immediately and free RAM — matches old scratch.py pattern
-    smooth_path = f"{md.store}_smooth.parquet"
-    smoothed.write_parquet(smooth_path, compression="zstd")
-    del smoothed
-    _gc.collect()
 
     md._smoothed = True
     md.uns["smooth_path"] = smooth_path

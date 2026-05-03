@@ -297,7 +297,8 @@ def smooth_methylation_bsmooth(
     samples: list[str],
     bandwidth: int = 1000,
     grid_resolution_bp: int | None = None,
-) -> pl.DataFrame:
+    output_path: str | None = None,
+) -> pl.DataFrame | None:
     """Smooth per-sample beta values with a fast Gaussian kernel.
 
     Implements the spirit of BSmooth pre-processing: within each chromosome
@@ -328,6 +329,10 @@ def smooth_methylation_bsmooth(
     pl.DataFrame
         Columns: chrom, pos, sample, beta_raw (Float32), beta_smooth (Float32).
         Sites with zero coverage have NaN in both beta columns.
+        Returned only when ``output_path`` is not provided.
+    None
+        When ``output_path`` is provided, each chunk is written to disk as it
+        is processed and no full in-memory result is accumulated.
     """
     try:
         from scipy.ndimage import gaussian_filter1d
@@ -342,6 +347,9 @@ def smooth_methylation_bsmooth(
 
     # Determine grid resolution once (same for all samples/chroms)
     _grid_res = max(1, bandwidth // 20) if grid_resolution_bp is None else grid_resolution_bp
+    _out_root = Path(output_path) if output_path else None
+    if _out_root:
+        _out_root.mkdir(parents=True, exist_ok=True)
 
     for sample in samples:
         sample_dir = store / f"sample={sample}"
@@ -404,13 +412,25 @@ def smooth_methylation_bsmooth(
                     sample, chrom, n_valid,
                 )
 
-            records.append(pl.DataFrame({
+            chunk = pl.DataFrame({
                 "chrom":       pl.Series([chrom]  * len(df), dtype=pl.Utf8),
                 "pos":         df["pos"],
                 "sample":      pl.Series([sample] * len(df), dtype=pl.Utf8),
                 "beta_raw":    pl.Series(beta_raw),
                 "beta_smooth": pl.Series(beta_smooth),
-            }))
+            })
+
+            if _out_root is not None:
+                part_dir = _out_root / f"sample={sample}" / f"chrom={chrom}"
+                part_dir.mkdir(parents=True, exist_ok=True)
+                chunk.write_parquet(
+                    str(part_dir / "part-0.parquet"), compression="zstd"
+                )
+            else:
+                records.append(chunk)
+
+    if _out_root is not None:
+        return None
 
     if not records:
         return pl.DataFrame(schema=_SMOOTH_EMPTY_SCHEMA)

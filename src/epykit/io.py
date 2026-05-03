@@ -69,18 +69,22 @@ def read_bismark(
             f"treatment_group={treatment_group}, control_group={control_group}"
         )
 
-    Path(store_dir).mkdir(parents=True, exist_ok=True)
+    # Organize stores under a .cache subdirectory for a cleaner output layout
+    analysis_root = Path(store_dir)
+    cache_store_dir = str(analysis_root / ".cache" / "raw")
+    
+    Path(cache_store_dir).mkdir(parents=True, exist_ok=True)
     for path, sample_id in files:
         print(f"  Converting {sample_id} ...", flush=True)
         ensure_converted_sample(
             path,
             sample_id,
-            store_dir,
+            cache_store_dir,
             context=context,
             reference_fasta=reference_fasta,
         )
 
-    n_sites_raw = _count_store_rows(store_dir)
+    n_sites_raw = _count_store_rows(cache_store_dir)
     uns = {
         "samplesheet": samplesheet,
         "pipeline": "bismark",
@@ -89,16 +93,18 @@ def read_bismark(
     if n_sites_raw is not None:
         uns["n_sites_raw"] = n_sites_raw
     uns["_store_history"] = [
-        {"step": "raw", "path": store_dir, "n_sites": n_sites_raw}
+        {"step": "raw", "path": cache_store_dir, "n_sites": n_sites_raw}
     ]
 
-    return MethylData(
+    md = MethylData(
         obs=pl.DataFrame(obs_rows),
-        store=store_dir,
+        store=cache_store_dir,
         assembly=assembly,
         context=context,
         uns=uns,
     )
+    md._analysis_root = str(analysis_root)
+    return md
 
 
 def load(path: str) -> MethylData:
@@ -170,7 +176,11 @@ def read_nfcore_methylseq(
         )
 
     obs_rows: list[dict] = []
-    Path(store_dir).mkdir(parents=True, exist_ok=True)
+    # Organize stores under a .cache subdirectory for a cleaner output layout
+    analysis_root = Path(store_dir)
+    cache_store_dir = str(analysis_root / ".cache" / "raw")
+    
+    Path(cache_store_dir).mkdir(parents=True, exist_ok=True)
     for row in rows:
         group = row["group"]
         if group not in (treatment_group, control_group):
@@ -196,7 +206,7 @@ def read_nfcore_methylseq(
         obs_rows.append(obs_row)
 
         print(f"  {sample_id} ({group}) ← {cov_path}", flush=True)
-        ensure_converted_sample(cov_path, sample_id, store_dir, context=context)
+        ensure_converted_sample(cov_path, sample_id, cache_store_dir, context=context)
 
     if not obs_rows:
         raise ValueError(
@@ -204,19 +214,21 @@ def read_nfcore_methylseq(
             f"treatment_group={treatment_group}, control_group={control_group}"
         )
 
-    n_sites_raw = _count_store_rows(store_dir)
+    n_sites_raw = _count_store_rows(cache_store_dir)
     uns = {
         "pipeline": "nf-core/methylseq",
         "nfcore_run": str(run),
         "samplesheet": str(samplesheet_path),
         "epykit_version": "0.1.0",
         "n_sites_raw": n_sites_raw,
-        "_store_history": [{"step": "raw", "path": store_dir, "n_sites": n_sites_raw}],
+        "_store_history": [{"step": "raw", "path": cache_store_dir, "n_sites": n_sites_raw}],
     }
-    return MethylData(
+    md = MethylData(
         obs=pl.DataFrame(obs_rows),
-        store=store_dir,
+        store=cache_store_dir,
         assembly=assembly,
         context=context,
         uns=uns,
     )
+    md._analysis_root = str(analysis_root)
+    return md

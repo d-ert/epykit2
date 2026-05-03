@@ -23,6 +23,7 @@ class MethylData:
     _filtered: bool = field(default=False, repr=False)
     _united: bool = field(default=False, repr=False)
     _smoothed: bool = field(default=False, repr=False)
+    _analysis_root: Optional[str] = field(default=None, repr=False)
 
     @property
     def treatment_ids(self) -> list[str]:

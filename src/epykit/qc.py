@@ -161,7 +161,7 @@ def global_methylation_report(
         lf = pl.scan_parquet(str(sample_dir / "**" / "part-*.parquet"))
 
         # Determine if the context column is present
-        schema = lf.schema
+        schema = lf.collect_schema()
         has_context = "context" in schema
 
         if has_context:
