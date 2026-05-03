@@ -78,7 +78,11 @@ class MethylData:
         return df
 
     def save(self, path: str) -> None:
-        out = Path(path)
+        # If analysis_root is set, save results under analysis_root/results/
+        if self._analysis_root:
+            out = Path(self._analysis_root) / "results" / Path(path).name
+        else:
+            out = Path(path)
         out.mkdir(parents=True, exist_ok=True)
 
         self.obs.write_parquet(str(out / "obs.parquet"))
@@ -100,6 +104,7 @@ class MethylData:
             "_filtered": self._filtered,
             "_united": self._united,
             "_smoothed": self._smoothed,
+            "_analysis_root": self._analysis_root,
             "varm_keys": list(self.varm.keys()),
             "uns": serialisable_uns,
         }
@@ -120,7 +125,7 @@ class MethylData:
             if isinstance(value, dict) and "__parquet__" in value:
                 uns[key] = pl.read_parquet(str(out / value["__parquet__"]))
 
-        return cls(
+        md = cls(
             obs=obs,
             store=meta.get("store", ""),
             assembly=meta.get("assembly", "unknown"),
@@ -131,6 +136,8 @@ class MethylData:
             _united=meta.get("_united", False),
             _smoothed=meta.get("_smoothed", False),
         )
+        md._analysis_root = meta.get("_analysis_root")
+        return md
 
     def __repr__(self) -> str:
         n_sites = self.uns.get("n_sites_filtered") or self.uns.get("n_sites_raw", "?")
