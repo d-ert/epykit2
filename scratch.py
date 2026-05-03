@@ -28,11 +28,11 @@ from epykit.qc import (
 
 ROOT = Path(__file__).resolve().parent
 
-GTF_PATH  = ROOT / "raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf"
-BED_PATH  = ROOT / "raw_data/hg38_cpg_islands.bed"
+GTF_PATH = ROOT / "raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf"
+BED_PATH = ROOT / "raw_data/hg38_cpg_islands.bed"
 
-SAMPLE_SHEET = ROOT / "samplesheet.csv"
-RAW_STORE    = ROOT / "scratch_store"
+SAMPLE_SHEET   = ROOT / "samplesheet.csv"
+RAW_STORE      = ROOT / "scratch_store"
 FILTERED_STORE = ROOT / "scratch_store_filtered"
 
 DMC_FISHER_OUTPUT     = ROOT / "scratch_dmc.fisher.parquet"
@@ -43,8 +43,10 @@ DMC_BB_SIG_OUTPUT     = ROOT / "scratch_dmc.beta_binomial.sig.csv"
 DMR_OUTPUT    = ROOT / "scratch_dmr.parquet"
 SMOOTH_OUTPUT = ROOT / "scratch_smooth.parquet"
 
-DMC_ANNOTATED_OUTPUT = ROOT / "scratch_dmc.annotated.parquet"
-DMR_ANNOTATED_OUTPUT = ROOT / "scratch_dmr.annotated.parquet"
+# Annotated outputs — one per test
+DMC_FISHER_ANNOTATED_OUTPUT = ROOT / "scratch_dmc.fisher.annotated.parquet"
+DMC_BB_ANNOTATED_OUTPUT     = ROOT / "scratch_dmc.beta_binomial.annotated.parquet"
+DMR_ANNOTATED_OUTPUT        = ROOT / "scratch_dmr.annotated.parquet"
 
 QC_GLOBAL_OUTPUT   = ROOT / "scratch_qc.global.parquet"
 QC_COVERAGE_OUTPUT = ROOT / "scratch_qc.coverage.parquet"
@@ -88,15 +90,6 @@ def section(title: str) -> None:
     log("=" * 60)
 
 
-def free(*objects) -> None:
-    """Delete references and run gc.collect(); log RSS before and after."""
-    before = _mem_str()
-    for obj in objects:
-        del obj
-    gc.collect()
-    log(f"  [freed]{before} -> {_mem_str()}")
-
-
 # ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
@@ -127,11 +120,71 @@ def _prepare_synthetic_chh_store(sample_id: str) -> None:
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="scratch.py")
-    ap.add_argument("--samplesheet",      default=str(SAMPLE_SHEET))
-    ap.add_argument("--gtf",              default=str(GTF_PATH))
-    ap.add_argument("--cpg-islands-bed",  dest="cpg_islands_bed", default=str(BED_PATH))
-    ap.add_argument("--no-annotate",      action="store_true")
+    ap.add_argument("--samplesheet",     default=str(SAMPLE_SHEET))
+    ap.add_argument("--gtf",             default=str(GTF_PATH))
+    ap.add_argument("--cpg-islands-bed", dest="cpg_islands_bed", default=str(BED_PATH))
+    ap.add_argument("--no-annotate",     action="store_true")
     return ap.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Annotation helper — annotates a full DMC/DMR DataFrame and saves to disk.
+# GTF is cached after the first call so subsequent calls are fast.
+# ---------------------------------------------------------------------------
+
+def _annotate_and_save(
+    df: pl.DataFrame,
+    label: str,
+    out_path: Path,
+    gtf_path: Path,
+    bed_path: Path,
+) -> None:
+    """Annotate *all* rows in df with gene features and CpG island context,
+    then write to out_path.  Both annotation steps are skipped gracefully if
+    the reference files are absent.
+    """
+    log(f"Annotating {len(df):,} {label} sites ...")
+
+    if gtf_path.exists():
+        log(f"  GTF: {gtf_path}")
+        t0 = time.time()
+        try:
+            df = annotate_features(
+                df,
+                annotation_gtf=str(gtf_path),
+                promoter_upstream_bp=2_000,
+                promoter_downstream_bp=200,
+            )
+            log(f"  annotate_features done in {time.time() - t0:.1f}s")
+        except Exception:
+            log(f"  ERROR in annotate_features:")
+            traceback.print_exc(file=sys.stdout)
+        finally:
+            gc.collect()
+    else:
+        log(f"  GTF not found at {gtf_path} — skipping feature annotation")
+
+    if bed_path.exists():
+        log(f"  BED: {bed_path}")
+        t0 = time.time()
+        try:
+            df = annotate_cpg_islands(df, cpg_island_bed=str(bed_path))
+            log(f"  annotate_cpg_islands done in {time.time() - t0:.1f}s")
+        except Exception:
+            log(f"  ERROR in annotate_cpg_islands:")
+            traceback.print_exc(file=sys.stdout)
+        finally:
+            gc.collect()
+    else:
+        log(f"  BED not found at {bed_path} — skipping CpG island annotation")
+
+    df.write_parquet(str(out_path))
+    log(f"  Written -> {out_path.name}")
+
+    # Print a preview of the annotation columns
+    preview_cols = [c for c in ["chrom", "pos", "gene_id", "feature_type", "cpg_context"]
+                    if c in df.columns]
+    print(df.select(preview_cols).head(5), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +211,8 @@ def main() -> None:
         DMC_FISHER_OUTPUT, DMC_BB_OUTPUT,
         DMC_FISHER_SIG_OUTPUT, DMC_BB_SIG_OUTPUT,
         DMR_OUTPUT, SMOOTH_OUTPUT,
-        DMC_ANNOTATED_OUTPUT, DMR_ANNOTATED_OUTPUT,
+        DMC_FISHER_ANNOTATED_OUTPUT, DMC_BB_ANNOTATED_OUTPUT,
+        DMR_ANNOTATED_OUTPUT,
         QC_GLOBAL_OUTPUT, QC_COVERAGE_OUTPUT,
     ]:
         out_path.unlink(missing_ok=True)
@@ -171,7 +225,7 @@ def main() -> None:
         input_path = (ROOT / row["path"]).resolve()
         sample_id  = row["sample_id"]
         t0 = time.time()
-        converted  = ensure_converted_sample(str(input_path), sample_id, str(RAW_STORE))
+        converted = ensure_converted_sample(str(input_path), sample_id, str(RAW_STORE))
         log(f"  {sample_id}: {'converted' if converted else 'cached'}  ({time.time()-t0:.1f}s)")
 
     log(f"Filtering -> {FILTERED_STORE.name} ...")
@@ -210,8 +264,6 @@ def main() -> None:
     log_df("dmc_fisher", dmc_fisher)
     print(dmc_fisher.head(10), flush=True)
 
-    # Free Fisher result — it's safely on disk.
-    # Phase 2c (DMR) will read it back from parquet.
     del dmc_fisher
     gc.collect()
     log("Fisher result freed from RAM")
@@ -237,21 +289,33 @@ def main() -> None:
     # ---------------------------------------------------------------
     section("Phase 2c: DMR calling")
     # ---------------------------------------------------------------
-    # Read Fisher result back from the parquet written in Phase 2a.
+    # DMR calling uses Fisher results (pooled counts, conventional approach).
+    # Post-filter on mean_pvalue < 0.05 to discard windows where only a few
+    # outlier CpGs crossed the significance threshold.
     log("Reading Fisher DMC from disk for DMR calling ...")
     dmc_fisher = pl.read_parquet(str(DMC_FISHER_OUTPUT))
     log_df("dmc_fisher (reloaded)", dmc_fisher)
 
     t0 = time.time()
     dmr_results = call_dmr_sliding_window(
-        dmc_fisher, window_bp=500, step_bp=250,
-        min_cpgs=5, min_sites_significant=3,
-        alpha=0.05, min_abs_meth_diff=0.1,
+        dmc_fisher,
+        window_bp=500,
+        step_bp=250,
+        min_cpgs=5,
+        min_sites_significant=3,
+        alpha=0.05,
+        min_abs_meth_diff=0.1,
     )
+
+    # Post-filter: require the DMR window to be coherently differential,
+    # not just contain a handful of individually significant CpGs in noise.
+    if len(dmr_results) > 0:
+        dmr_results = dmr_results.filter(pl.col("mean_pvalue") < 0.05)
+
     dmr_results.write_parquet(str(DMR_OUTPUT))
     log(f"DMR done in {time.time()-t0:.1f}s  total={len(dmr_results):,}")
     if len(dmr_results) > 0:
-        print(dmr_results.head(10), flush=True)
+        print(dmr_results, flush=True)
 
     del dmc_fisher
     gc.collect()
@@ -279,91 +343,54 @@ def main() -> None:
         gtf_path = Path(args.gtf)
         bed_path = Path(args.cpg_islands_bed)
 
-        # Read Fisher back from disk; take first 20k for annotation
+        # --- Annotate Fisher DMC (all sites) ---
+        section("Phase 3a: Annotate Fisher DMC")
         dmc_fisher = pl.read_parquet(str(DMC_FISHER_OUTPUT))
-        dmc_annot  = dmc_fisher.head(min(20_000, len(dmc_fisher)))
+        dmc_fisher_sig = dmc_fisher.filter(pl.col("qvalue") < 0.05)
+        log(
+            f"Fisher DMC: {len(dmc_fisher):,} total -> {len(dmc_fisher_sig):,} significant (qvalue < 0.05)"
+        )
         del dmc_fisher
         gc.collect()
-
-        log(f"Annotation input subset: {len(dmc_annot):,} sites")
-
-        if gtf_path.exists():
-            log(f"GTF path: {gtf_path}")
-            t0 = time.time()
-            try:
-                dmc_annot = annotate_features(
-                    dmc_annot, annotation_gtf=str(gtf_path),
-                    promoter_upstream_bp=2_000, promoter_downstream_bp=200,
-                )
-                log(f"annotate_features done in {time.time()-t0:.1f}s")
-            except Exception:
-                log(f"ERROR in annotate_features after {time.time()-t0:.1f}s:")
-                traceback.print_exc(file=sys.stdout)
-            finally:
-                gc.collect()
-        else:
-            log(f"GTF not found at {gtf_path} — skipping feature annotation")
-
-        if bed_path.exists():
-            log(f"BED path: {bed_path}")
-            t0 = time.time()
-            try:
-                dmc_annot = annotate_cpg_islands(dmc_annot, cpg_island_bed=str(bed_path))
-                log(f"annotate_cpg_islands done in {time.time()-t0:.1f}s")
-            except Exception:
-                log(f"ERROR in annotate_cpg_islands after {time.time()-t0:.1f}s:")
-                traceback.print_exc(file=sys.stdout)
-            finally:
-                gc.collect()
-        else:
-            log(f"BED not found at {bed_path} — skipping CpG island annotation")
-
-        log(f"Writing annotated DMC -> {DMC_ANNOTATED_OUTPUT.name} ...")
-        dmc_annot.write_parquet(str(DMC_ANNOTATED_OUTPUT))
-        cols_to_print = [c for c in ["chrom", "pos", "gene_id", "feature_type", "cpg_context"]
-                         if c in dmc_annot.columns]
-        print(dmc_annot.select(cols_to_print).head(10), flush=True)
-        del dmc_annot
+        _annotate_and_save(
+            dmc_fisher_sig, "Fisher DMC (significant)",
+            DMC_FISHER_ANNOTATED_OUTPUT,
+            gtf_path, bed_path,
+        )
+        del dmc_fisher_sig
         gc.collect()
 
+        # --- Annotate beta-binomial DMC (all sites) ---
+        # GTF is now cached — this call skips the 70s parse entirely.
+        section("Phase 3b: Annotate beta-binomial DMC")
+        dmc_bb = pl.read_parquet(str(DMC_BB_OUTPUT))
+        dmc_bb_sig = dmc_bb.filter(pl.col("qvalue") < 0.05)
+        log(
+            f"Beta-binomial DMC: {len(dmc_bb):,} total -> {len(dmc_bb_sig):,} significant (qvalue < 0.05)"
+        )
+        del dmc_bb
+        gc.collect()
+        _annotate_and_save(
+            dmc_bb_sig, "beta-binomial DMC (significant)",
+            DMC_BB_ANNOTATED_OUTPUT,
+            gtf_path, bed_path,
+        )
+        del dmc_bb_sig
+        gc.collect()
+
+        # --- Annotate DMRs ---
+        section("Phase 3c: Annotate DMRs")
+        dmr_results = pl.read_parquet(str(DMR_OUTPUT))
         if len(dmr_results) > 0:
-            log(f"Annotating {len(dmr_results):,} DMRs ...")
-            dmr_annot = dmr_results
-
-            if gtf_path.exists():
-                t0 = time.time()
-                try:
-                    dmr_annot = annotate_features(
-                        dmr_annot, annotation_gtf=str(gtf_path),
-                        promoter_upstream_bp=2_000, promoter_downstream_bp=200,
-                    )
-                    log(f"DMR annotate_features done in {time.time()-t0:.1f}s")
-                except Exception:
-                    log(f"ERROR in annotate_features (DMRs):")
-                    traceback.print_exc(file=sys.stdout)
-                finally:
-                    gc.collect()
-
-            if bed_path.exists():
-                t0 = time.time()
-                try:
-                    dmr_annot = annotate_cpg_islands(dmr_annot, cpg_island_bed=str(bed_path))
-                    log(f"DMR annotate_cpg_islands done in {time.time()-t0:.1f}s")
-                except Exception:
-                    log(f"ERROR in annotate_cpg_islands (DMRs):")
-                    traceback.print_exc(file=sys.stdout)
-                finally:
-                    gc.collect()
-
-            dmr_annot.write_parquet(str(DMR_ANNOTATED_OUTPUT))
-            log(f"Annotated DMR written to {DMR_ANNOTATED_OUTPUT.name}")
-            del dmr_annot
-            gc.collect()
+            _annotate_and_save(
+                dmr_results, "DMR",
+                DMR_ANNOTATED_OUTPUT,
+                gtf_path, bed_path,
+            )
         else:
             log("No DMRs to annotate")
-
-    del dmr_results
-    gc.collect()
+        del dmr_results
+        gc.collect()
 
     # ---------------------------------------------------------------
     section("Phase 4: QC")

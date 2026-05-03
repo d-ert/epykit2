@@ -219,7 +219,8 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
 
 def _pick_best_overlap(joined_df) -> "pd.DataFrame":
     df = joined_df.copy()
-    df["_priority"] = df["Feature_b"].map(_FEATURE_PRIORITY).fillna(99)
+    feat_col = "Feature_b" if "Feature_b" in df.columns else "Feature"
+    df["_priority"] = df[feat_col].map(_FEATURE_PRIORITY).fillna(99)
     return (
         df.sort_values("_priority")
           .groupby("_row_idx", as_index=False)
@@ -275,8 +276,10 @@ def _annotate_chromosome_chunk(
     try:
         # FIX-1: cast Feature to Categorical so pyranges can null-fill it
         feat_df = chrom_features_df.copy()
-        feat_df["Feature"] = feat_df["Feature"].astype("category")
+        for _col in feat_df.select_dtypes(include=["object"]).columns:
+            feat_df[_col] = feat_df[_col].astype("category")
         features_pr = pr.PyRanges(feat_df)
+
         _log(f"  {chrom}: features PyRanges built in {time.time()-t0:.1f}s")
     except Exception:
         _log(f"  {chrom}: ERROR building features PyRanges:\n{traceback.format_exc()}")
@@ -310,9 +313,10 @@ def _annotate_chromosome_chunk(
         del joined_df
         gc.collect()
 
+        feat_col = "Feature_b" if "Feature_b" in best.columns else "Feature"
         best_slim = (
-            best[["_row_idx", "gene_id", "gene_name", "Feature_b"]]
-            .rename(columns={"Feature_b": "feature_type"})
+            best[["_row_idx", "gene_id", "gene_name", feat_col]]
+            .rename(columns={feat_col: "feature_type"})
         )
         del best
 
@@ -320,9 +324,9 @@ def _annotate_chromosome_chunk(
             pd.DataFrame({"_row_idx": np.arange(chunk_n, dtype=np.int32)})
             .merge(best_slim, on="_row_idx", how="left")
         )
-        result["gene_id"]      = local_df["gene_id"].fillna("").astype(str).to_numpy()
-        result["gene_name"]    = local_df["gene_name"].fillna("").astype(str).to_numpy()
-        result["feature_type"] = local_df["feature_type"].fillna("intergenic").astype(str).to_numpy()
+        result["gene_id"]      = local_df["gene_id"].fillna("").astype(str).replace("-1", "").to_numpy()
+        result["gene_name"]    = local_df["gene_name"].fillna("").astype(str).replace("-1", "").to_numpy()
+        result["feature_type"] = local_df["feature_type"].fillna("intergenic").astype(str).replace("-1", "intergenic").to_numpy()
 
         n_annotated = int((result["gene_id"] != "").sum())
         _log(f"  {chrom}: {n_annotated:,}/{chunk_n:,} sites annotated")
@@ -589,17 +593,21 @@ def annotate_cpg_islands(
     cpg_island_bed: str,
 ) -> pl.DataFrame:
     """Classify each CpG site by CpG-island context."""
+    _log("=" * 60)
+    _log("annotate_cpg_islands START")
+    _log(f"  sites: {_df_info('sites', sites)}")
+    _log(f"  BED: {cpg_island_bed}")
+
+    if len(sites) == 0:
+        _log("  sites is empty — returning early with no cpg_context column")
+        return sites
+
     try:
         import pyranges as pr
     except ImportError as exc:
         raise ImportError("pyranges is required. pip install pyranges") from exc
 
     import pandas as pd
-
-    _log("=" * 60)
-    _log("annotate_cpg_islands START")
-    _log(f"  sites: {_df_info('sites', sites)}")
-    _log(f"  BED: {cpg_island_bed}")
 
     t_total = time.time()
     n = len(sites)
