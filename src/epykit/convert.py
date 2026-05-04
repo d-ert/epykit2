@@ -137,6 +137,59 @@ def _promote_sample_dir(temp_sample_dir: Path, final_sample_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CpG strand merging (BIO-2)
+# ---------------------------------------------------------------------------
+
+def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
+    """Merge + and - strand CpG pairs into single sites at the + strand position.
+    
+    When Bismark .cov files contain both strands, a CpG dinucleotide appears as:
+      - + strand at position N (C position)
+      - - strand at position N+1 (G position on reverse strand)
+    
+    This function merges them by:
+      1. Shifting - strand positions back by 1 (N+1 → N)
+      2. Grouping by (chrom, pos) and summing counts
+      3. Setting all merged sites to + strand
+    
+    If the input already has strand-merged data (e.g., from bismark2bedGraph),
+    this function is a no-op.
+    """
+    if "strand" not in df.columns:
+        # No strand information, return as-is
+        return df
+    
+    # Separate + and - strands
+    plus = df.filter(pl.col("strand") == "+")
+    minus = df.filter(pl.col("strand") == "-")
+    
+    if len(minus) == 0:
+        # No - strand data, already merged or only + strand present
+        return df
+    
+    # Shift - strand positions to + strand coordinate (N+1 → N)
+    minus = minus.with_columns(
+        (pl.col("pos") - 1).alias("pos")
+    )
+    
+    # Combine and merge by position
+    combined = pl.concat([plus, minus])
+    
+    # Group by chrom and pos, summing methylation counts
+    merged = combined.group_by(["chrom", "pos"], maintain_order=True).agg([
+        pl.sum("N_meth").alias("N_meth"),
+        pl.sum("N_unmeth").alias("N_unmeth"),
+        pl.sum("coverage").alias("coverage"),
+        pl.first("sample").alias("sample"),
+        pl.first("context").alias("context"),
+    ]).with_columns(
+        pl.lit("+").alias("strand")
+    )
+    
+    return merged.sort("pos")
+
+
+# ---------------------------------------------------------------------------
 # Optional strand inference
 # ---------------------------------------------------------------------------
 
@@ -203,6 +256,7 @@ def convert_sample(
     row_group_size: int = 1_000_000,
     context: str = "CpG",
     reference_fasta: str | None = None,
+    merge_strands: bool = True,
 ) -> None:
     """Convert a Bismark .cov (optionally gzipped) file into a partitioned
     Parquet store.
@@ -224,6 +278,11 @@ def convert_sample(
         Path to an indexed reference FASTA. When provided, strand is inferred
         from the reference base at each position (BIO-1). Without this
         argument, strand defaults to "*".
+    merge_strands : bool
+        If True (default), merge + and - strand CpG pairs into single sites
+        at the + strand position (BIO-2). This is appropriate for .cov files
+        from bismark_methylation_extractor with both strands. Files from
+        bismark2bedGraph are typically already strand-merged.
 
     Output schema
     -------------
@@ -270,6 +329,10 @@ def convert_sample(
         ["chrom", "pos", "strand", "context", "N_meth", "N_unmeth", "coverage",
          "sample"]
     )
+
+    # CpG strand merging (BIO-2): merge + and - strand pairs if requested
+    if merge_strands and reference_fasta is not None:
+        df = _merge_cpg_pairs(df)
 
     # Write one Parquet file per chromosome
     for chrom in df["chrom"].unique().to_list():

@@ -115,8 +115,13 @@ def _recompute_dmr_stats(
     window_diffs = meth_diffs[lo:hi]
     window_pvals = pvals[lo:hi]
 
-    n_hyper = int((window_diffs > 0).sum())
-    n_hypo  = int((window_diffs < 0).sum())
+    # Filter out NaN diffs for direction determination
+    valid_diffs = window_diffs[~np.isnan(window_diffs)]
+    if len(valid_diffs) == 0:
+        return None  # no valid diffs
+    
+    n_hyper = int((valid_diffs > 0).sum())
+    n_hypo  = int((valid_diffs < 0).sum())
     if n_hyper == n_hypo:
         return None  # ambiguous direction
 
@@ -393,14 +398,17 @@ def smooth_methylation_bsmooth(
                 grid_pos    = np.arange(grid_start, grid_end, _grid_res,
                                         dtype=np.float64)
 
-                # Interpolate raw betas onto the regular grid (linear)
-                grid_beta   = np.interp(grid_pos, pos_valid, beta_valid)
+                # Coverage-weighted interpolation onto the regular grid
+                cov_valid = cov[valid].astype(np.float64)
+                grid_beta = np.interp(grid_pos, pos_valid, beta_valid)
+                grid_weights = np.interp(grid_pos, pos_valid, cov_valid)
+                grid_weights = np.maximum(grid_weights, 0.1)  # avoid exact zeros
 
-                # Apply Gaussian filter on the grid
-                sigma_grid  = max(bandwidth / _grid_res, 0.5)
-                smoothed_grid = gaussian_filter1d(
-                    grid_beta, sigma=sigma_grid, mode="nearest"
-                )
+                # Apply weighted Gaussian: smooth numerator and denominator separately
+                sigma_grid = max(bandwidth / _grid_res, 0.5)
+                grid_num = gaussian_filter1d(grid_beta * grid_weights, sigma=sigma_grid, mode="nearest")
+                grid_den = gaussian_filter1d(grid_weights, sigma=sigma_grid, mode="nearest")
+                smoothed_grid = grid_num / np.maximum(grid_den, 1e-9)
                 np.clip(smoothed_grid, 0.0, 1.0, out=smoothed_grid)
 
                 # Interpolate smoothed values back to original CpG positions

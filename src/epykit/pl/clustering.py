@@ -54,7 +54,7 @@ def pca(
 
     # Count total sites
     total_sites = (
-        pl.scan_parquet(f"{md.store_filtered}/sample=*/chrom=*/part-*.parquet")
+        pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
         .select(pl.count())
         .collect()
     ).item()
@@ -62,12 +62,12 @@ def pca(
     # Determine sampling strategy
     if total_sites <= n_sites * 2:
         # Load all sites
-        all_data = pl.scan_parquet(f"{md.store_filtered}/sample=*/chrom=*/part-*.parquet").collect()
+        all_data = pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet").collect()
     else:
         # Sample every Kth site to get ~n_sites
         k = max(1, total_sites // n_sites)
         all_data = (
-            pl.scan_parquet(f"{md.store_filtered}/sample=*/chrom=*/part-*.parquet")
+            pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
             .select(["chrom", "pos", "sample", "N_meth", "coverage"])
             .collect()
         )

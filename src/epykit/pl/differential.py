@@ -73,9 +73,11 @@ def ma_plot(
     p_col = "qvalue" if "qvalue" in dmc.columns else "pvalue"
     diff = dmc["meth_diff"].to_numpy()
     pval = dmc[p_col].to_numpy()
-    mean_beta = dmc["mean_beta"].to_numpy() if "mean_beta" in dmc.columns else (
-        dmc.select(pl.col("*").exclude("meth_diff")).mean().to_dicts()[0].get("beta", 0.5)
-    )
+    
+    # Compute mean_beta as average of case and control
+    mean_beta = (
+        dmc["mean_beta_case"].to_numpy() + dmc["mean_beta_control"].to_numpy()
+    ) / 2.0
 
     sig = (pval < alpha) & (np.abs(diff) >= min_abs_diff)
     hyper = sig & (diff > 0)

@@ -256,6 +256,86 @@ def _beta_binom_statsmodels(
 
 
 # ---------------------------------------------------------------------------
+# CMH test — O(n_sites) memory, statistically correct for replicates
+# ---------------------------------------------------------------------------
+
+def _cmh_init(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Allocate CMH accumulators. Memory: ~32 bytes × n_sites total."""
+    return (
+        np.zeros(n, dtype=np.float64),  # Σ(a - E): obs minus expected
+        np.zeros(n, dtype=np.float64),  # Σ V:      variance sum
+        np.zeros(n, dtype=np.float64),  # Σ(ad/n):  MH OR numerator
+        np.zeros(n, dtype=np.float64),  # Σ(bc/n):  MH OR denominator
+    )
+
+
+def _cmh_update(
+    ome: np.ndarray,
+    var_sum: np.ndarray,
+    or_num: np.ndarray,
+    or_den: np.ndarray,
+    meth_case: np.ndarray,
+    cov_case: np.ndarray,
+    meth_ctrl: np.ndarray,
+    cov_ctrl: np.ndarray,
+) -> None:
+    """In-place CMH accumulation from one case/control sample pair.
+
+    Sites where either sample has zero coverage contribute V=0 and
+    therefore do not influence the statistic — this correctly handles
+    union-mode sites with partial coverage without any special casing.
+    """
+    a = meth_case.astype(np.float64)
+    b = (cov_case - meth_case).astype(np.float64)  # unmeth case
+    c = meth_ctrl.astype(np.float64)
+    d = (cov_ctrl - meth_ctrl).astype(np.float64)  # unmeth ctrl
+    n = a + b + c + d
+
+    # Sites need n > 1 for a non-degenerate variance term
+    valid = n > 1
+
+    row1 = a + b  # case coverage
+    row2 = c + d  # ctrl coverage
+    col1 = a + c  # total methylated
+    col2 = b + d  # total unmethylated
+
+    E = np.where(valid, row1 * col1 / n, 0.0)
+    V = np.where(
+        valid,
+        row1 * row2 * col1 * col2 / (n * n * (n - 1.0)),
+        0.0,
+    )
+
+    ome[valid] += (a - E)[valid]
+    var_sum[valid] += V[valid]
+
+    # Mantel-Haenszel common odds ratio terms
+    or_num += np.where(valid, a * d / n, 0.0)
+    or_den += np.where(valid, b * c / n, 0.0)
+
+
+def _cmh_finalize(
+    ome: np.ndarray,
+    var_sum: np.ndarray,
+    or_num: np.ndarray,
+    or_den: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute CMH p-value and MH log2 OR from accumulated sums."""
+    cmh_stat = np.where(var_sum > 0, ome ** 2 / var_sum, np.nan)
+    pvals = np.where(
+        ~np.isnan(cmh_stat),
+        sp_stats.chi2.sf(cmh_stat, df=1),
+        np.nan,
+    )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mh_or = np.where(or_den > 0, or_num / or_den, np.nan)
+        log2_mh_or = np.where(mh_or > 0, np.log2(mh_or), np.nan)
+
+    return pvals, log2_mh_or
+
+
+# ---------------------------------------------------------------------------
 # Welford online statistics — O(n_sites) memory regardless of n_samples
 # ---------------------------------------------------------------------------
 
@@ -349,7 +429,14 @@ def _beta_binom_mom_from_welford(
     )
     pvals[degenerate] = np.nan
 
-    log2_ors = np.full(n_sites, np.nan, dtype=np.float64)
+    # Compute log2 odds ratio from Welford means
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log2_ors = np.log2(
+            (mean_case / np.maximum(1 - mean_case, 1e-9)) /
+            np.maximum(mean_ctrl / np.maximum(1 - mean_ctrl, 1e-9), 1e-9)
+        )
+    log2_ors[degenerate] = np.nan
+    
     return pvals, log2_ors
 
 
@@ -501,32 +588,46 @@ def _process_one_chromosome(
     mean_case, M2_case, n_valid_case = _welford_init(n_sites)
     mean_ctrl, M2_ctrl, n_valid_ctrl = _welford_init(n_sites)
 
-    # --- Case samples: one Parquet file at a time ---
-    for sample in samples_case:
-        meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
-        meth_case_sum += meth
-        cov_case_sum  += cov
-        _welford_update(mean_case, M2_case, n_valid_case, meth, cov)
-        del meth, cov
-
-    # --- Control samples: one Parquet file at a time ---
-    for sample in samples_control:
-        meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
-        meth_ctrl_sum += meth
-        cov_ctrl_sum  += cov
-        _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
-        del meth, cov
-
     # --- Statistical test ---
-    if test == "fisher":
-        unmeth_case_sum = cov_case_sum - meth_case_sum
-        unmeth_ctrl_sum = cov_ctrl_sum - meth_ctrl_sum
-        pvals, log2_ors = fisher_exact_vectorized(
-            meth_case_sum, unmeth_case_sum,
-            meth_ctrl_sum, unmeth_ctrl_sum,
-        )
+    if test in ("fisher", "cmh"):
+        # CMH test: cache control arrays to avoid re-reading
+        # For k_ctrl ≤ 5 and n_sites ≤ 4M this is <100 MB — acceptable
+        ome, var_sum, or_num, or_den = _cmh_init(n_sites)
+        
+        ctrl_arrays: list[tuple[np.ndarray, np.ndarray]] = []
+        for ctrl in samples_control:
+            meth, cov = _load_sample_chrom(methylstore_path, chrom, ctrl, canonical_pos)
+            ctrl_arrays.append((meth, cov))
+            # Also accumulate Welford for mean_beta_control
+            _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
+        
+        # Iterate through case samples
+        for case in samples_case:
+            meth_i, cov_i = _load_sample_chrom(methylstore_path, chrom, case, canonical_pos)
+            _welford_update(mean_case, M2_case, n_valid_case, meth_i, cov_i)
+            
+            # Update CMH for all case-control pairs
+            for meth_j, cov_j in ctrl_arrays:
+                _cmh_update(ome, var_sum, or_num, or_den,
+                           meth_i, cov_i, meth_j, cov_j)
+            del meth_i, cov_i
+        
+        del ctrl_arrays
+        pvals, log2_ors = _cmh_finalize(ome, var_sum, or_num, or_den)
+        del ome, var_sum, or_num, or_den
 
     elif test == "beta_binomial":
+        # Load all samples for Welford accumulators
+        for sample in samples_case:
+            meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+            _welford_update(mean_case, M2_case, n_valid_case, meth, cov)
+            del meth, cov
+
+        for sample in samples_control:
+            meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+            _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
+            del meth, cov
+
         # Welford path: no (n_sites × n_replicates) matrix ever built.
         pvals, log2_ors = _beta_binom_mom_from_welford(
             mean_case, M2_case, n_valid_case,

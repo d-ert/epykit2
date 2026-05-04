@@ -1,4 +1,10 @@
 "Scratch2"
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg", force=True)
+
 import epykit as ep
 import polars as pl
 
@@ -31,3 +37,20 @@ print(md.uns["dmr"].filter(pl.col("mean_pvalue") < 0.05))
 ep.tl.annotate(md, gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf", cpg_islands="raw_data/hg38_cpg_islands.bed")
 
 md.save("cd55_analysis")
+
+plot_names = [
+    ("volcano", ep.pl.volcano),
+    ("ma_plot", ep.pl.ma_plot),
+    ("manhattan", ep.pl.manhattan),
+    ("pca", ep.pl.pca),
+    ("coverage_histogram", ep.pl.coverage_histogram),
+    ("methylation_heatmap", ep.pl.methylation_heatmap),
+    ("genomic_context_bar", ep.pl.genomic_context_bar),
+    ("cpg_island_pie", ep.pl.cpg_island_pie),
+]
+
+for plot_name, plot_fn in plot_names:
+    plot_fn(md, save=f"scratch2_{plot_name}")
+    plot_path = Path("figures") / f"scratch2_{plot_name}.png"
+    assert plot_path.exists(), f"Missing plot output: {plot_path}"
+    print(f"{plot_name}: {plot_path}")
