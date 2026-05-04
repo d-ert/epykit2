@@ -299,19 +299,23 @@ def _cmh_update(
     col1 = a + c  # total methylated
     col2 = b + d  # total unmethylated
 
-    E = np.where(valid, row1 * col1 / n, 0.0)
+    # Use safe denominator to avoid divide-by-zero warnings
+    n_safe = np.where(n > 0, n, 1.0)
+    E = np.where(valid, row1 * col1 / n_safe, 0.0)
+    # Safe denominators to avoid divide-by-zero warnings
+    n_sq_safe = np.where(n > 1, n * n * (n - 1.0), 1.0)
     V = np.where(
         valid,
-        row1 * row2 * col1 * col2 / (n * n * (n - 1.0)),
+        row1 * row2 * col1 * col2 / n_sq_safe,
         0.0,
     )
 
     ome[valid] += (a - E)[valid]
     var_sum[valid] += V[valid]
 
-    # Mantel-Haenszel common odds ratio terms
-    or_num += np.where(valid, a * d / n, 0.0)
-    or_den += np.where(valid, b * c / n, 0.0)
+    # Mantel-Haenszel common odds ratio terms (using n_safe from above)
+    or_num += np.where(valid, a * d / n_safe, 0.0)
+    or_den += np.where(valid, b * c / n_safe, 0.0)
 
 
 def _cmh_finalize(
@@ -321,7 +325,9 @@ def _cmh_finalize(
     or_den: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute CMH p-value and MH log2 OR from accumulated sums."""
-    cmh_stat = np.where(var_sum > 0, ome ** 2 / var_sum, np.nan)
+    # Use safe denominator to avoid divide-by-zero warnings
+    var_safe = np.where(var_sum > 0, var_sum, 1.0)
+    cmh_stat = np.where(var_sum > 0, ome ** 2 / var_safe, np.nan)
     pvals = np.where(
         ~np.isnan(cmh_stat),
         sp_stats.chi2.sf(cmh_stat, df=1),
