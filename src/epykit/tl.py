@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import gc
 import polars as pl
 
-from .annotate import annotate_cpg_islands, annotate_features
+from .annotate import annotate_cpg_islands, annotate_features, _GTF_CACHE
 from .dmc import apply_multiple_testing_correction, process_chromosomes_dmc
 from .dmr import call_dmr_sliding_window
 from .methyldata import MethylData
@@ -139,12 +140,20 @@ def annotate(
     alpha: float = 0.05,
     promoter_upstream_bp: int = 2000,
     promoter_downstream_bp: int = 200,
+    clear_gtf_cache: bool = True,
 ) -> None:
     """Annotate DMC/DMR outputs.
 
     By default only significant DMCs are annotated to avoid OOM. Set
     `significant_only=False` to annotate all sites (not recommended for
     whole-genome datasets).
+
+    Parameters
+    ----------
+    clear_gtf_cache : bool, optional
+        If True (default), clear the GTF cache and run garbage collection
+        after annotation. Set to False if you plan to call annotate()
+        multiple times to reuse the cached GTF.
     """
     if not gtf and not cpg_islands:
         raise ValueError("Provide at least one of gtf or cpg_islands")
@@ -192,3 +201,8 @@ def annotate(
         "promoter_upstream_bp": promoter_upstream_bp,
         "promoter_downstream_bp": promoter_downstream_bp,
     }
+    
+    # Clear GTF cache if requested (default: True)
+    if clear_gtf_cache and gtf:
+        _GTF_CACHE.clear()
+        gc.collect()

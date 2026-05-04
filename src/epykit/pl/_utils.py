@@ -25,6 +25,10 @@ def _save_fig(md, fig: Figure, name: str, out_dir: str | None = None) -> str:
         if "figures" not in md.uns:
             md.uns["figures"] = {}
         md.uns["figures"][name] = str(path)
+    # Close the figure to release memory
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
     return str(path)
 
 

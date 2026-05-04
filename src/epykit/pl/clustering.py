@@ -65,14 +65,16 @@ def pca(
         all_data = pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet").collect()
     else:
         # Sample every Kth site to get ~n_sites
+        # Use lazy chain to push filter down into Parquet scan
         k = max(1, total_sites // n_sites)
         all_data = (
             pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
             .select(["chrom", "pos", "sample", "N_meth", "coverage"])
+            .with_row_index("_row_num")
+            .filter(pl.col("_row_num") % k == 0)
+            .drop("_row_num")
             .collect()
         )
-        # Use row_number to sample every kth row
-        all_data = all_data.with_row_count("row_num").filter(pl.col("row_num") % k == 0)
 
     # Compute beta values
     all_data = all_data.with_columns(

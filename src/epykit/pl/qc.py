@@ -7,12 +7,38 @@ import numpy as np
 
 
 def coverage_histogram(md: MethylData, bins: int = 100, ax=None, figsize=(6, 4), save: str | None = None):
-    cov = (
+    """Plot histogram of coverage across all sites.
+    
+    For large datasets, samples every Kth site to avoid OOM.
+    """
+    # Count total sites
+    total_sites = (
         pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-        .select("coverage")
-        .collect()["coverage"]
-        .to_numpy()
-    )
+        .select(pl.count())
+        .collect()
+    ).item()
+    
+    # Determine sampling strategy
+    if total_sites <= 1_000_000:
+        # Small dataset: load all coverage values
+        cov = (
+            pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
+            .select("coverage")
+            .collect()["coverage"]
+            .to_numpy()
+        )
+    else:
+        # Large dataset: sample every Kth site to get ~1M points
+        k = max(1, total_sites // 1_000_000)
+        cov = (
+            pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
+            .select("coverage")
+            .with_row_index("_row_num")
+            .filter(pl.col("_row_num") % k == 0)
+            .drop("_row_num")
+            .collect()["coverage"]
+            .to_numpy()
+        )
 
     fig, ax = _get_ax(ax, figsize)
     ax.hist(cov, bins=bins, edgecolor="black")

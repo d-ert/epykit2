@@ -75,14 +75,15 @@ def read_bismark(
     
     Path(cache_store_dir).mkdir(parents=True, exist_ok=True)
     for path, sample_id in files:
-        print(f"  Converting {sample_id} ...", flush=True)
-        ensure_converted_sample(
+        converted = ensure_converted_sample(
             path,
             sample_id,
             cache_store_dir,
             context=context,
             reference_fasta=reference_fasta,
         )
+        status = "converted" if converted else "cached"
+        print(f"  {sample_id}: {status}", flush=True)
 
     n_sites_raw = _count_store_rows(cache_store_dir)
     uns = {

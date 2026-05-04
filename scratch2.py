@@ -38,19 +38,38 @@ ep.tl.annotate(md, gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf
 
 md.save("cd55_analysis")
 
-plot_names = [
-    ("volcano", ep.pl.volcano),
-    ("ma_plot", ep.pl.ma_plot),
-    ("manhattan", ep.pl.manhattan),
-    ("pca", ep.pl.pca),
-    ("coverage_histogram", ep.pl.coverage_histogram),
-    ("methylation_heatmap", ep.pl.methylation_heatmap),
-    ("genomic_context_bar", ep.pl.genomic_context_bar),
-    ("cpg_island_pie", ep.pl.cpg_island_pie),
-]
 
-for plot_name, plot_fn in plot_names:
-    plot_fn(md, save=f"scratch2_{plot_name}")
-    plot_path = Path("figures") / f"scratch2_{plot_name}.png"
-    assert plot_path.exists(), f"Missing plot output: {plot_path}"
-    print(f"{plot_name}: {plot_path}")
+# plot volcano plot
+ep.pl.volcano(md, dmc_key="dmc", title="Volcano Plot of DMCs", save_path="volcano_plot.png")
+print("Volcano plot saved as volcano_plot.png")
+
+# plot MA plot
+ep.pl.ma_plot(md, dmc_key="dmc", title="MA Plot of DMCs", save_path="ma_plot.png")
+print("MA plot saved as ma_plot.png")
+
+# plot Manhattan plot
+ep.pl.manhattan(md, dmc_key="dmc", title="Manhattan Plot of DMCs", save_path="manhattan_plot.png")
+print("Manhattan plot saved as manhattan_plot.png")
+
+# plot PCA
+ep.pl.pca(md, title="PCA of Methylation Data", save_path="pca_plot.png")
+print("PCA plot saved as pca_plot.png")
+
+# plot coverage histogram
+ep.pl.coverage_histogram(md, title="Coverage Histogram", save_path="coverage_histogram.png")
+print("Coverage histogram saved as coverage_histogram.png")
+
+# plot methylation heatmap
+ep.pl.methylation_heatmap(md, title="Methylation Heatmap", save_path="methylation_heatmap.png")
+print("Methylation heatmap saved as methylation_heatmap.png")
+
+# plot genomic context bar plot
+ep.pl.genomic_context_bar(md, title="Genomic Context Distribution", save_path="genomic_context_bar.png")
+print("Genomic context bar plot saved as genomic_context_bar.png")
+
+# plot CpG island pie chart
+ep.pl.cpg_island_pie(md, title="CpG Island Distribution", save_path="cpg_island_pie.png")
+print("CpG island pie chart saved as cpg_island_pie.png")
+
+print("All plots generated and saved successfully.")
+print("Analysis complete.")
