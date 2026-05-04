@@ -15,7 +15,7 @@ def coverage_histogram(md: MethylData, bins: int = 100, ax=None, figsize=(6, 4),
     )
 
     fig, ax = _get_ax(ax, figsize)
-    ax.hist(cov, bins=bins)
+    ax.hist(cov, bins=bins, edgecolor="black")
     ax.set_xlabel("Coverage")
     ax.set_ylabel("Count")
     ax.set_title("Coverage histogram")

@@ -46,7 +46,7 @@ def pca(
 
     # Get list of samples
     samples = md.obs.get_column("sample_id").to_list()
-    if "treatment" not in md.obs.columns or "group" not in md.obs.columns:
+    if "treatment" not in md.obs.columns and "group" not in md.obs.columns:
         raise ValueError("md.obs must have 'treatment' or 'group' column for coloring. Run ep.tl.qc(md) first.")
 
     group_col = "group" if "group" in md.obs.columns else "treatment"
