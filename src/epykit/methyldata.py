@@ -53,7 +53,11 @@ class MethylData:
 
     @property
     def dmc(self) -> Optional[pl.DataFrame]:
+        # Prefer annotated versions for plotting compatibility
         preferred = [
+            "dmc_beta_binomial_annotated",
+            "dmc_fisher_annotated",
+            "dmc_auto_annotated",
             "dmc_beta_binomial",
             "dmc_fisher",
             "dmc_auto",

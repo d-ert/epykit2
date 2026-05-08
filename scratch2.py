@@ -38,38 +38,69 @@ ep.tl.annotate(md, gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf
 
 md.save("cd55_analysis")
 
+# Clear memory before plotting to avoid OOM issues
+import gc
+del md
+gc.collect()
 
-# plot volcano plot
-ep.pl.volcano(md, dmc_key="dmc", title="Volcano Plot of DMCs", save_path="volcano_plot.png")
-print("Volcano plot saved as volcano_plot.png")
+# Reload the preprocessed/annotated data for plotting (much faster than full pipeline)
+md = ep.load("methyl_store_test/results/cd55_analysis")
+print("\nLoaded preprocessed data for plotting")
 
-# plot MA plot
-ep.pl.ma_plot(md, dmc_key="dmc", title="MA Plot of DMCs", save_path="ma_plot.png")
-print("MA plot saved as ma_plot.png")
+# Plot differential methylation plots
+try:
+    ep.pl.volcano(md, save="volcano_plot")
+    print("✓ Volcano plot saved")
+except Exception as e:
+    print(f"✗ Volcano plot failed: {e}")
 
-# plot Manhattan plot
-ep.pl.manhattan(md, dmc_key="dmc", title="Manhattan Plot of DMCs", save_path="manhattan_plot.png")
-print("Manhattan plot saved as manhattan_plot.png")
+try:
+    ep.pl.ma_plot(md, save="ma_plot")
+    print("✓ MA plot saved")
+except Exception as e:
+    print(f"✗ MA plot failed: {e}")
 
-# plot PCA
-ep.pl.pca(md, title="PCA of Methylation Data", save_path="pca_plot.png")
-print("PCA plot saved as pca_plot.png")
+try:
+    ep.pl.manhattan(md, save="manhattan_plot")
+    print("✓ Manhattan plot saved")
+except Exception as e:
+    print(f"✗ Manhattan plot failed: {e}")
 
-# plot coverage histogram
-ep.pl.coverage_histogram(md, title="Coverage Histogram", save_path="coverage_histogram.png")
-print("Coverage histogram saved as coverage_histogram.png")
+# Plot coverage histogram
+try:
+    ep.pl.coverage_histogram(md, save="coverage_histogram")
+    print("✓ Coverage histogram saved")
+except Exception as e:
+    print(f"✗ Coverage histogram failed: {e}")
 
-# plot methylation heatmap
-ep.pl.methylation_heatmap(md, title="Methylation Heatmap", save_path="methylation_heatmap.png")
-print("Methylation heatmap saved as methylation_heatmap.png")
+# Plot genomic context bar plot
+try:
+    ep.pl.genomic_context_bar(md, save="genomic_context_bar")
+    print("✓ Genomic context bar plot saved")
+except Exception as e:
+    print(f"✗ Genomic context bar plot failed: {e}")
 
-# plot genomic context bar plot
-ep.pl.genomic_context_bar(md, title="Genomic Context Distribution", save_path="genomic_context_bar.png")
-print("Genomic context bar plot saved as genomic_context_bar.png")
+# Plot CpG island pie chart
+try:
+    ep.pl.cpg_island_pie(md, save="cpg_island_pie")
+    print("✓ CpG island pie chart saved")
+except Exception as e:
+    print(f"✗ CpG island pie chart failed: {e}")
 
-# plot CpG island pie chart
-ep.pl.cpg_island_pie(md, title="CpG Island Distribution", save_path="cpg_island_pie.png")
-print("CpG island pie chart saved as cpg_island_pie.png")
+# Optional: PCA (requires scikit-learn)
+try:
+    ep.pl.pca(md, save="pca_plot")
+    print("✓ PCA plot saved")
+except ImportError:
+    print("⊘ PCA skipped (requires: pip install scikit-learn)")
+except Exception as e:
+    print(f"✗ PCA failed: {e}")
 
-print("All plots generated and saved successfully.")
-print("Analysis complete.")
+# Optional: Methylation heatmap (now optimized)
+try:
+    ep.pl.methylation_heatmap(md, n_top=500, save="methylation_heatmap")
+    print("✓ Methylation heatmap saved")
+except Exception as e:
+    print(f"✗ Methylation heatmap failed: {e}")
+
+print("\nAnalysis complete.")

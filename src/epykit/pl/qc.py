@@ -73,18 +73,34 @@ def methylation_heatmap(md: MethylData, n_top: int = 1000, ax=None, figsize=(8, 
         raise ValueError("No DMC rows available to build heatmap")
 
     samples = md.obs.get_column("sample_id").to_list()
-    site_df = (
-        pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-        .join(top.lazy(), on=["chrom", "pos"], how="inner")
-        .select(["chrom", "pos", "sample", "N_meth", "coverage"])
-        .collect()
-        .with_columns(
-            pl.when(pl.col("coverage") > 0)
-            .then(pl.col("N_meth") / pl.col("coverage"))
-            .otherwise(None)
-            .alias("beta")
+    
+    # top is already a collected DataFrame from md.dmc, no need to call .collect()
+    if len(top) == 0:
+        raise ValueError("No top DMCs to build heatmap")
+    
+    # Process each sample separately to reduce memory footprint
+    site_dfs = []
+    for sample in samples:
+        sample_df = (
+            pl.scan_parquet(f"{md.store}/sample={sample}/chrom=*/part-*.parquet")
+            .select(["chrom", "pos", "N_meth", "coverage"])
+            .join(top.lazy(), on=["chrom", "pos"], how="inner")
+            .collect()
         )
-    )
+        if len(sample_df) > 0:
+            sample_df = sample_df.with_columns(
+                pl.when(pl.col("coverage") > 0)
+                .then(pl.col("N_meth") / pl.col("coverage"))
+                .otherwise(None)
+                .alias("beta"),
+                pl.lit(sample).alias("sample")
+            )
+            site_dfs.append(sample_df)
+    
+    if not site_dfs:
+        raise ValueError("No sites found in store matching top DMCs")
+    
+    site_df = pl.concat(site_dfs)
 
     pivot = site_df.pivot(values="beta", index=["chrom", "pos"], on="sample", aggregate_function="mean")
     for sample in samples:

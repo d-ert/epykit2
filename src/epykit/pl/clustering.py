@@ -52,29 +52,37 @@ def pca(
     group_col = "group" if "group" in md.obs.columns else "treatment"
     groups = md.obs.get_column(group_col).to_list()
 
-    # Count total sites
-    total_sites = (
-        pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-        .select(pl.count())
-        .collect()
-    ).item()
+    # Step 1: Find common sites that exist in ALL samples to avoid NaNs
+    common_sites = None
+    for sample in samples:
+        sample_sites = pl.scan_parquet(f"{md.store}/sample={sample}/chrom=*/part-*.parquet").select(["chrom", "pos"]).collect().unique()
+        if common_sites is None:
+            common_sites = sample_sites
+        else:
+            common_sites = common_sites.join(sample_sites, on=["chrom", "pos"], how="inner")
+    
+    if len(common_sites) == 0:
+        raise ValueError("No common sites across all samples for PCA")
+    
+    # Sample if too many common sites
+    if len(common_sites) > n_sites:
+        common_sites = common_sites.sample(n_sites, seed=42)
 
-    # Determine sampling strategy
-    if total_sites <= n_sites * 2:
-        # Load all sites
-        all_data = pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet").collect()
-    else:
-        # Sample every Kth site to get ~n_sites
-        # Use lazy chain to push filter down into Parquet scan
-        k = max(1, total_sites // n_sites)
-        all_data = (
-            pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-            .select(["chrom", "pos", "sample", "N_meth", "coverage"])
-            .with_row_index("_row_num")
-            .filter(pl.col("_row_num") % k == 0)
-            .drop("_row_num")
+    # Step 2: Load only common sites from each sample
+    sample_data_list = []
+    for sample in samples:
+        sample_df = (
+            pl.scan_parquet(f"{md.store}/sample={sample}/chrom=*/part-*.parquet")
+            .select(["chrom", "pos", "N_meth", "coverage", "sample"])
+            .join(common_sites.lazy(), on=["chrom", "pos"], how="inner")
             .collect()
         )
+        sample_data_list.append(sample_df)
+    
+    all_data = pl.concat(sample_data_list) if sample_data_list else None
+    
+    if all_data is None or len(all_data) == 0:
+        raise ValueError("No data available for PCA")
 
     # Compute beta values
     all_data = all_data.with_columns(
@@ -85,19 +93,21 @@ def pca(
     )
 
     # Pivot to get sites x samples matrix
+    # Since we only have common sites, there should be NO NaNs
     pivot = all_data.pivot(values="beta", index=["chrom", "pos"], on="sample", aggregate_function="mean")
 
-    # Ensure all samples present (fill missing with NaN)
-    for sample in samples:
-        if sample not in pivot.columns:
-            pivot = pivot.with_columns(pl.lit(None).alias(sample))
-
-    # Get matrix and remove NaN rows
+    # Get matrix - shape is (n_sites, n_samples)
     matrix = pivot.select(samples).to_numpy()
-    matrix = matrix[~np.isnan(matrix).any(axis=1)]
+    
+    # Double-check: remove any NaN rows just in case
+    valid_mask = ~np.isnan(matrix).any(axis=1)
+    matrix = matrix[valid_mask]
 
     if matrix.shape[0] < 2:
-        raise ValueError("Not enough valid sites for PCA after filtering NaNs")
+        raise ValueError(f"Not enough valid sites for PCA ({matrix.shape[0]} remains after filtering)")
+    
+    # Transpose to (n_samples, n_sites) for PCA
+    matrix = matrix.T
 
     # Fit PCA
     pca_fit = PCA(n_components=2)
