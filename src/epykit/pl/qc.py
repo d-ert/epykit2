@@ -11,10 +11,10 @@ def coverage_histogram(md: MethylData, bins: int = 100, ax=None, figsize=(6, 4),
     
     For large datasets, samples every Kth site to avoid OOM.
     """
-    # Count total sites
+    # Count total sites — FIX-11: pl.count() removed in Polars ≥0.20; use pl.len()
     total_sites = (
         pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-        .select(pl.count())
+        .select(pl.len())
         .collect()
     ).item()
     

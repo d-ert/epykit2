@@ -463,7 +463,15 @@ def _intersect_chrom(
     chrom: str,
     samples: list[str],
 ) -> pl.DataFrame:
-    """Return (pos, strand) rows present in every sample for one chromosome."""
+    """Return (pos, strand) rows present in every sample for one chromosome.
+
+    FIX-5: The previous implementation joined on ["pos", "strand"].  Samples
+    without a reference FASTA receive strand="*" while samples converted with
+    a FASTA receive "+"/"-".  A mixed cohort produced an empty intersection
+    with no warning.  We now join on "pos" only and resolve the strand column
+    by taking the first non-"*" value seen across samples (falling back to "*"
+    when all samples lack strand information).
+    """
     intersect: Optional[pl.DataFrame] = None
 
     for sample in samples:
@@ -485,9 +493,27 @@ def _intersect_chrom(
         if intersect is None:
             intersect = sites
         else:
-            intersect = intersect.join(sites, on=["pos", "strand"], how="inner")
+            # Join on pos only to avoid strand-value mismatches between
+            # samples converted with and without a reference FASTA.
+            # Keep the strand column from the left frame; if it is "*",
+            # prefer the right frame's value (may carry real strand info).
+            intersect = (
+                intersect
+                .join(sites.rename({"strand": "_strand_r"}), on="pos", how="inner")
+                .with_columns(
+                    pl.when(pl.col("strand") == "*")
+                    .then(pl.col("_strand_r"))
+                    .otherwise(pl.col("strand"))
+                    .alias("strand")
+                )
+                .drop("_strand_r")
+            )
 
         if len(intersect) == 0:
+            logger.warning(
+                "  Intersection is empty after adding sample '%s' on %s. "
+                "Check strand consistency across samples.", sample, chrom,
+            )
             break
 
     if intersect is None:
@@ -596,29 +622,36 @@ def _process_one_chromosome(
 
     # --- Statistical test ---
     if test in ("fisher", "cmh"):
-        # CMH test: cache control arrays to avoid re-reading
-        # For k_ctrl ≤ 5 and n_sites ≤ 4M this is <100 MB — acceptable
+        # FIX-CMH: The previous implementation formed one stratum per
+        # (case_i, ctrl_j) pair, so each observation was counted
+        # n_other_group times.  The CMH chi-squared statistic was inflated
+        # by ~n_case × n_control, producing grossly anti-conservative p-values.
+        #
+        # Correct approach: pool all control reads into a single count vector,
+        # then contribute one stratum per case sample (case_i vs pooled ctrl).
+        # With n_case=1, n_ctrl=1 this degenerates to Fisher exact.
+        # With replicates it gives a properly weighted CMH result.
         ome, var_sum, or_num, or_den = _cmh_init(n_sites)
-        
-        ctrl_arrays: list[tuple[np.ndarray, np.ndarray]] = []
+
+        # Pass 1: accumulate pooled control sums and Welford mean beta
+        meth_ctrl_pool = np.zeros(n_sites, dtype=np.int64)
+        cov_ctrl_pool  = np.zeros(n_sites, dtype=np.int64)
         for ctrl in samples_control:
             meth, cov = _load_sample_chrom(methylstore_path, chrom, ctrl, canonical_pos)
-            ctrl_arrays.append((meth, cov))
-            # Also accumulate Welford for mean_beta_control
+            meth_ctrl_pool += meth
+            cov_ctrl_pool  += cov
             _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
-        
-        # Iterate through case samples
+            del meth, cov
+
+        # Pass 2: one CMH stratum per case sample vs the pooled control
         for case in samples_case:
             meth_i, cov_i = _load_sample_chrom(methylstore_path, chrom, case, canonical_pos)
             _welford_update(mean_case, M2_case, n_valid_case, meth_i, cov_i)
-            
-            # Update CMH for all case-control pairs
-            for meth_j, cov_j in ctrl_arrays:
-                _cmh_update(ome, var_sum, or_num, or_den,
-                           meth_i, cov_i, meth_j, cov_j)
+            _cmh_update(ome, var_sum, or_num, or_den,
+                        meth_i, cov_i, meth_ctrl_pool, cov_ctrl_pool)
             del meth_i, cov_i
-        
-        del ctrl_arrays
+
+        del meth_ctrl_pool, cov_ctrl_pool
         pvals, log2_ors = _cmh_finalize(ome, var_sum, or_num, or_den)
         del ome, var_sum, or_num, or_den
 

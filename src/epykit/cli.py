@@ -19,7 +19,7 @@ def _cmd_convert(args: argparse.Namespace):
         args.output_dir,
         context=args.context,
         reference_fasta=args.reference_fasta,
-        merge_cpg=args.merge_cpg,
+        merge_strands=args.merge_cpg,  # FIX-9: CLI flag is --merge-cpg; param is merge_strands
     )
 
 

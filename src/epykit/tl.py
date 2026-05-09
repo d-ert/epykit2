@@ -102,7 +102,16 @@ def dmr(
     min_abs_meth_diff: float = 0.1,
     min_mean_pvalue: float | None = 0.05,
 ) -> None:
-    """Run DMR calling using the current DMC result and store in md.uns['dmr']."""
+    """Run DMR calling using the current DMC result and store in md.uns['dmr'].
+
+    Parameters
+    ----------
+    min_mean_pvalue : float or None
+        Post-hoc filter on the DMR-level ``combined_pvalue`` (Fisher's method
+        across per-CpG p-values).  DMRs with ``combined_pvalue ≥ min_mean_pvalue``
+        are dropped.  Set to None to keep all candidate DMRs.  Default 0.05.
+        (Previously filtered on the now-removed ``mean_pvalue`` column.)
+    """
     dmc_df = md.dmc
     if dmc_df is None:
         raise ValueError("No DMC results available. Run ep.tl.dmc(md) first.")
@@ -116,9 +125,10 @@ def dmr(
         alpha=alpha,
         min_abs_meth_diff=min_abs_meth_diff,
     )
-    # Discard windows where the window-level signal is weak (match old behaviour)
+    # Discard windows where the window-level signal is weak (match old behaviour).
+    # FIX-8: filter on combined_pvalue (Fisher's method) not mean_pvalue.
     if len(dmr_df) > 0 and min_mean_pvalue is not None:
-        dmr_df = dmr_df.filter(pl.col("mean_pvalue") < min_mean_pvalue)
+        dmr_df = dmr_df.filter(pl.col("combined_pvalue") < min_mean_pvalue)
 
     md.uns["dmr"] = dmr_df
     md.uns["dmr_params"] = {

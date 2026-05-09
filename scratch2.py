@@ -20,7 +20,7 @@ print(md)
 
 ep.pp.filter_coverage(md, lo_count=10, hi_perc=99.9)
 ep.pp.unite(md, type="union")
-ep.pp.smooth(md, bandwidth=1000)
+#ep.pp.smooth(md, bandwidth=1000)
 
 ep.tl.qc(md)
 ep.tl.dmc(md, test="auto")
@@ -30,7 +30,7 @@ ep.tl.dmr(md, window_bp=500, min_cpgs=5)
 print(md.dmc.filter(pl.col("qvalue") < 0.05))
 
 # Check DMR results  
-print(md.uns["dmr"].filter(pl.col("mean_pvalue") < 0.05))
+print(md.uns["dmr"].filter(pl.col("combined_pvalue") < 0.05))
 
 
 

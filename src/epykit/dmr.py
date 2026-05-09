@@ -41,14 +41,14 @@ import polars as pl
 logger = logging.getLogger(__name__)
 
 _DMR_EMPTY_SCHEMA = {
-    "chrom":           pl.Utf8,
-    "start":           pl.Int32,
-    "end":             pl.Int32,
-    "n_cpgs":          pl.Int32,
-    "n_significant":   pl.Int32,
-    "mean_meth_diff":  pl.Float32,
-    "mean_pvalue":     pl.Float64,
-    "dmr_type":        pl.Utf8,
+    "chrom":            pl.Utf8,
+    "start":            pl.Int32,
+    "end":              pl.Int32,
+    "n_cpgs":           pl.Int32,
+    "n_significant":    pl.Int32,
+    "mean_meth_diff":   pl.Float32,
+    "combined_pvalue":  pl.Float64,   # FIX-8: Fisher's method replaces mean_pvalue
+    "dmr_type":         pl.Utf8,
 }
 
 _SMOOTH_EMPTY_SCHEMA = {
@@ -58,6 +58,10 @@ _SMOOTH_EMPTY_SCHEMA = {
     "beta_raw":     pl.Float32,
     "beta_smooth":  pl.Float32,
 }
+
+# FIX-6: cap merged DMR size to prevent biologically implausible mega-DMRs.
+# Mammalian DMRs are typically 200 bp – 5 kb; 10 kb is a generous ceiling.
+_MAX_DMR_BP: int = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +100,11 @@ def _recompute_dmr_stats(
     When ``cum_sig`` is supplied the significance count is computed in O(1)
     via prefix-sum lookup; otherwise falls back to a boolean mask scan.
     """
+    # FIX-6: reject biologically implausible mega-DMRs that arise when
+    # overlapping candidate windows collapse across many megabases.
+    if (end - start) > _MAX_DMR_BP:
+        return None
+
     # Use searchsorted for O(log n) slice instead of boolean mask
     lo = int(np.searchsorted(positions, start,  side="left"))
     hi = int(np.searchsorted(positions, end,    side="left"))
@@ -119,11 +128,21 @@ def _recompute_dmr_stats(
     valid_diffs = window_diffs[~np.isnan(window_diffs)]
     if len(valid_diffs) == 0:
         return None  # no valid diffs
-    
+
     n_hyper = int((valid_diffs > 0).sum())
     n_hypo  = int((valid_diffs < 0).sum())
     if n_hyper == n_hypo:
         return None  # ambiguous direction
+
+    # FIX-8: arithmetic mean of p-values is not a valid statistic.
+    # Use Fisher's method: -2 Σ ln(p) ~ χ² with 2k df.
+    from scipy.stats import combine_pvalues
+    valid_pvals = window_pvals[~np.isnan(window_pvals)]
+    if len(valid_pvals) == 0:
+        return None
+    # Clip to avoid log(0); p-values of exactly 0 map to the smallest float
+    valid_pvals = np.clip(valid_pvals, np.finfo(float).tiny, 1.0)
+    _, combined_p = combine_pvalues(valid_pvals, method="fisher")
 
     return {
         "chrom":          chrom,
@@ -132,7 +151,7 @@ def _recompute_dmr_stats(
         "n_cpgs":         n_cpgs,
         "n_significant":  n_sig,
         "mean_meth_diff": float(np.float32(np.nanmean(window_diffs))),
-        "mean_pvalue":    float(np.nanmean(window_pvals)),
+        "combined_pvalue": float(combined_p),
         "dmr_type":       "hyper" if n_hyper > n_hypo else "hypo",
     }
 
@@ -177,7 +196,7 @@ def call_dmr_sliding_window(
     -------
     pl.DataFrame
         Columns: chrom, start, end, n_cpgs, n_significant,
-                 mean_meth_diff, mean_pvalue, dmr_type ("hyper" | "hypo").
+                 mean_meth_diff, combined_pvalue, dmr_type ("hyper" | "hypo").
     """
     required = {"chrom", "pos", "meth_diff", "pvalue"}
     missing  = required - set(dmc_results.columns)

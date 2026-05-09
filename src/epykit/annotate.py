@@ -185,7 +185,10 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
                 feature = parts[2]
                 if feature not in ('gene', 'exon'):
                     continue
-                start  = int(parts[3])
+                # FIX-3: GTF uses 1-based closed intervals; PyRanges expects
+                # 0-based half-open intervals.  Subtract 1 from start only —
+                # the GTF end is already the correct half-open end.
+                start  = int(parts[3]) - 1
                 end    = int(parts[4])
                 strand = parts[6]
                 attrs  = {}
@@ -574,7 +577,19 @@ def annotate_features(
         .map(tss_series)
         .to_numpy(dtype=np.float64, na_value=np.nan)
     )
-    dist_to_tss              = (site_mids - tss_positions).astype(np.float32)
+
+    # FIX-4: TSS distance must respect strand.
+    # For + strand: positive distance = downstream of TSS (higher genomic coord). ✓
+    # For − strand: TSS is at genomic End; a higher coordinate is *upstream*,
+    # so the sign must be flipped to keep "positive = downstream" consistent.
+    _strand_lut = (
+        genes_pd[["gene_id", "Strand"]]
+        .drop_duplicates("gene_id")
+        .set_index("gene_id")["Strand"]
+    )
+    strand_arr  = pd.Series(gene_ids.tolist()).map(_strand_lut).to_numpy(dtype=object)
+    strand_sign = np.where(strand_arr == "-", -1.0, 1.0).astype(np.float64)
+    dist_to_tss              = (strand_sign * (site_mids - tss_positions)).astype(np.float32)
     dist_to_tss[gene_ids == ""] = np.nan
 
     _log(f"annotate_features DONE  total elapsed {time.time()-t_total:.1f}s")

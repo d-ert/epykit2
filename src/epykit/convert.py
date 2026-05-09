@@ -11,6 +11,25 @@ Changes vs previous version:
     deferred to a post-conversion step once strand is known.
   - context column added ("CpG" default; expandable to CHG/CHH).
   - Minor: use str.removeprefix instead of str.replace for robustness.
+
+Coordinate system (FIX-7)
+--------------------------
+This converter treats the ``start`` column of .cov files as a **0-based**
+position, storing it verbatim as the ``pos`` column in the Parquet store.
+This is correct for files produced by ``bismark2bedGraph`` (BED-format,
+0-based half-open intervals), which is the output format used by
+nf-core/methylseq ``*.cov.gz`` files.
+
+**Important**: ``bismark_methylation_extractor --comprehensive`` can produce
+**1-based** coverage reports (``CX_report`` / ``coverage2cytosine`` output).
+Those files require ``start - 1`` before storing.  Do **not** pass 1-based
+Bismark extractor output directly to this converter without pre-converting
+coordinates; doing so will shift every CpG position by +1 bp relative to
+annotation features and CpG island intervals.
+
+If you are unsure which format your files are in, inspect the first few
+lines: a 0-based file will show ``start = end - 1`` for CpG sites (1 bp
+wide), whereas a 1-based file will show ``start == end``.
 """
 
 from __future__ import annotations

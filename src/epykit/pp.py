@@ -5,7 +5,6 @@ from pathlib import Path
 import polars as pl
 
 from . import filter as filter_mod
-from .dmr import smooth_methylation_bsmooth
 from .methyldata import MethylData
 
 
@@ -91,32 +90,37 @@ def smooth(
     bandwidth: int = 1000,
     grid_resolution_bp: int | None = None,
 ) -> None:
-    """BSmooth-style smoothing. Write smoothed output to disk chunk-by-chunk."""
-    samples = md.obs.get_column("sample_id").to_list()
-    
-    # Derive smooth path: from analysis_root cache, or legacy behavior
-    if md._analysis_root:
-        smooth_path = str(Path(md._analysis_root) / ".cache" / "smoothed")
-    else:
-        smooth_path = f"{md.store}_smooth"
+    """BSmooth-style smoothing.
 
-    smooth_methylation_bsmooth(
-        methylstore_path=md.store,
-        samples=samples,
-        bandwidth=bandwidth,
-        grid_resolution_bp=grid_resolution_bp,
-        output_path=smooth_path,
-    )
+    .. note::
+        Not yet wired into downstream DMC/DMR calling.  The smoothed beta
+        values written by this function are not currently read by
+        ``ep.tl.dmc`` or ``ep.tl.dmr``, so calling this step has no effect
+        on results.  Raise an error rather than silently misleading users.
 
-    md._smoothed = True
-    md.uns["smooth_path"] = smooth_path
-    md.uns["smooth"] = {
-        "bandwidth": bandwidth,
-        "grid_resolution_bp": grid_resolution_bp,
-    }
-    _append_store_history(
-        md,
-        "smoothed",
-        md.store,
-        md.uns.get("n_sites_filtered") or md.uns.get("n_sites_raw"),
+        To implement properly, ``ep.tl.dmr`` (or a dedicated
+        ``ep.tl.dmr_bsmooth``) must load ``md.uns["smooth_path"]`` and
+        compute ``meth_diff`` from smoothed betas instead of raw counts.
+        Remove this guard once that wiring is in place.
+
+    Raises
+    ------
+    NotImplementedError
+        Always, until downstream usage is implemented.
+    ValueError
+        If called before ``ep.pp.filter_coverage`` (FIX-10).
+    """
+    # FIX-10: smoothing on unfiltered data silently degrades results.
+    if not md._filtered:
+        raise ValueError(
+            "Run ep.pp.filter_coverage(md) before ep.pp.smooth(md)."
+        )
+
+    # FIX-4: smoothed values are computed but never consumed downstream.
+    # Raise so users are not misled into thinking smoothing affects results.
+    raise NotImplementedError(
+        "ep.pp.smooth() computes smoothed beta values but ep.tl.dmc / "
+        "ep.tl.dmr do not yet read them, so this step currently has no "
+        "effect on DMC or DMR results.  Remove this call from your pipeline "
+        "until BSmooth-style downstream usage is implemented."
     )
