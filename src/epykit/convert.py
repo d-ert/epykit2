@@ -171,6 +171,9 @@ def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
       2. Grouping by (chrom, pos) and summing counts
       3. Setting all merged sites to + strand
     
+    Validates pairing and warns if unpaired sites are found (may indicate
+    incomplete bisulfite conversion or quality issues).
+    
     If the input already has strand-merged data (e.g., from bismark2bedGraph),
     this function is a no-op.
     """
@@ -190,6 +193,29 @@ def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
     minus = minus.with_columns(
         (pl.col("pos") - 1).alias("pos")
     )
+    
+    # VALIDATION: Check for proper pairing
+    plus_pos = set(plus["pos"].to_list())
+    minus_pos_shifted = set(minus["pos"].to_list())
+    
+    paired = plus_pos & minus_pos_shifted
+    unpaired_plus = plus_pos - minus_pos_shifted
+    unpaired_minus = minus_pos_shifted - plus_pos
+    
+    total_plus_orig = len(plus)
+    total_minus_orig = len(minus)
+    
+    if unpaired_plus or unpaired_minus:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            f"CpG strand pairing incomplete:\n"
+            f"  Paired sites: {len(paired):,}\n"
+            f"  Unpaired + strand: {len(unpaired_plus):,}/{total_plus_orig:,}\n"
+            f"  Unpaired - strand: {len(unpaired_minus):,}/{total_minus_orig:,}\n"
+            f"  Merging will sum paired sites and keep unpaired sites as-is.\n"
+            f"  This may indicate incomplete bisulfite conversion or data quality issues."
+        )
     
     # Combine and merge by position
     combined = pl.concat([plus, minus])

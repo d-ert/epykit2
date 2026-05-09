@@ -24,6 +24,18 @@ ep.pp.unite(md, type="union")
 
 ep.tl.qc(md)
 ep.tl.dmc(md, test="auto")
+
+# After ep.tl.dmc(md, test="auto")
+total = len(md.dmc)
+sig = md.dmc.filter(pl.col('qvalue') < 0.05).height
+pct = 100 * sig / total
+
+print(f"Total sites tested: {total:,}")
+print(f"Significant DMCs: {sig:,}")  
+print(f"Percentage: {pct:.2f}%")
+print(f"\nEffect size summary:")
+print(md.dmc.filter(pl.col('qvalue') < 0.05).select('meth_diff').describe())
+
 ep.tl.dmr(md, window_bp=500, min_cpgs=5)
 
 # Check DMC results

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import polars as pl
 
 from . import filter as filter_mod
 from .methyldata import MethylData
+
+logger = logging.getLogger(__name__)
 
 
 def _append_store_history(md: MethylData, step: str, path: str, n_sites: int | None) -> None:
@@ -90,25 +93,40 @@ def smooth(
     bandwidth: int = 1000,
     grid_resolution_bp: int | None = None,
 ) -> None:
-    """BSmooth-style smoothing.
+    """BSmooth-style smoothing (EXPERIMENTAL).
 
-    .. note::
-        Not yet wired into downstream DMC/DMR calling.  The smoothed beta
-        values written by this function are not currently read by
-        ``ep.tl.dmc`` or ``ep.tl.dmr``, so calling this step has no effect
-        on results.  Raise an error rather than silently misleading users.
+    Smooths per-sample beta values using a fast Gaussian kernel (bandwidth
+    in base pairs). Smoothing is applied per-chromosome and per-sample.
 
-        To implement properly, ``ep.tl.dmr`` (or a dedicated
-        ``ep.tl.dmr_bsmooth``) must load ``md.uns["smooth_path"]`` and
-        compute ``meth_diff`` from smoothed betas instead of raw counts.
-        Remove this guard once that wiring is in place.
+    .. warning::
+        This function is experimental. The smoothed values are computed but
+        are NOT yet wired into downstream DMC/DMR calling. You can use this
+        to compute smoothed beta values for manual analysis, but standard
+        DMC/DMR calling will still use raw counts.
+
+        To use smoothed values in DMR calling, a future version will add
+        a ``use_smoothed=True`` parameter to ``ep.tl.dmr()``.
+
+    Parameters
+    ----------
+    md : MethylData
+        MethylData object (must have been filtered with ep.pp.filter_coverage)
+    bandwidth : int
+        Gaussian smoothing bandwidth in base pairs (default 1000)
+    grid_resolution_bp : int, optional
+        Internal grid resolution (default: bandwidth // 20).
+        Finer resolution → higher accuracy but slower.
 
     Raises
     ------
-    NotImplementedError
-        Always, until downstream usage is implemented.
     ValueError
         If called before ``ep.pp.filter_coverage`` (FIX-10).
+
+    Notes
+    -----
+    Smoothed values are written to ``md.uns["smooth_path"]`` for inspection.
+    Currently these are not used by ``ep.tl.dmr()``, but can be accessed
+    via the Parquet store for custom downstream analysis.
     """
     # FIX-10: smoothing on unfiltered data silently degrades results.
     if not md._filtered:
@@ -116,11 +134,34 @@ def smooth(
             "Run ep.pp.filter_coverage(md) before ep.pp.smooth(md)."
         )
 
-    # FIX-4: smoothed values are computed but never consumed downstream.
-    # Raise so users are not misled into thinking smoothing affects results.
-    raise NotImplementedError(
-        "ep.pp.smooth() computes smoothed beta values but ep.tl.dmc / "
-        "ep.tl.dmr do not yet read them, so this step currently has no "
-        "effect on DMC or DMR results.  Remove this call from your pipeline "
-        "until BSmooth-style downstream usage is implemented."
+    from .dmr import smooth_methylation_bsmooth
+
+    samples = md.obs.get_column("sample_id").to_list()
+    
+    # Derive output smooth path
+    if md._analysis_root:
+        smooth_path = str(Path(md._analysis_root) / ".cache" / "smoothed")
+    else:
+        smooth_path = f"{md.store}_smoothed"
+    
+    logger.info(f"Running BSmooth smoothing to {smooth_path}...")
+    
+    smooth_methylation_bsmooth(
+        methylstore_path=md.store,
+        samples=samples,
+        bandwidth=bandwidth,
+        grid_resolution_bp=grid_resolution_bp,
+        output_path=smooth_path,
+    )
+    
+    md._smoothed = True
+    md.uns["smooth_path"] = smooth_path
+    md.uns["smooth_params"] = {
+        "bandwidth": bandwidth,
+        "grid_resolution_bp": grid_resolution_bp,
+    }
+    
+    logger.info(
+        f"✓ Smoothing complete ({len(samples)} samples, {bandwidth} bp bandwidth). "
+        f"Results stored in {smooth_path}"
     )

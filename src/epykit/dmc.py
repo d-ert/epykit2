@@ -392,6 +392,106 @@ def _welford_var_mean(M2: np.ndarray, n_valid: np.ndarray) -> np.ndarray:
         return np.where(n_valid > 0, var / n_valid, np.nan)
 
 
+def _logit_transform(beta: np.ndarray) -> np.ndarray:
+    """Transform beta values to logit scale.
+    
+    logit(β) = log(β / (1 - β))
+    
+    Handles boundary cases (β=0, β=1) by clipping to [ε, 1-ε].
+    """
+    epsilon = 1e-6
+    beta_clipped = np.clip(beta, epsilon, 1 - epsilon)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logit_beta = np.log(beta_clipped / (1 - beta_clipped))
+    return logit_beta
+
+
+def _logit_variance_jacobian(beta: np.ndarray) -> np.ndarray:
+    """Compute Jacobian for delta-method variance transformation.
+    
+    If Y = logit(X), then Var(Y) ≈ Var(X) × [dY/dX]²
+    where dY/dX = 1 / [X(1-X)]
+    """
+    epsilon = 1e-6
+    beta_clipped = np.clip(beta, epsilon, 1 - epsilon)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        jacobian = 1.0 / (beta_clipped * (1 - beta_clipped))
+    return jacobian
+
+
+def _beta_binom_mom_from_welford_logit(
+    mean_case: np.ndarray,
+    M2_case: np.ndarray,
+    n_valid_case: np.ndarray,
+    mean_ctrl: np.ndarray,
+    M2_ctrl: np.ndarray,
+    n_valid_ctrl: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Welch t-test on logit-transformed beta values (from Welford accumulators).
+    
+    Beta values are highly skewed near boundaries [0, 1]. Logit transformation
+    stabilizes variance and improves normality for robust t-testing.
+    
+    Parameters match _beta_binom_mom_from_welford; output is p-values and
+    log2 odds ratio on original (non-logit) scale.
+    """
+    n_sites = len(mean_case)
+    
+    # Transform means to logit scale
+    logit_mean_case = _logit_transform(mean_case)
+    logit_mean_ctrl = _logit_transform(mean_ctrl)
+    
+    # Compute variance on logit scale via delta method
+    # Var(logit(β)) = Var(β) × jacobian²
+    jac_case = _logit_variance_jacobian(mean_case)
+    jac_ctrl = _logit_variance_jacobian(mean_ctrl)
+    
+    var_case = M2_case / np.maximum(n_valid_case - 1, 1)
+    var_ctrl = M2_ctrl / np.maximum(n_valid_ctrl - 1, 1)
+    
+    var_logit_case = var_case * (jac_case ** 2)
+    var_logit_ctrl = var_ctrl * (jac_ctrl ** 2)
+    
+    # Normalize by sample size (variance of the mean)
+    var_mean_logit_case = var_logit_case / np.maximum(n_valid_case, 1)
+    var_mean_logit_ctrl = var_logit_ctrl / np.maximum(n_valid_ctrl, 1)
+    
+    se = np.sqrt(var_mean_logit_case + var_mean_logit_ctrl)
+    
+    # Welch t-test on logit scale
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t_stat = np.where(se > 0, (logit_mean_case - logit_mean_ctrl) / se, np.nan)
+    
+    # Welch–Satterthwaite degrees of freedom
+    dof_num = (var_mean_logit_case + var_mean_logit_ctrl) ** 2
+    dof_den = (
+        np.where(n_valid_case > 1, var_mean_logit_case ** 2 / (n_valid_case - 1), 0.0)
+        + np.where(n_valid_ctrl > 1, var_mean_logit_ctrl ** 2 / (n_valid_ctrl - 1), 0.0)
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dof = np.where(dof_den > 0, dof_num / dof_den, 1.0)
+        dof = np.maximum(dof, 1.0)
+    
+    pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
+    
+    # Mark degenerate cases
+    degenerate = (
+        np.isnan(mean_case) | np.isnan(mean_ctrl) | np.isnan(t_stat)
+        | (n_valid_case == 0) | (n_valid_ctrl == 0)
+    )
+    pvals[degenerate] = np.nan
+    
+    # Compute log2 odds ratio on original scale
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log2_ors = np.log2(
+            (mean_case / np.maximum(1 - mean_case, 1e-9)) /
+            np.maximum(mean_ctrl / np.maximum(1 - mean_ctrl, 1e-9), 1e-9)
+        )
+    log2_ors[degenerate] = np.nan
+    
+    return pvals, log2_ors
+
+
 def _beta_binom_mom_from_welford(
     mean_case: np.ndarray,
     M2_case: np.ndarray,
@@ -655,7 +755,7 @@ def _process_one_chromosome(
         pvals, log2_ors = _cmh_finalize(ome, var_sum, or_num, or_den)
         del ome, var_sum, or_num, or_den
 
-    elif test == "beta_binomial":
+    elif test in ("beta_binomial", "logit_t"):
         # Load all samples for Welford accumulators
         for sample in samples_case:
             meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
@@ -668,14 +768,20 @@ def _process_one_chromosome(
             del meth, cov
 
         # Welford path: no (n_sites × n_replicates) matrix ever built.
-        pvals, log2_ors = _beta_binom_mom_from_welford(
-            mean_case, M2_case, n_valid_case,
-            mean_ctrl, M2_ctrl, n_valid_ctrl,
-        )
+        if test == "logit_t":
+            pvals, log2_ors = _beta_binom_mom_from_welford_logit(
+                mean_case, M2_case, n_valid_case,
+                mean_ctrl, M2_ctrl, n_valid_ctrl,
+            )
+        else:
+            pvals, log2_ors = _beta_binom_mom_from_welford(
+                mean_case, M2_case, n_valid_case,
+                mean_ctrl, M2_ctrl, n_valid_ctrl,
+            )
 
     else:
         raise NotImplementedError(
-            f"Test '{test}' not implemented. Choose 'fisher' or 'beta_binomial'."
+            f"Test '{test}' not implemented. Choose 'fisher', 'logit_t', or 'beta_binomial'."
         )
 
     del meth_case_sum, meth_ctrl_sum, cov_case_sum, cov_ctrl_sum
@@ -703,6 +809,43 @@ def _process_one_chromosome(
         "log2_odds_ratio":   pl.Series(log2_ors),
         "meth_diff":         pl.Series(meth_diff),
     }).sort("pos")
+
+
+def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
+    """Validate sample sizes and issue appropriate warnings."""
+    min_n = min(n_case, n_ctrl)
+    max_n = max(n_case, n_ctrl)
+    
+    if min_n == 0:
+        raise ValueError(
+            "Cannot perform DMC with zero samples in a group. "
+            f"n_case={n_case}, n_control={n_ctrl}"
+        )
+    
+    if min_n == 1:
+        logger.warning(
+            "⚠️  CRITICAL: Only 1 replicate per group detected!\n"
+            "   Statistical results are UNRELIABLE without biological replicates.\n"
+            "   Effect sizes may be reported, but p-values should NOT be trusted.\n"
+            "   Recommendation: Collect at least 3 biological replicates per group."
+        )
+    elif min_n == 2:
+        logger.warning(
+            "⚠️  WARNING: Only 2 replicates per group.\n"
+            "   Statistical power is very low. Many true positives will be missed.\n"
+            "   Recommendation: Use n≥3 for reliable differential methylation calling."
+        )
+    elif min_n < 6 and test == "beta_binomial":
+        logger.warning(
+            "⚠️  Beta-binomial test with n<6 may have poor variance estimates.\n"
+            "   Consider using test='logit_t' or test='fisher' instead."
+        )
+    
+    if max_n / min_n > 2:
+        logger.warning(
+            f"⚠️  Unbalanced design detected: n_case={n_case}, n_control={n_ctrl}\n"
+            "   Large imbalance may reduce statistical power."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +891,8 @@ def process_chromosomes_dmc(
     all_samples = samples_case + samples_control
 
     min_group = min(len(samples_case), len(samples_control))
+    _validate_sample_size_and_warn(len(samples_case), len(samples_control), test)
+    
     for rng, rec in _TEST_RECOMMENDATIONS.items():
         if min_group in rng:
             logger.info(

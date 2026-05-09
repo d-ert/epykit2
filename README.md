@@ -3,6 +3,16 @@
 `epykit` now supports an AnnData-inspired central object for WGBS workflows:
 `MethylData`.
 
+## ⚡ Recent Improvements (v0.1+)
+
+**Statistical Fixes:**
+- ✅ Logit-transformed t-test for beta-bounded methylation values
+- ✅ Brown's method for correlation-aware DMR p-value combination  
+- ✅ Sample size validation with automatic test selection
+- ✅ Improved CpG strand pairing validation
+
+See [STATISTICAL_FIXES_IMPLEMENTED.md](STATISTICAL_FIXES_IMPLEMENTED.md) for details.
+
 ## New high-level API
 
 ```python
@@ -85,3 +95,8 @@ Extra columns are preserved automatically in `md.obs` (e.g. `batch_id`,
 
 The original module-level functions remain exported for compatibility
 (`convert_sample`, `filter_sites`, `process_chromosomes_dmc`, etc.).
+
+
+If you ever need to see the logs for debugging, you can enable them with:
+import epykit
+epykit.annotate._VERBOSE = True

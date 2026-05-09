@@ -51,6 +51,9 @@ _FEAT_COLS = ["Chromosome", "Start", "End", "Strand", "Feature", "gene_id", "gen
 # Avoids re-parsing the 8 M-line GTF when annotating both DMC and DMR sets.
 _GTF_CACHE: dict[str, tuple[Any, Any]] = {}
 
+# Module-level verbose flag (set to False to disable logging)
+_VERBOSE: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -66,6 +69,8 @@ def _mb() -> str:
 
 
 def _log(msg: str) -> None:
+    if not _VERBOSE:
+        return
     full = f"[annotate] {msg}{_mb()}"
     print(full, flush=True)
     logger.info(msg)
@@ -291,7 +296,7 @@ def _annotate_chromosome_chunk(
     _log(f"  {chrom}: running join ...")
     t0 = time.time()
     try:
-        joined    = sites_pr2.join(features_pr, how="left", suffix="_b")
+        joined    = sites_pr2.join(features_pr, how="left", suffix="_b", apply_strand_suffix=False)
         join_rows = len(joined.df)
         _log(f"  {chrom}: join done in {time.time()-t0:.1f}s  -> {join_rows:,} rows")
         del features_pr

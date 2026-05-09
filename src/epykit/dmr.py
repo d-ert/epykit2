@@ -68,6 +68,111 @@ _MAX_DMR_BP: int = 10_000
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _estimate_cpg_correlation(positions: np.ndarray) -> np.ndarray:
+    """Estimate correlation matrix for CpG sites based on genomic distance.
+    
+    Uses exponential decay model: cor(i,j) = exp(-|pos_i - pos_j| / length_scale)
+    Length scale of 500 bp reflects typical co-methylation decay distance.
+    
+    Parameters
+    ----------
+    positions : np.ndarray
+        Genomic positions of CpGs (must be sorted)
+    
+    Returns
+    -------
+    np.ndarray
+        Correlation matrix (k × k where k = len(positions))
+    """
+    k = len(positions)
+    if k == 0:
+        return np.array([]).reshape(0, 0)
+    if k == 1:
+        return np.array([[1.0]])
+    
+    pos_array = np.asarray(positions, dtype=np.float64)
+    length_scale = 500.0  # bp
+    
+    # Compute pairwise distances
+    distances = np.abs(pos_array[:, np.newaxis] - pos_array[np.newaxis, :])
+    
+    # Exponential decay correlation
+    cor = np.exp(-distances / length_scale)
+    return cor
+
+
+def _browns_method(
+    pvals: np.ndarray,
+    positions: np.ndarray,
+) -> float:
+    """Combine p-values accounting for correlation via Brown's method.
+    
+    Brown's method extends Fisher's combined p-value test by accounting for
+    correlations between individual tests. The test statistic is scaled by a
+    variance inflation factor computed from the correlation matrix.
+    
+    References:
+    - Brown, M. B. (1975). "A method for combining non-independent, 
+      one-sided tests of significance." Biometrics, 31(4), 987-992.
+    
+    Parameters
+    ----------
+    pvals : np.ndarray
+        P-values to combine (length k)
+    positions : np.ndarray
+        Genomic positions for correlation estimation (length k)
+    
+    Returns
+    -------
+    float
+        Combined p-value (Brown's method)
+    """
+    pvals = np.asarray(pvals, dtype=np.float64)
+    k = len(pvals)
+    
+    if k == 0:
+        return np.nan
+    if k == 1:
+        return float(pvals[0])
+    
+    # Filter out invalid p-values
+    valid = ~np.isnan(pvals) & (pvals > 0) & (pvals <= 1.0)
+    if valid.sum() < 1:
+        return np.nan
+    
+    pvals_valid = pvals[valid]
+    pos_valid = positions[valid]
+    k_valid = len(pvals_valid)
+    
+    if k_valid == 1:
+        return float(pvals_valid[0])
+    
+    # Estimate correlation matrix from positions
+    cor = _estimate_cpg_correlation(pos_valid)
+    
+    # Compute Brown's scaling factor: sum of correlation matrix / k
+    # Under independence, this equals 1.0; under positive correlation, > 1.0
+    f = np.sum(cor) / k_valid
+    
+    # Fisher's combined test statistic: -2 Σ ln(p)
+    # Clip p-values to avoid log(0)
+    pvals_clipped = np.clip(pvals_valid, np.finfo(float).tiny, 1.0)
+    chi2_obs = -2.0 * np.sum(np.log(pvals_clipped))
+    
+    # Scale by correlation factor
+    chi2_scaled = chi2_obs / f
+    
+    # Adjusted degrees of freedom (Welch approximation)
+    # df_adj = 2k² / (k + (k-1)f)
+    df_adjusted = (2.0 * k_valid ** 2) / (k_valid + (k_valid - 1.0) * f)
+    
+    # Combined p-value from scaled chi-square
+    from scipy.stats import chi2
+    combined_p = chi2.sf(chi2_scaled, df=df_adjusted)
+    
+    return float(combined_p)
+
+
 def _merge_intervals(starts: list[int], ends: list[int]) -> list[tuple[int, int]]:
     """Merge overlapping (start, end) integer intervals."""
     if not starts:
@@ -134,15 +239,25 @@ def _recompute_dmr_stats(
     if n_hyper == n_hypo:
         return None  # ambiguous direction
 
-    # FIX-8: arithmetic mean of p-values is not a valid statistic.
-    # Use Fisher's method: -2 Σ ln(p) ~ χ² with 2k df.
-    from scipy.stats import combine_pvalues
-    valid_pvals = window_pvals[~np.isnan(window_pvals)]
-    if len(valid_pvals) == 0:
+    # FIX-8/FIX-2: Use Brown's method instead of Fisher's to account for
+    # correlation between nearby CpGs. Adjacent sites share methylation state
+    # and therefore violate Fisher's independence assumption.
+    # Brown's method scales Fisher's statistic by correlation factor.
+    valid_pval_mask = ~np.isnan(window_pvals)
+    valid_pvals_for_combine = window_pvals[valid_pval_mask]
+    valid_pos_for_combine = np.asarray(
+        [positions[i] for i in range(lo, hi) if valid_pval_mask[i - lo]],
+        dtype=np.int64
+    )
+    
+    if len(valid_pvals_for_combine) == 0:
         return None
-    # Clip to avoid log(0); p-values of exactly 0 map to the smallest float
-    valid_pvals = np.clip(valid_pvals, np.finfo(float).tiny, 1.0)
-    _, combined_p = combine_pvalues(valid_pvals, method="fisher")
+    
+    # Use Brown's method for correlation-aware p-value combination
+    combined_p = _browns_method(valid_pvals_for_combine, valid_pos_for_combine)
+    
+    if np.isnan(combined_p):
+        return None
 
     return {
         "chrom":          chrom,
