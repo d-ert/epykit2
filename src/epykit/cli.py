@@ -1,3 +1,18 @@
+"""Command-line entry point for epykit.
+
+Changes vs prior version (see analysis report for bug numbers):
+
+* BIO-3 / BIO-1: ``dmc --test`` now exposes ``logit_t`` (default), ``cmh``,
+  ``beta_binomial``, and ``fisher``. Default changed from ``fisher`` (broken
+  pooled-CMH at n<6) to ``logit_t`` (statistically sound replicate-aware
+  Welch t-test on logit-transformed betas).
+* BIO-7: ``dmc`` gains ``--min-samples-case`` / ``--min-samples-control``
+  flags that propagate to ``process_chromosomes_dmc``.
+* BIO-5: ``dmr`` gains ``--method {tile,sliding_window}``, ``--tile-size-bp``,
+  ``--min-cpgs-per-tile``, and the tile path takes a methylstore +
+  samplesheet (not a precomputed DMC table) to enable read-pooling per tile.
+"""
+
 import argparse
 import logging
 from pathlib import Path
@@ -10,6 +25,36 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+
+# ---------------------------------------------------------------------------
+# Internal helper: samplesheet → (treatment_samples, control_samples)
+# ---------------------------------------------------------------------------
+
+def _read_samplesheet_groups(samplesheet: str, treatment_group: str, control_group: str):
+    import csv
+
+    with open(samplesheet) as f:
+        reader = csv.DictReader(f)
+        samples_by_group: dict[str, list[str]] = {}
+        for row in reader:
+            group     = row["group"]
+            sample_id = row["sample_id"]
+            samples_by_group.setdefault(group, []).append(sample_id)
+
+    treatment_samples = samples_by_group.get(treatment_group)
+    control_samples   = samples_by_group.get(control_group)
+
+    if not treatment_samples:
+        raise ValueError(f"No samples found for group '{treatment_group}'")
+    if not control_samples:
+        raise ValueError(f"No samples found for group '{control_group}'")
+
+    return treatment_samples, control_samples
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
 
 def _cmd_convert(args: argparse.Namespace):
     """Handler for 'convert' subcommand."""
@@ -44,26 +89,19 @@ def _cmd_sample_summary(args: argparse.Namespace):
 
 def _cmd_dmc(args: argparse.Namespace):
     """Handler for 'dmc' subcommand."""
-    import csv
-
-    with open(args.samplesheet) as f:
-        reader = csv.DictReader(f)
-        samples_by_group: dict[str, list[str]] = {}
-        for row in reader:
-            group     = row["group"]
-            sample_id = row["sample_id"]
-            samples_by_group.setdefault(group, []).append(sample_id)
-
-    treatment_samples = samples_by_group.get(args.treatment_group)
-    control_samples   = samples_by_group.get(args.control_group)
-
-    if not treatment_samples:
-        raise ValueError(f"No samples found for group '{args.treatment_group}'")
-    if not control_samples:
-        raise ValueError(f"No samples found for group '{args.control_group}'")
+    treatment_samples, control_samples = _read_samplesheet_groups(
+        args.samplesheet, args.treatment_group, args.control_group
+    )
 
     print(f"Treatment samples: {treatment_samples}")
     print(f"Control samples:   {control_samples}")
+    print(f"Test:              {args.test}")
+    print(f"Unite mode:        {'intersect' if args.unite else 'union'}")
+    if args.min_samples_case or args.min_samples_control:
+        print(
+            f"Per-site guards:   min_samples_case={args.min_samples_case}, "
+            f"min_samples_control={args.min_samples_control}"
+        )
 
     results = dmc.process_chromosomes_dmc(
         args.methylstore,
@@ -71,34 +109,76 @@ def _cmd_dmc(args: argparse.Namespace):
         control_samples,
         test=args.test,
         unite=args.unite,
+        min_samples_case=args.min_samples_case,
+        min_samples_control=args.min_samples_control,
     )
     results = dmc.apply_multiple_testing_correction(results, method="fdr_bh")
     results.write_parquet(args.output)
     print(f"DMC results written to {args.output}")
+    n_sig = int((results["qvalue"] < 0.05).sum()) if "qvalue" in results.columns else 0
+    print(f"  Total sites tested: {len(results):,}")
+    print(f"  Significant (q<0.05): {n_sig:,}")
 
 
 def _cmd_dmr(args: argparse.Namespace):
     """Handler for 'dmr' subcommand."""
     import polars as pl
-    from .dmr import call_dmr_sliding_window
+    from .dmr import call_dmr_sliding_window, call_dmr_tile_based
 
-    dmc_results = pl.read_parquet(args.dmc_results)
-    dmr_results = call_dmr_sliding_window(
-        dmc_results,
-        window_bp=args.window_bp,
-        step_bp=args.step_bp,
-        min_cpgs=args.min_cpgs,
-        min_sites_significant=args.min_sites_significant,
-        alpha=args.alpha,
-        min_abs_meth_diff=args.min_abs_meth_diff,
-    )
+    if args.method == "tile":
+        # --- BIO-5: tile-based path. Needs methylstore + samplesheet. ---
+        if not args.methylstore or not args.samplesheet:
+            raise ValueError(
+                "method=tile requires --methylstore, --samplesheet, "
+                "--treatment-group and --control-group."
+            )
+
+        treatment_samples, control_samples = _read_samplesheet_groups(
+            args.samplesheet, args.treatment_group, args.control_group
+        )
+
+        print(f"Treatment samples: {treatment_samples}")
+        print(f"Control samples:   {control_samples}")
+        print(f"Tile size:         {args.tile_size_bp} bp")
+        print(f"Test:              {args.test}")
+
+        dmr_results = call_dmr_tile_based(
+            methylstore_path=args.methylstore,
+            samples_case=treatment_samples,
+            samples_control=control_samples,
+            tile_size_bp=args.tile_size_bp,
+            test=args.test,
+            min_cpgs_per_tile=args.min_cpgs_per_tile,
+            alpha=args.alpha,
+            min_abs_meth_diff=args.min_abs_meth_diff,
+            unite=args.unite,
+            min_samples_case=args.min_samples_case,
+            min_samples_control=args.min_samples_control,
+        )
+    else:
+        # --- Legacy sliding-window path: takes a DMC parquet ---
+        if not args.dmc_results:
+            raise ValueError("method=sliding_window requires --dmc-results.")
+
+        dmc_results = pl.read_parquet(args.dmc_results)
+        dmr_results = call_dmr_sliding_window(
+            dmc_results,
+            window_bp=args.window_bp,
+            step_bp=args.step_bp,
+            min_cpgs=args.min_cpgs,
+            min_sites_significant=args.min_sites_significant,
+            alpha=args.alpha,
+            min_abs_meth_diff=args.min_abs_meth_diff,
+        )
+
     dmr_results.write_parquet(args.output)
     print(f"DMR results written to {args.output}")
     print(f"Total DMRs called: {len(dmr_results):,}")
-    if len(dmr_results) > 0:
+    if len(dmr_results) > 0 and "dmr_type" in dmr_results.columns:
         n_hyper = int((dmr_results["dmr_type"] == "hyper").sum())
         n_hypo  = int((dmr_results["dmr_type"] == "hypo").sum())
-        print(f"  Hyper: {n_hyper:,}  Hypo: {n_hypo:,}")
+        n_mixed = int((dmr_results["dmr_type"] == "mixed").sum())
+        print(f"  Hyper: {n_hyper:,}  Hypo: {n_hypo:,}  Mixed: {n_mixed:,}")
         print(dmr_results.head(10))
 
 
@@ -174,6 +254,10 @@ def _cmd_smooth(args: argparse.Namespace):
     print(f"Smoothed betas written to {smooth_path}")
 
 
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
 def main():
     ap  = argparse.ArgumentParser(
         prog="epykit", description="Methylation Parquet store tools"
@@ -228,27 +312,93 @@ def main():
     p_dmc.add_argument("--output",           required=True)
     p_dmc.add_argument(
         "--test",
-        choices=["fisher", "beta_binomial"],
-        default="fisher",
-        help="Statistical test: 'fisher' (default) or 'beta_binomial' (≥6 reps)",
+        choices=["score", "logit_t", "beta_binomial", "cmh", "fisher"],
+        default="score",
+        help=(
+            "Statistical test (default: score). "
+            "score — Quasi-binomial score test with chromosome-level "
+            "overdispersion correction, replicate-aware. Matches methylKit's "
+            "calculateDiffMeth(overdispersion='MN', test='Chisq'). "
+            "Recommended at n>=3. "
+            "logit_t — Welch t on logit(beta), variance-stabilising fallback. "
+            "beta_binomial — Welch t on raw betas (NOT a GLM; superseded by score). "
+            "cmh — Cochran-Mantel-Haenszel with proper per-pair stratification. "
+            "fisher — Fisher exact on reads pooled across replicates "
+            "(anti-conservative, kept for backward compatibility; warns)."
+        ),
     )
     p_dmc.add_argument(
         "--no-unite", action="store_false", dest="unite", default=True,
         help="Include sites seen in at least one sample (default: only sites in all samples)",
+    )
+    p_dmc.add_argument(
+        "--min-samples-case", type=int, default=0,
+        help=(
+            "Per-site minimum number of treatment samples with non-zero "
+            "coverage. Sites failing the threshold are NaN'd before FDR. "
+            "Useful with --no-unite (BIO-7)."
+        ),
+    )
+    p_dmc.add_argument(
+        "--min-samples-control", type=int, default=0,
+        help="Per-site minimum number of control samples with non-zero coverage.",
     )
     p_dmc.set_defaults(func=_cmd_dmc)
 
     # ------------------------------------------------------------------
     # dmr
     # ------------------------------------------------------------------
-    p_dmr = sub.add_parser("dmr", help="DMR calling from DMC results")
-    p_dmr.add_argument("--dmc-results",          required=True,
-                       help="Parquet file from 'epykit dmc'")
-    p_dmr.add_argument("--output",               required=True)
+    p_dmr = sub.add_parser("dmr", help="DMR calling (tile-based or sliding-window)")
+    p_dmr.add_argument(
+        "--method",
+        choices=["tile", "sliding_window"],
+        default="tile",
+        help=(
+            "DMR algorithm. "
+            "'tile' (default, methylKit parity, BIO-5) pools reads across "
+            "CpGs within each fixed-size tile and runs one test per tile. "
+            "'sliding_window' takes a precomputed DMC parquet and combines "
+            "per-CpG p-values with signed Stouffer's Z (legacy)."
+        ),
+    )
+    p_dmr.add_argument("--output", required=True)
+
+    # Tile-method options
+    p_dmr.add_argument("--methylstore",
+                       help="(tile only) Path to filtered Parquet methylstore.")
+    p_dmr.add_argument("--samplesheet",
+                       help="(tile only) CSV: sample_id, group, path.")
+    p_dmr.add_argument("--treatment-group",
+                       help="(tile only) Group label for treatment samples.")
+    p_dmr.add_argument("--control-group",
+                       help="(tile only) Group label for control samples.")
+    p_dmr.add_argument("--tile-size-bp",       type=int,   default=1000,
+                       help="(tile only) Tile width in bp. Default 1000 (methylKit default).")
+    p_dmr.add_argument("--min-cpgs-per-tile",  type=int,   default=5,
+                       help="(tile only) Minimum CpGs per tile per sample.")
+    p_dmr.add_argument(
+        "--test", choices=["score", "logit_t", "beta_binomial", "cmh", "fisher"],
+        default="score",
+        help="(tile only) Statistical test applied to tile-level counts.",
+    )
+    p_dmr.add_argument(
+        "--no-unite", action="store_false", dest="unite", default=True,
+        help="(tile only) Test tiles covered in at least one sample (default: intersect).",
+    )
+    p_dmr.add_argument("--min-samples-case",    type=int, default=0,
+                       help="(tile only) Per-tile minimum treatment samples.")
+    p_dmr.add_argument("--min-samples-control", type=int, default=0,
+                       help="(tile only) Per-tile minimum control samples.")
+
+    # Sliding-window-method options
+    p_dmr.add_argument("--dmc-results",
+                       help="(sliding_window only) Parquet file from 'epykit dmc'")
     p_dmr.add_argument("--window-bp",            type=int,   default=500)
     p_dmr.add_argument("--step-bp",              type=int,   default=250)
     p_dmr.add_argument("--min-cpgs",             type=int,   default=5)
     p_dmr.add_argument("--min-sites-significant",type=int,   default=3)
+
+    # Shared filters
     p_dmr.add_argument("--alpha",                type=float, default=0.05)
     p_dmr.add_argument("--min-abs-meth-diff",    type=float, default=0.1)
     p_dmr.set_defaults(func=_cmd_dmr)

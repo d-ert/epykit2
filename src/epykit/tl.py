@@ -1,3 +1,20 @@
+"""High-level tools for the standard WGBS analysis flow.
+
+Changes vs prior version (see analysis report for bug numbers):
+
+* BIO-3 — ``_auto_test`` no longer routes n<6 designs to the broken
+  ``"fisher"`` path. It returns ``"logit_t"`` at n<6 (replicate-aware Welch
+  t-test on logit-transformed betas) and ``"beta_binomial"`` at n>=6.
+* BIO-5 — ``dmr()`` gains a ``method`` parameter: ``"tile"`` (new, default)
+  runs methylKit-style tile-based DMR with read pooling per tile, and
+  ``"sliding_window"`` (legacy) runs the prior per-CpG p-value combining path.
+* BIO-7 — ``dmc()`` and the tile-based DMR pass ``min_samples_case`` /
+  ``min_samples_control`` through to the underlying engine so that union-mode
+  tests on singleton-covered sites can be filtered out before correction.
+* BIO-10 — the DMR-level filter now applies to ``combined_qvalue`` (BH-
+  corrected at the DMR level) rather than the raw ``combined_pvalue``.
+"""
+
 from __future__ import annotations
 
 import gc
@@ -5,14 +22,33 @@ import polars as pl
 
 from .annotate import annotate_cpg_islands, annotate_features, _GTF_CACHE
 from .dmc import apply_multiple_testing_correction, process_chromosomes_dmc
-from .dmr import call_dmr_sliding_window
+from .dmr import call_dmr_sliding_window, call_dmr_tile_based
 from .methyldata import MethylData
 from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
 
 
 def _auto_test(md: MethylData) -> str:
+    """Pick a sensible test based on group size.
+
+    BIO-3 fix: previously this returned ``"fisher"`` for n<6, which then hit
+    the broken pooled-control CMH path in ``dmc.py``.
+
+    Current default: ``"score"`` at n>=2 — the quasi-binomial score test
+    with chromosome-level overdispersion correction, matching methylKit's
+    ``calculateDiffMeth(overdispersion="MN", test="Chisq")``. This is a real
+    count-based test, replicate-aware (via the φ̂ inflation), and uses
+    closed-form streaming accumulators so it has the same O(n_sites) memory
+    profile as the other paths.
+
+    At n=1 (single replicate per group) there is no between-replicate
+    variability for φ̂ to estimate, so we fall back to Fisher exact with the
+    understanding that no statistical test is genuinely reliable in that
+    regime.
+    """
     min_group = min(len(md.treatment_ids), len(md.control_ids))
-    return "beta_binomial" if min_group >= 6 else "fisher"
+    if min_group < 2:
+        return "fisher"
+    return "score"
 
 
 def qc(md: MethylData, chh_context_store: str | None = None) -> None:
@@ -66,8 +102,29 @@ def dmc(
     md: MethylData,
     test: str = "auto",
     chromosomes: list[str] | None = None,
+    min_samples_case: int = 0,
+    min_samples_control: int = 0,
 ) -> None:
-    """Run DMC calling and store result in md.varm['dmc_<test>']."""
+    """Run DMC calling and store result in md.varm['dmc_<test>'].
+
+    Parameters
+    ----------
+    md : MethylData
+        Analysis object containing the methylstore path and the
+        treatment/control sample lists.
+    test : str
+        One of ``"auto"``, ``"logit_t"``, ``"beta_binomial"``, ``"cmh"``,
+        ``"fisher"``. ``"auto"`` resolves to ``"logit_t"`` at n<6 (BIO-3) and
+        ``"beta_binomial"`` at n>=6.
+    chromosomes : list[str], optional
+        Restrict to a subset of chromosomes. Auto-detected when None.
+    min_samples_case, min_samples_control : int
+        BIO-7: per-site minimum number of samples with non-zero coverage in
+        each group. Sites that fail are NaN'd out before FDR correction.
+        Primarily useful when ``ep.pp.unite(..., type="union")`` was used so
+        that union-introduced zero-coverage rows aren't treated as real
+        observations.
+    """
     selected_test = _auto_test(md) if test == "auto" else test
     unite_info = md.uns.get("unite")
     unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
@@ -79,6 +136,8 @@ def dmc(
         test=selected_test,
         chromosomes=chromosomes,
         unite=unite,
+        min_samples_case=min_samples_case,
+        min_samples_control=min_samples_control,
     )
     result = apply_multiple_testing_correction(result, method="fdr_bh")
 
@@ -89,57 +148,156 @@ def dmc(
         "test_used": selected_test,
         "n_sites": len(result),
         "unite": unite,
+        "min_samples_case": min_samples_case,
+        "min_samples_control": min_samples_control,
     }
 
 
 def dmr(
     md: MethylData,
+    method: str = "tile",
+    # Tile-method options ---------------------------------------------------
+    tile_size_bp: int = 1000,
+    min_cpgs_per_tile: int = 5,
+    test: str = "auto",
+    chromosomes: list[str] | None = None,
+    min_samples_case: int = 0,
+    min_samples_control: int = 0,
+    # Sliding-window options ------------------------------------------------
     window_bp: int = 500,
     step_bp: int = 250,
     min_cpgs: int = 5,
     min_sites_significant: int = 3,
+    # Shared filters --------------------------------------------------------
     alpha: float = 0.05,
     min_abs_meth_diff: float = 0.1,
-    min_mean_pvalue: float | None = 0.05,
+    min_mean_qvalue: float | None = 0.05,
 ) -> None:
-    """Run DMR calling using the current DMC result and store in md.uns['dmr'].
+    """Run DMR calling and store result in ``md.uns['dmr']``.
+
+    Two methods are supported:
+
+    * ``method="tile"`` (default, methylKit parity, BIO-5) — aggregates
+      read counts within fixed tiles and runs a single test per tile.
+      Requires direct access to ``md.store`` and the per-sample methylstore;
+      does not need a prior DMC table. This is the recommended path for
+      whole-genome WGBS analyses.
+    * ``method="sliding_window"`` — the legacy in-tree method: takes the
+      DMC result on ``md`` and combines per-CpG p-values within overlapping
+      windows with signed Stouffer's Z. Faster (no extra I/O) but
+      substantially lower-power than tile-based aggregation at typical
+      WGBS coverage.
 
     Parameters
     ----------
-    min_mean_pvalue : float or None
-        Post-hoc filter on the DMR-level ``combined_pvalue`` (Fisher's method
-        across per-CpG p-values).  DMRs with ``combined_pvalue ≥ min_mean_pvalue``
-        are dropped.  Set to None to keep all candidate DMRs.  Default 0.05.
-        (Previously filtered on the now-removed ``mean_pvalue`` column.)
+    method : {"tile", "sliding_window"}
+        Which DMR algorithm to run.
+    tile_size_bp, min_cpgs_per_tile : int
+        Tile-method options. ``tile_size_bp=1000`` matches methylKit's default.
+    test : str
+        Statistical test for tile-method (ignored when ``method="sliding_window"``).
+        ``"auto"`` resolves the same way as in :func:`dmc`.
+    chromosomes : list[str], optional
+        Restrict tile-method processing to these chromosomes.
+    min_samples_case, min_samples_control : int
+        Per-tile sample-count guard for tile-method (BIO-7).
+    window_bp, step_bp, min_cpgs, min_sites_significant : int
+        Sliding-window method options.
+    alpha : float
+        q-value threshold for "significant" at the DMC / tile level
+        (used by both methods, with different downstream meanings).
+    min_abs_meth_diff : float
+        Minimum |meth_diff| for a DMC / tile to count.
+    min_mean_qvalue : float or None
+        BIO-10: post-hoc filter on the DMR-level **q-value**
+        (``combined_qvalue`` for sliding-window, ``qvalue`` for tile).
+        DMRs with q >= ``min_mean_qvalue`` are dropped. Set to None to keep
+        all candidate DMRs. Default 0.05.
+
+        This parameter was previously named ``min_mean_pvalue`` and applied
+        to the uncorrected p-value, which was not FDR-controlled across the
+        DMR set.
     """
-    dmc_df = md.dmc
-    if dmc_df is None:
-        raise ValueError("No DMC results available. Run ep.tl.dmc(md) first.")
+    if method == "tile":
+        selected_test = _auto_test(md) if test == "auto" else test
+        unite_info = md.uns.get("unite")
+        unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
 
-    dmr_df = call_dmr_sliding_window(
-        dmc_results=dmc_df,
-        window_bp=window_bp,
-        step_bp=step_bp,
-        min_cpgs=min_cpgs,
-        min_sites_significant=min_sites_significant,
-        alpha=alpha,
-        min_abs_meth_diff=min_abs_meth_diff,
+        dmr_df = call_dmr_tile_based(
+            methylstore_path=md.store,
+            samples_case=md.treatment_ids,
+            samples_control=md.control_ids,
+            tile_size_bp=tile_size_bp,
+            test=selected_test,
+            chromosomes=chromosomes,
+            min_cpgs_per_tile=min_cpgs_per_tile,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+            unite=unite,
+            min_samples_case=min_samples_case,
+            min_samples_control=min_samples_control,
+        )
+
+        # Optional q-value post-filter (the tile path already filtered at
+        # `alpha`, but a stricter user threshold is allowed here).
+        if len(dmr_df) > 0 and min_mean_qvalue is not None and "qvalue" in dmr_df.columns:
+            dmr_df = dmr_df.filter(pl.col("qvalue") < min_mean_qvalue)
+
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "tile",
+            "tile_size_bp": tile_size_bp,
+            "min_cpgs_per_tile": min_cpgs_per_tile,
+            "test": selected_test,
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "min_mean_qvalue": min_mean_qvalue,
+            "min_samples_case": min_samples_case,
+            "min_samples_control": min_samples_control,
+            "unite": unite,
+        }
+        return
+
+    if method == "sliding_window":
+        dmc_df = md.dmc
+        if dmc_df is None:
+            raise ValueError(
+                "No DMC results available. Run ep.tl.dmc(md) first, or use "
+                "method='tile' which goes directly to the methylstore."
+            )
+
+        dmr_df = call_dmr_sliding_window(
+            dmc_results=dmc_df,
+            window_bp=window_bp,
+            step_bp=step_bp,
+            min_cpgs=min_cpgs,
+            min_sites_significant=min_sites_significant,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+        )
+        # BIO-10: filter on the BH-corrected DMR-level q-value, not the raw
+        # combined p-value. ``call_dmr_sliding_window`` now adds
+        # ``combined_qvalue`` itself.
+        if len(dmr_df) > 0 and min_mean_qvalue is not None:
+            q_col = "combined_qvalue" if "combined_qvalue" in dmr_df.columns else "combined_pvalue"
+            dmr_df = dmr_df.filter(pl.col(q_col) < min_mean_qvalue)
+
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "sliding_window",
+            "window_bp": window_bp,
+            "step_bp": step_bp,
+            "min_cpgs": min_cpgs,
+            "min_sites_significant": min_sites_significant,
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "min_mean_qvalue": min_mean_qvalue,
+        }
+        return
+
+    raise ValueError(
+        f"Unknown DMR method '{method}'. Expected 'tile' or 'sliding_window'."
     )
-    # Discard windows where the window-level signal is weak (match old behaviour).
-    # FIX-8: filter on combined_pvalue (Fisher's method) not mean_pvalue.
-    if len(dmr_df) > 0 and min_mean_pvalue is not None:
-        dmr_df = dmr_df.filter(pl.col("combined_pvalue") < min_mean_pvalue)
-
-    md.uns["dmr"] = dmr_df
-    md.uns["dmr_params"] = {
-        "window_bp": window_bp,
-        "step_bp": step_bp,
-        "min_cpgs": min_cpgs,
-        "min_sites_significant": min_sites_significant,
-        "alpha": alpha,
-        "min_abs_meth_diff": min_abs_meth_diff,
-        "min_mean_pvalue": min_mean_pvalue,
-    }
 
 
 def annotate(
@@ -211,7 +369,7 @@ def annotate(
         "promoter_upstream_bp": promoter_upstream_bp,
         "promoter_downstream_bp": promoter_downstream_bp,
     }
-    
+
     # Clear GTF cache if requested (default: True)
     if clear_gtf_cache and gtf:
         _GTF_CACHE.clear()

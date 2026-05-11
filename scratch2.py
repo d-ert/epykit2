@@ -42,7 +42,7 @@ ep.tl.dmr(md, window_bp=500, min_cpgs=5)
 print(md.dmc.filter(pl.col("qvalue") < 0.05))
 
 # Check DMR results  
-print(md.uns["dmr"].filter(pl.col("combined_pvalue") < 0.05))
+print(md.uns["dmr"].filter(pl.col("qvalue") < 0.05))
 
 
 

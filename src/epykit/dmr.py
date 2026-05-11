@@ -1,42 +1,68 @@
 """Differentially Methylated Region (DMR) calling.
 
-Phase 2 of the epykit pipeline:
-  - call_dmr_sliding_window: aggregates DMC sites into contiguous genomic
-    windows using an overlapping sliding-window approach (MVP).
-  - smooth_methylation_bsmooth: BSmooth-style methylation smoothing using a
-    fast grid-based Gaussian kernel (replaces statsmodels LOESS).
+Two complementary algorithms are exposed:
+
+call_dmr_sliding_window(dmc_results, ...)
+    Operates on a precomputed per-CpG DMC table. Slides a window across the
+    genome, collects per-CpG p-values within each window, and combines them
+    via signed Stouffer's Z. Best when you already have a DMC table and
+    want a cheap region-level summary.
+
+call_dmr_tile_based(methylstore_path, samples_case, samples_control, ...)
+    Operates directly on the methylstore. For each fixed-size tile, sums
+    N_meth and coverage across CpGs PER SAMPLE, then runs the full DMC
+    test on the tile-level counts. This is the methylKit-style approach
+    (tileMethylCounts → calculateDiffMeth). Read-pooling within tiles
+    aggregates evidence across CpGs before testing, so windows whose
+    individual CpGs lack the per-site significance the sliding-window
+    method needs are still recovered. Recommended for methylKit parity
+    and for studies where per-CpG coverage is modest.
 
 Performance notes
 -----------------
-v2 rewrites:
-
 call_dmr_sliding_window
-  Old: Python ``while`` loop over every window position; each iteration runs
-       a full O(n_sites) boolean mask.  For chr1 with 1 M CpGs and step=250 bp
-       that is ~1 M × 1 M = 10^12 operations.
-  New: All window boundaries are generated with ``np.arange``, then
-       ``np.searchsorted`` locates each boundary in O(log n_sites).
-       Per-window CpG and significance counts are answered in O(1) using
-       prefix cumulative sums.  Total cost is O(W log N + W) where W is the
-       number of windows — typically 100-1000× faster on whole-genome data.
+  All window boundaries are generated with ``np.arange``, then
+  ``np.searchsorted`` locates each boundary in O(log n_sites). Per-window
+  CpG and significance counts are answered in O(1) using prefix cumulative
+  sums.
 
 smooth_methylation_bsmooth
-  Old: statsmodels ``lowess`` at frac = bandwidth / chrom_span.  At
-       frac = 0.01 on 1 M sites the kernel uses 10 000 neighbours per point:
-       O(n × frac × n) ≈ O(n²) in practice — minutes per chromosome.
-  New: Raw betas are projected onto a regular grid, smoothed with
-       scipy.ndimage.gaussian_filter1d (O(G) where G = grid size), then
-       interpolated back.  For bandwidth=1 000 bp on chr1 this is ~500×
-       faster with negligible numerical difference.
+  Raw betas are projected onto a regular grid, smoothed with
+  scipy.ndimage.gaussian_filter1d (O(G) where G = grid size), then
+  interpolated back. ~500× faster than statsmodels LOESS on WGBS data.
+
+Statistical fixes vs previous revision
+--------------------------------------
+BIO-9:  p-value combination uses signed Stouffer's Z instead of Brown's
+        method. Brown's required a correlation matrix of the test
+        statistics; the old implementation substituted a position-based
+        correlation between CpG states, which has the wrong scale and
+        systematically inflates the correlation factor f, dividing χ² and
+        weakening combined p-values. Signed Stouffer's is robust to mild
+        positive correlation without estimating it explicitly, and its
+        sign comes from each CpG's meth_diff so the test naturally
+        downweights mixed-direction windows.
+BIO-10: direction (hyper / hypo / mixed) is determined from the sign of
+        the mean meth_diff in the window, not from a tally of hyper vs
+        hypo sites. A window with 6 +0.12 sites and 4 -0.40 sites is now
+        correctly called "hypo" (or "mixed" when the sign tally is close)
+        rather than "hyper" by raw count.
+BIO-5 (cross-module): the new call_dmr_tile_based path provides
+        methylKit-parity DMR calling by aggregating reads within tiles
+        before testing. The sliding-window path is preserved as a
+        secondary, lower-power method.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+from scipy import stats as sp_stats
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +73,24 @@ _DMR_EMPTY_SCHEMA = {
     "n_cpgs":           pl.Int32,
     "n_significant":    pl.Int32,
     "mean_meth_diff":   pl.Float32,
-    "combined_pvalue":  pl.Float64,   # FIX-8: Fisher's method replaces mean_pvalue
+    "combined_pvalue":  pl.Float64,
+    "combined_qvalue":  pl.Float64,
+    "dmr_type":         pl.Utf8,
+}
+
+_DMR_TILE_SCHEMA = {
+    "chrom":            pl.Utf8,
+    "start":            pl.Int32,
+    "end":              pl.Int32,
+    "n_cpgs":           pl.Int32,
+    "n_case":           pl.Int32,
+    "n_control":        pl.Int32,
+    "mean_beta_case":   pl.Float32,
+    "mean_beta_control": pl.Float32,
+    "meth_diff":        pl.Float32,
+    "log2_odds_ratio":  pl.Float64,
+    "pvalue":           pl.Float64,
+    "qvalue":           pl.Float64,
     "dmr_type":         pl.Utf8,
 }
 
@@ -63,114 +106,90 @@ _SMOOTH_EMPTY_SCHEMA = {
 # Mammalian DMRs are typically 200 bp – 5 kb; 10 kb is a generous ceiling.
 _MAX_DMR_BP: int = 10_000
 
+# BIO-10: a window's direction is called "mixed" when the fraction of
+# valid sites agreeing with the sign of the mean is below this threshold.
+_MIXED_DIRECTION_THRESHOLD: float = 0.6
+
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers — p-value combination
 # ---------------------------------------------------------------------------
 
-def _estimate_cpg_correlation(positions: np.ndarray) -> np.ndarray:
-    """Estimate correlation matrix for CpG sites based on genomic distance.
-    
-    Uses exponential decay model: cor(i,j) = exp(-|pos_i - pos_j| / length_scale)
-    Length scale of 500 bp reflects typical co-methylation decay distance.
-    
-    Parameters
-    ----------
-    positions : np.ndarray
-        Genomic positions of CpGs (must be sorted)
-    
-    Returns
-    -------
-    np.ndarray
-        Correlation matrix (k × k where k = len(positions))
-    """
-    k = len(positions)
-    if k == 0:
-        return np.array([]).reshape(0, 0)
-    if k == 1:
-        return np.array([[1.0]])
-    
-    pos_array = np.asarray(positions, dtype=np.float64)
-    length_scale = 500.0  # bp
-    
-    # Compute pairwise distances
-    distances = np.abs(pos_array[:, np.newaxis] - pos_array[np.newaxis, :])
-    
-    # Exponential decay correlation
-    cor = np.exp(-distances / length_scale)
-    return cor
-
-
-def _browns_method(
+def _stouffer_combine_signed(
     pvals: np.ndarray,
-    positions: np.ndarray,
+    meth_diffs: np.ndarray,
+    weights: np.ndarray | None = None,
 ) -> float:
-    """Combine p-values accounting for correlation via Brown's method.
-    
-    Brown's method extends Fisher's combined p-value test by accounting for
-    correlations between individual tests. The test statistic is scaled by a
-    variance inflation factor computed from the correlation matrix.
-    
-    References:
-    - Brown, M. B. (1975). "A method for combining non-independent, 
-      one-sided tests of significance." Biometrics, 31(4), 987-992.
-    
+    """Combine per-CpG two-sided p-values via signed Stouffer's Z.
+
+    Each CpG contributes a signed Z-score:
+        z_i = sign(meth_diff_i) · Φ⁻¹(1 - p_i / 2)
+    so that hyper-methylated CpGs contribute positive Z and hypo-methylated
+    CpGs contribute negative Z. The combined statistic is
+        Z = Σ w_i · z_i  /  √(Σ w_i²)
+    which is two-sided-tested. When all CpGs in a window agree in direction
+    the |Z| grows as √k and the combined p-value gets correspondingly
+    small; when directions are mixed, contributions cancel and the
+    combined p-value stays large.
+
+    BIO-9: this replaces the previous Brown's method implementation, which
+    required a correlation matrix of the per-CpG test statistics. The old
+    code estimated it from genomic distances between CpGs — a proxy for the
+    correlation of methylation STATES, not of the test statistics — which
+    systematically over-inflated the variance correction f and weakened
+    combined p-values regardless of how strong the per-CpG signal was.
+    Stouffer's Z is robust to mild positive correlation between tests
+    (combined Z is conservative but not over-smoothed) and does not
+    require correlation estimation.
+
     Parameters
     ----------
     pvals : np.ndarray
-        P-values to combine (length k)
-    positions : np.ndarray
-        Genomic positions for correlation estimation (length k)
-    
+        Two-sided p-values for each CpG in the window.
+    meth_diffs : np.ndarray
+        Signed per-CpG effect sizes (mean_beta_case − mean_beta_ctrl).
+        Used only for direction; magnitude is ignored.
+    weights : np.ndarray, optional
+        Per-CpG weights (e.g. coverage). Defaults to equal weights.
+
     Returns
     -------
     float
-        Combined p-value (Brown's method)
+        Two-sided combined p-value.
     """
-    pvals = np.asarray(pvals, dtype=np.float64)
-    k = len(pvals)
-    
-    if k == 0:
-        return np.nan
-    if k == 1:
-        return float(pvals[0])
-    
-    # Filter out invalid p-values
-    valid = ~np.isnan(pvals) & (pvals > 0) & (pvals <= 1.0)
-    if valid.sum() < 1:
-        return np.nan
-    
-    pvals_valid = pvals[valid]
-    pos_valid = positions[valid]
-    k_valid = len(pvals_valid)
-    
-    if k_valid == 1:
-        return float(pvals_valid[0])
-    
-    # Estimate correlation matrix from positions
-    cor = _estimate_cpg_correlation(pos_valid)
-    
-    # Compute Brown's scaling factor: sum of correlation matrix / k
-    # Under independence, this equals 1.0; under positive correlation, > 1.0
-    f = np.sum(cor) / k_valid
-    
-    # Fisher's combined test statistic: -2 Σ ln(p)
-    # Clip p-values to avoid log(0)
-    pvals_clipped = np.clip(pvals_valid, np.finfo(float).tiny, 1.0)
-    chi2_obs = -2.0 * np.sum(np.log(pvals_clipped))
-    
-    # Scale by correlation factor
-    chi2_scaled = chi2_obs / f
-    
-    # Adjusted degrees of freedom (Welch approximation)
-    # df_adj = 2k² / (k + (k-1)f)
-    df_adjusted = (2.0 * k_valid ** 2) / (k_valid + (k_valid - 1.0) * f)
-    
-    # Combined p-value from scaled chi-square
-    from scipy.stats import chi2
-    combined_p = chi2.sf(chi2_scaled, df=df_adjusted)
-    
-    return float(combined_p)
+    pvals      = np.asarray(pvals,      dtype=np.float64)
+    meth_diffs = np.asarray(meth_diffs, dtype=np.float64)
+
+    valid = (
+        ~np.isnan(pvals) & (pvals > 0.0) & (pvals <= 1.0)
+        & ~np.isnan(meth_diffs)
+    )
+    if not np.any(valid):
+        return float("nan")
+
+    p_valid    = np.clip(pvals[valid], np.finfo(float).tiny, 1.0 - 1e-15)
+    diff_valid = meth_diffs[valid]
+
+    # Magnitude Z from two-sided p-value: |z| = Φ⁻¹(1 - p/2)
+    z_mag = sp_stats.norm.isf(p_valid / 2.0)
+    # Signed contribution: hyper (+) vs hypo (-). meth_diff == 0 → no
+    # contribution (sign = 0), which is correct: zero-effect CpGs neither
+    # add nor subtract evidence.
+    z_signed = np.sign(diff_valid) * z_mag
+
+    if weights is None:
+        w = np.ones_like(z_signed)
+    else:
+        w = np.asarray(weights, dtype=np.float64)[valid]
+        w = np.where(np.isfinite(w) & (w >= 0), w, 0.0)
+
+    w_sq_sum = float(np.sum(w * w))
+    if w_sq_sum <= 0.0:
+        return float("nan")
+
+    z_combined = float(np.sum(w * z_signed) / np.sqrt(w_sq_sum))
+    # Two-sided normal tail
+    return float(2.0 * sp_stats.norm.sf(abs(z_combined)))
 
 
 def _merge_intervals(starts: list[int], ends: list[int]) -> list[tuple[int, int]]:
@@ -185,6 +204,35 @@ def _merge_intervals(starts: list[int], ends: list[int]) -> list[tuple[int, int]
         else:
             merged.append((s, e))
     return merged
+
+
+def _classify_direction(
+    mean_diff: float,
+    n_hyper: int,
+    n_hypo: int,
+) -> str:
+    """Classify DMR direction from mean effect + per-site sign tally.
+
+    BIO-10: previously the direction was the larger of n_hyper / n_hypo.
+    A window with 6 hyper sites at +0.12 and 4 hypo sites at -0.40 was
+    called "hyper" even though the mean effect was clearly negative.
+
+    The new rule:
+      - Mean direction governs (sign of mean_meth_diff). This matches
+        what the tile-based path does when it pools reads.
+      - If the per-site sign tally is too close (< 60 % majority), the
+        window is labelled "mixed" so downstream filters can drop it.
+    """
+    total_signed = n_hyper + n_hypo
+    if total_signed == 0:
+        return "mixed"
+    consensus = max(n_hyper, n_hypo) / total_signed
+    if consensus < _MIXED_DIRECTION_THRESHOLD:
+        return "mixed"
+    if np.isnan(mean_diff):
+        # Fall back to majority tally if mean is undefined for some reason.
+        return "hyper" if n_hyper > n_hypo else "hypo"
+    return "hyper" if mean_diff > 0 else "hypo"
 
 
 def _recompute_dmr_stats(
@@ -229,50 +277,36 @@ def _recompute_dmr_stats(
     window_diffs = meth_diffs[lo:hi]
     window_pvals = pvals[lo:hi]
 
-    # Filter out NaN diffs for direction determination
     valid_diffs = window_diffs[~np.isnan(window_diffs)]
     if len(valid_diffs) == 0:
-        return None  # no valid diffs
+        return None
 
     n_hyper = int((valid_diffs > 0).sum())
     n_hypo  = int((valid_diffs < 0).sum())
-    if n_hyper == n_hypo:
-        return None  # ambiguous direction
 
-    # FIX-8/FIX-2: Use Brown's method instead of Fisher's to account for
-    # correlation between nearby CpGs. Adjacent sites share methylation state
-    # and therefore violate Fisher's independence assumption.
-    # Brown's method scales Fisher's statistic by correlation factor.
-    valid_pval_mask = ~np.isnan(window_pvals)
-    valid_pvals_for_combine = window_pvals[valid_pval_mask]
-    valid_pos_for_combine = np.asarray(
-        [positions[i] for i in range(lo, hi) if valid_pval_mask[i - lo]],
-        dtype=np.int64
-    )
-    
-    if len(valid_pvals_for_combine) == 0:
-        return None
-    
-    # Use Brown's method for correlation-aware p-value combination
-    combined_p = _browns_method(valid_pvals_for_combine, valid_pos_for_combine)
-    
+    # BIO-9: signed Stouffer's Z. Sign comes from per-CpG meth_diff so the
+    # combined statistic naturally cancels mixed-direction windows.
+    combined_p = _stouffer_combine_signed(window_pvals, window_diffs)
     if np.isnan(combined_p):
         return None
 
+    mean_diff = float(np.nanmean(window_diffs))
+    dmr_type  = _classify_direction(mean_diff, n_hyper, n_hypo)
+
     return {
-        "chrom":          chrom,
-        "start":          start,
-        "end":            end,
-        "n_cpgs":         n_cpgs,
-        "n_significant":  n_sig,
-        "mean_meth_diff": float(np.float32(np.nanmean(window_diffs))),
+        "chrom":           chrom,
+        "start":           start,
+        "end":             end,
+        "n_cpgs":          n_cpgs,
+        "n_significant":   n_sig,
+        "mean_meth_diff":  float(np.float32(mean_diff)),
         "combined_pvalue": float(combined_p),
-        "dmr_type":       "hyper" if n_hyper > n_hypo else "hypo",
+        "dmr_type":        dmr_type,
     }
 
 
 # ---------------------------------------------------------------------------
-# Public API — DMR calling
+# Public API — sliding-window DMR calling (works from a DMC table)
 # ---------------------------------------------------------------------------
 
 def call_dmr_sliding_window(
@@ -286,6 +320,13 @@ def call_dmr_sliding_window(
 ) -> pl.DataFrame:
     """Call DMRs by aggregating DMC sites into overlapping sliding windows.
 
+    This method takes a precomputed DMC table and combines per-CpG p-values
+    region-by-region with signed Stouffer's Z. It is fast and reuses an
+    existing DMC call, but has lower power than the tile-based path
+    (`call_dmr_tile_based`) because it cannot pool reads — windows whose
+    individual CpGs aren't significant won't gather enough sig sites to
+    pass the `min_sites_significant` gate.
+
     Parameters
     ----------
     dmc_results : pl.DataFrame
@@ -293,25 +334,25 @@ def call_dmr_sliding_window(
         ``apply_multiple_testing_correction``.
         Required columns: chrom, pos, meth_diff, pvalue.
         Optional: qvalue (used in preference to pvalue when present).
-    window_bp : int
-        Window width in base pairs (default 500 bp).
-    step_bp : int
-        Step size in base pairs (default 250 bp; must be ≤ window_bp).
+    window_bp, step_bp : int
+        Window width and step in base pairs.
     min_cpgs : int
-        Minimum CpG count in a *merged* DMR (default 5).
+        Minimum CpG count in a *merged* DMR.
     min_sites_significant : int
-        Minimum significant CpG sites in a window for it to be a candidate
-        (default 3).
+        Minimum significant CpG sites in a window for it to be a candidate.
     alpha : float
-        Significance threshold for qvalue / pvalue (default 0.05).
+        Significance threshold for qvalue / pvalue.
     min_abs_meth_diff : float
-        Minimum |meth_diff| for a site to count as significant (default 0.10).
+        Minimum |meth_diff| for a site to count as significant.
 
     Returns
     -------
     pl.DataFrame
         Columns: chrom, start, end, n_cpgs, n_significant,
-                 mean_meth_diff, combined_pvalue, dmr_type ("hyper" | "hypo").
+                 mean_meth_diff, combined_pvalue, combined_qvalue,
+                 dmr_type ("hyper" | "hypo" | "mixed").
+        ``combined_qvalue`` is BH-corrected genome-wide across DMR
+        candidates that passed the per-window gate.
     """
     required = {"chrom", "pos", "meth_diff", "pvalue"}
     missing  = required - set(dmc_results.columns)
@@ -354,8 +395,6 @@ def call_dmr_sliding_window(
 
         # ---------------------------------------------------------------
         # Build prefix-sum arrays for O(1) range count queries
-        # cum_sig[i] = number of significant sites in positions[0 .. i-1]
-        # cum_sig has length n_sites + 1 (sentinel at index 0)
         # ---------------------------------------------------------------
         cum_sig = np.empty(len(positions) + 1, dtype=np.int32)
         cum_sig[0] = 0
@@ -364,24 +403,15 @@ def call_dmr_sliding_window(
         pos_min = int(positions[0])
         pos_max = int(positions[-1])
 
-        # ---------------------------------------------------------------
-        # Vectorised window generation
-        # Generate *all* window start positions as a numpy array, then use
-        # np.searchsorted to locate both boundaries for every window at once.
-        # This replaces the previous Python while-loop with O(n_sites) masks.
-        # ---------------------------------------------------------------
         win_starts_arr = np.arange(pos_min, pos_max + 1, step_bp, dtype=np.int64)
         win_ends_arr   = win_starts_arr + window_bp
 
-        # O(W log N) binary searches for all window boundaries simultaneously
         lefts  = np.searchsorted(positions, win_starts_arr, side="left")
         rights = np.searchsorted(positions, win_ends_arr,   side="left")
 
-        # O(W) range counts via prefix sums
         n_cpgs_arr = (rights - lefts).astype(np.int32)
         n_sig_arr  = (cum_sig[rights] - cum_sig[lefts]).astype(np.int32)
 
-        # Filter candidate windows
         cand_mask = (n_cpgs_arr >= min_cpgs) & (n_sig_arr >= min_sites_significant)
 
         if not np.any(cand_mask):
@@ -414,7 +444,7 @@ def call_dmr_sliding_window(
         logger.warning("No DMRs found with current filters")
         return pl.DataFrame(schema=_DMR_EMPTY_SCHEMA)
 
-    return (
+    dmr_df = (
         pl.DataFrame(all_records)
         .with_columns([
             pl.col("start").cast(pl.Int32),
@@ -425,6 +455,268 @@ def call_dmr_sliding_window(
         ])
         .sort(["chrom", "start"])
     )
+
+    # BIO-11: BH-correct DMR-level combined p-values so downstream filters
+    # are operating on q-values. Without this the sliding-window output
+    # was effectively un-corrected at the region level.
+    from .dmc import apply_multiple_testing_correction
+
+    dmr_df = apply_multiple_testing_correction(
+        dmr_df,
+        method="fdr_bh",
+        pvalue_col="combined_pvalue",
+        qvalue_col="combined_qvalue",
+    )
+    return dmr_df
+
+
+# ---------------------------------------------------------------------------
+# Public API — tile-based DMR calling (methylKit-style)
+# ---------------------------------------------------------------------------
+
+def _aggregate_sample_to_tiles(
+    src_part_file: Path,
+    chrom: str,
+    tile_size_bp: int,
+) -> pl.DataFrame | None:
+    """Aggregate one sample/chromosome's per-CpG counts to per-tile sums.
+
+    Returns a DataFrame with columns: chrom, pos (= tile start), strand,
+    N_meth, N_unmeth, coverage, n_cpgs.  Or None when the source is missing.
+    """
+    if not src_part_file.exists():
+        return None
+
+    df = pl.read_parquet(str(src_part_file))
+    if len(df) == 0:
+        return None
+
+    # Tile assignment: pos // tile * tile gives left-inclusive boundary.
+    tile_col = (pl.col("pos") // tile_size_bp) * tile_size_bp
+    tiled = (
+        df.with_columns(tile_col.cast(pl.Int32).alias("tile_start"))
+        .group_by("tile_start")
+        .agg([
+            pl.sum("N_meth").alias("N_meth"),
+            pl.sum("coverage").alias("coverage"),
+            pl.len().alias("n_cpgs"),
+            # Preserve a strand value: first non-"*" if available, else "*"
+            (
+                pl.when(pl.col("strand") != "*").then(pl.col("strand")).otherwise(None)
+                .drop_nulls().first()
+            ).alias("strand_real")
+            if "strand" in df.columns
+            else pl.lit("*").alias("strand_real"),
+        ])
+        .with_columns([
+            pl.lit(chrom).alias("chrom"),
+            pl.col("tile_start").alias("pos"),
+            pl.col("strand_real").fill_null("*").alias("strand"),
+            (pl.col("coverage") - pl.col("N_meth")).alias("N_unmeth"),
+        ])
+        .drop("tile_start", "strand_real")
+        .sort("pos")
+    )
+    return tiled
+
+
+def call_dmr_tile_based(
+    methylstore_path: str,
+    samples_case: list[str],
+    samples_control: list[str],
+    tile_size_bp: int = 1000,
+    test: str = "logit_t",
+    chromosomes: list[str] | None = None,
+    min_cpgs_per_tile: int = 5,
+    alpha: float = 0.05,
+    min_abs_meth_diff: float = 0.1,
+    unite: bool = True,
+    min_samples_case: int = 0,
+    min_samples_control: int = 0,
+) -> pl.DataFrame:
+    """Call DMRs by aggregating read counts within fixed-size tiles.
+
+    BIO-5: This is the methylKit-parity DMR path. methylKit's tileMethylCounts
+    sums N_meth and coverage across all CpGs in each tile per sample, then
+    runs a single tile-level test (e.g. logistic regression with
+    overdispersion). The sliding-window method in this module tests each
+    CpG individually and combines p-values, which has dramatically lower
+    power at typical WGBS coverage: a tile with 20 CpGs at +15 % effect
+    might have zero individually-significant CpGs but still trivially
+    pass when its 600 pooled reads are tested.
+
+    Implementation
+    --------------
+    1. For each sample and chromosome, aggregate (N_meth, coverage) per tile
+       and write a "tiled methylstore" to a temp directory. Tiles with
+       fewer than ``min_cpgs_per_tile`` CpGs (in that sample) are dropped
+       before writing.
+    2. Run ``process_chromosomes_dmc`` on the tiled store with the requested
+       test. Tiles are treated as "sites" with pos = tile_start.
+    3. BH-correct the tile-level p-values.
+    4. Filter on qvalue and |meth_diff|.
+    5. Reshape into the DMR output schema.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Path to the filtered partitioned Parquet methylstore.
+    samples_case, samples_control : list[str]
+        Sample IDs.
+    tile_size_bp : int
+        Tile width in bp (default 1000, matching methylKit default).
+        Adjacent tiles do not overlap.
+    test : str
+        Statistical test for tile-level counts. Defaults to ``"logit_t"``,
+        which is the closest analogue to methylKit's logistic regression
+        at n ≥ 3 replicates.
+    chromosomes : list[str], optional
+        Chromosomes to process. Auto-detected when None.
+    min_cpgs_per_tile : int
+        Skip tiles with fewer than this many CpGs (per sample) during the
+        per-sample aggregation step. methylKit's default is 1; we use 5 to
+        reduce noise at sparse coverage.
+    alpha : float
+        q-value threshold for significance.
+    min_abs_meth_diff : float
+        Minimum |meth_diff| for a tile to be called significant.
+    unite : bool
+        If True (default), only test tiles covered in every sample.
+    min_samples_case, min_samples_control : int
+        Per-tile minimum number of samples required to be present in each
+        group (only relevant when unite=False).
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: chrom, start, end, n_cpgs, n_case, n_control,
+                 mean_beta_case, mean_beta_control, meth_diff,
+                 log2_odds_ratio, pvalue, qvalue, dmr_type.
+    """
+    from .dmc import process_chromosomes_dmc, apply_multiple_testing_correction
+
+    store       = Path(methylstore_path)
+    all_samples = samples_case + samples_control
+
+    if chromosomes is None:
+        chromosomes = sorted({
+            d.name.removeprefix("chrom=")
+            for s in store.glob("sample=*")
+            for d in s.glob("chrom=*")
+        })
+
+    if not chromosomes:
+        return pl.DataFrame(schema=_DMR_TILE_SCHEMA)
+
+    logger.info(
+        "call_dmr_tile_based: tile=%d bp, test=%s, n_case=%d, n_control=%d, "
+        "min_cpgs/tile=%d, alpha=%.3f, min_|Δβ|=%.2f, unite=%s",
+        tile_size_bp, test, len(samples_case), len(samples_control),
+        min_cpgs_per_tile, alpha, min_abs_meth_diff, unite,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="epykit_tile_") as tmpdir:
+        tile_store = Path(tmpdir) / "tiled_store"
+
+        # ----- Phase 1: aggregate per-sample, per-chromosome counts -----
+        # Track per-tile CpG counts (max across samples) for output column.
+        # Stored as {(chrom, tile_start): n_cpgs}.
+        tile_n_cpgs: dict[tuple[str, int], int] = {}
+
+        for sample in all_samples:
+            for chrom in chromosomes:
+                src = store / f"sample={sample}" / f"chrom={chrom}" / "part-0.parquet"
+                tiled = _aggregate_sample_to_tiles(src, chrom, tile_size_bp)
+                if tiled is None or len(tiled) == 0:
+                    continue
+                tiled = tiled.filter(pl.col("n_cpgs") >= min_cpgs_per_tile)
+                if len(tiled) == 0:
+                    continue
+
+                # Record per-tile CpG count (use max across samples so the
+                # output reflects the most CpG-dense observation of the
+                # tile, comparable to methylKit's reporting).
+                for tile_start, n_cpgs_val in zip(
+                    tiled["pos"].to_list(), tiled["n_cpgs"].to_list()
+                ):
+                    key = (chrom, int(tile_start))
+                    if n_cpgs_val > tile_n_cpgs.get(key, 0):
+                        tile_n_cpgs[key] = int(n_cpgs_val)
+
+                out_dir = tile_store / f"sample={sample}" / f"chrom={chrom}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (
+                    tiled
+                    .select(["chrom", "pos", "strand", "N_meth", "N_unmeth", "coverage"])
+                    .write_parquet(str(out_dir / "part-0.parquet"))
+                )
+
+        # ----- Phase 2: run DMC on the tiled store -----
+        if not list(tile_store.glob("sample=*/chrom=*/part-0.parquet")):
+            logger.warning("Tile aggregation produced no rows; returning empty DMR set")
+            return pl.DataFrame(schema=_DMR_TILE_SCHEMA)
+
+        tile_dmc = process_chromosomes_dmc(
+            methylstore_path=str(tile_store),
+            samples_case=samples_case,
+            samples_control=samples_control,
+            test=test,
+            chromosomes=chromosomes,
+            unite=unite,
+            min_samples_case=min_samples_case,
+            min_samples_control=min_samples_control,
+        )
+
+    if len(tile_dmc) == 0:
+        return pl.DataFrame(schema=_DMR_TILE_SCHEMA)
+
+    # ----- Phase 3: BH at tile level -----
+    tile_dmc = apply_multiple_testing_correction(tile_dmc, method="fdr_bh")
+
+    # ----- Phase 4: filter and reshape -----
+    # Attach n_cpgs from the per-sample aggregation.
+    n_cpgs_rows = [
+        {"chrom": c, "pos": p, "n_cpgs": n}
+        for (c, p), n in tile_n_cpgs.items()
+    ]
+    n_cpgs_df = pl.DataFrame(
+        n_cpgs_rows,
+        schema={"chrom": pl.Utf8, "pos": pl.Int32, "n_cpgs": pl.Int32},
+    )
+
+    dmr_df = (
+        tile_dmc
+        .join(n_cpgs_df, on=["chrom", "pos"], how="left")
+        .with_columns(pl.col("n_cpgs").fill_null(0))
+        .filter(
+            (pl.col("qvalue") < alpha)
+            & (pl.col("meth_diff").abs() >= min_abs_meth_diff)
+            & (~pl.col("pvalue").is_nan())
+        )
+        .with_columns([
+            pl.col("pos").alias("start"),
+            (pl.col("pos") + tile_size_bp).cast(pl.Int32).alias("end"),
+            pl.when(pl.col("meth_diff") > 0)
+              .then(pl.lit("hyper"))
+              .otherwise(pl.lit("hypo"))
+              .alias("dmr_type"),
+        ])
+        .select([
+            "chrom", "start", "end", "n_cpgs",
+            "n_case", "n_control",
+            "mean_beta_case", "mean_beta_control",
+            "meth_diff", "log2_odds_ratio",
+            "pvalue", "qvalue",
+            "dmr_type",
+        ])
+        .sort(["chrom", "start"])
+    )
+
+    logger.info("Tile-based DMR: %s tiles → %s significant DMRs",
+                f"{len(tile_dmc):,}", f"{len(dmr_df):,}")
+
+    gc.collect()
+    return dmr_df
 
 
 # ---------------------------------------------------------------------------
@@ -446,32 +738,6 @@ def smooth_methylation_bsmooth(
     filter (``scipy.ndimage.gaussian_filter1d``), then interpolates back to
     the original CpG positions.  This is O(G) where G is the grid size,
     versus O(n²) for LOESS — typically 100-500× faster on WGBS-scale data.
-
-    Parameters
-    ----------
-    methylstore_path : str
-        Path to the filtered partitioned Parquet methylstore.
-    samples : list[str]
-        Sample identifiers to smooth.
-    bandwidth : int
-        Smoothing bandwidth in base pairs (default 1000 bp).  Directly maps
-        to the Gaussian σ on the regular grid.
-    grid_resolution_bp : int, optional
-        Resolution of the internal regular grid in base pairs.  Defaults to
-        ``max(1, bandwidth // 20)``, which gives ≥20 grid points per
-        bandwidth and keeps the grid size manageable for whole-chromosome
-        smoothing.  Decrease for higher accuracy; increase to trade accuracy
-        for speed on very large chromosomes.
-
-    Returns
-    -------
-    pl.DataFrame
-        Columns: chrom, pos, sample, beta_raw (Float32), beta_smooth (Float32).
-        Sites with zero coverage have NaN in both beta columns.
-        Returned only when ``output_path`` is not provided.
-    None
-        When ``output_path`` is provided, each chunk is written to disk as it
-        is processed and no full in-memory result is accumulated.
     """
     try:
         from scipy.ndimage import gaussian_filter1d
@@ -522,11 +788,7 @@ def smooth_methylation_bsmooth(
                 pos_valid   = pos[valid]
                 beta_valid  = beta_raw[valid].astype(np.float64)
 
-                # ----------------------------------------------------------
                 # Build a regular grid spanning the valid positions.
-                # Sigma is expressed in grid-index units:
-                #   sigma_grid = bandwidth_bp / grid_resolution_bp
-                # ----------------------------------------------------------
                 grid_start  = int(pos_valid[0])
                 grid_end    = int(pos_valid[-1]) + _grid_res
                 grid_pos    = np.arange(grid_start, grid_end, _grid_res,
