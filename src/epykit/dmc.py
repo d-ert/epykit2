@@ -566,7 +566,7 @@ def _score_finalize(
     dispersion:     str   = "site",
     shrink_pseudo_df: float = 4.0,
     statistic:      str   = "lr",
-    reference:      str   = "chi2",
+    reference:      str   = "methylkit",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Compute per-site score p-values with McCullagh-Nelder overdispersion.
 
@@ -636,26 +636,29 @@ def _score_finalize(
             Asymptotically equivalent to the LR test but mildly
             anti-conservative at the boundaries. Kept as an option for
             users who want the small extra power.
-    reference : {"chi2", "F"}
+    reference : {"methylkit", "chi2", "F"}
         Reference distribution used to convert the test statistic to a
         p-value.
 
-        ``"chi2"`` (default, methylKit-parity at the per-CpG level)
-            Standard quasi-binomial chi-squared:  p = 1 − χ²₁.cdf(stat).
-            This is what methylKit's ``calculateDiffMeth(test="Chisq")``
-            uses (and what its DMC behaviour empirically matches). Mildly
-            anti-conservative at very small samples, but the asymptotic
-            theory says it is correct as n → ∞.
-        ``"F"`` (small-sample corrected)
-            Per-site F-test:  p = 1 − F.cdf(stat, 1, df_i)
-            where df_i = (nv_case + nv_ctrl) − 2. This is the textbook
-            quasi-likelihood small-sample correction (McCullagh-Nelder
-            §8.3), which accounts for the variance of the estimated
-            dispersion φ̂. With df_i ≈ 4 it is much more conservative than
-            χ²₁ and will reject zero genome-wide CpG sites on typical
-            n=3+3 WGBS — use only if you understand the trade-off, or for
-            DMR-level analyses where the underlying statistics are large
-            enough to clear F's heavy tails.
+        ``"methylkit"`` (default, exact methylKit-parity)
+            Per-site adaptive: F(1, df_residual_i) where the per-site
+            dispersion φ̂_i > 1 (overdispersion detected), χ²(1) elsewhere.
+            This is what methylKit's ``calculateDiffMeth`` does with its
+            default ``test`` argument (the first option of
+            ``c("F","Chisq",...)`` resolves to ``"F"``, which logReg then
+            switches to ``"Chisq"`` only where ``phi <= 1``). See line
+            273 of methylKit's ``R/diffMeth.R``. This is the only choice
+            that gives parity at BOTH the per-CpG (DMC) and per-tile
+            (DMR) levels.
+        ``"chi2"``
+            Always reference to χ²(1). Matches methylKit only at sites
+            where φ̂ was clamped to 1. Over-liberal at tiles with real
+            overdispersion (typical DMR setting).
+        ``"F"``
+            Always reference to F(1, df_residual_i). Matches methylKit
+            only at sites where φ̂ > 1. Wildly conservative at sites with
+            clamped φ̂ = 1 — will reject zero genome-wide CpGs on typical
+            n=3+3 WGBS.
 
     Returns
     -------
@@ -676,9 +679,9 @@ def _score_finalize(
         raise ValueError(
             f"statistic must be 'lr' or 'score'; got {statistic!r}"
         )
-    if reference not in {"F", "chi2"}:
+    if reference not in {"methylkit", "F", "chi2"}:
         raise ValueError(
-            f"reference must be 'F' or 'chi2'; got {reference!r}"
+            f"reference must be 'methylkit', 'F', or 'chi2'; got {reference!r}"
         )
     eps = _BETA_EPSILON
 
@@ -822,16 +825,25 @@ def _score_finalize(
         chi2_stat = np.where(phi_eff > 0, stat_raw / phi_eff, np.nan)
         chi2_stat = np.where(var_U_bin > 0, chi2_stat, np.nan)
 
-    if reference == "F":
-        # Per-site df_residual = total replicates with coverage − 2 fitted
-        # proportions. Floors at 1 to keep the F-distribution well-defined;
-        # in practice all but the most degenerate sites have df_i ≥ 2.
-        df_resid = np.maximum(
-            (nv_case + nv_ctrl).astype(np.float64) - 2.0,
-            1.0,
-        )
+    # --- Reference distribution → p-value ---------------------------------
+    # methylKit's logReg (R/diffMeth.R line 273):
+    #     test = ifelse(test=="F" & phi>1, "F", "Chisq")
+    # i.e. with the default test="F", logReg uses F(1, df_residual) at sites
+    # where overdispersion was detected (phi > 1) and falls back to χ²(1)
+    # where φ̂ was clamped to 1.
+    df_resid = np.maximum(
+        (nv_case + nv_ctrl).astype(np.float64) - 2.0,
+        1.0,
+    )
+    if reference == "methylkit":
+        # Per-site adaptive: F where phi_eff > 1 (i.e. real overdispersion
+        # signal made it past the floor), chi² where phi_eff is clamped to 1.
+        p_F    = sp_stats.f.sf(chi2_stat, dfn=1, dfd=df_resid)
+        p_chi2 = sp_stats.chi2.sf(chi2_stat, df=1)
+        pvals  = np.where(phi_eff > 1.0, p_F, p_chi2)
+    elif reference == "F":
         pvals = sp_stats.f.sf(chi2_stat, dfn=1, dfd=df_resid)
-    else:
+    else:  # "chi2"
         pvals = sp_stats.chi2.sf(chi2_stat, df=1)
 
     degenerate = (
@@ -1135,7 +1147,7 @@ def _process_one_chromosome(
     min_samples_case: int = 0,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "chi2",
+    reference: str = "methylkit",
 ) -> pl.DataFrame:
     """Run DMC for one chromosome, loading one sample at a time.
 
@@ -1449,7 +1461,7 @@ def process_chromosomes_dmc(
     min_samples_case: int = 0,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "chi2",
+    reference: str = "methylkit",
 ) -> pl.DataFrame:
     """Process differential methylation for all chromosomes.
 
@@ -1500,13 +1512,14 @@ def process_chromosomes_dmc(
         ``test="score"``. Default ``"site"`` matches methylKit
         ``overdispersion="MN"``. See :func:`_score_finalize` for details.
         Ignored for other tests.
-    reference : {"chi2", "F"}
+    reference : {"methylkit", "chi2", "F"}
         Reference distribution for the quasi-binomial test statistic.
-        Default ``"chi2"`` matches methylKit's ``test="Chisq"`` at the
-        per-CpG level. ``"F"`` is the textbook small-sample correction
-        but is too conservative for genome-wide per-CpG BH-FDR on
-        typical n=3+3 designs. See :func:`_score_finalize`. Ignored for
-        other tests.
+        Default ``"methylkit"`` switches per-site between F(1, df) where
+        φ̂ > 1 and χ²(1) where φ̂ was clamped to 1 — exactly what
+        methylKit's ``logReg`` does (see ``R/diffMeth.R`` line 273).
+        ``"chi2"`` and ``"F"`` force a single reference distribution
+        regardless of dispersion. See :func:`_score_finalize` for details.
+        Ignored for other tests.
 
     Returns
     -------

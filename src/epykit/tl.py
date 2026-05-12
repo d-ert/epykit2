@@ -107,7 +107,7 @@ def dmc(
     min_samples_case: int = 0,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "chi2",
+    reference: str = "methylkit",
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -176,7 +176,7 @@ def dmr(
     min_samples_case: int = 0,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "chi2",
+    reference: str = "methylkit",
     # Sliding-window options ------------------------------------------------
     window_bp: int = 500,
     step_bp: int = 250,
