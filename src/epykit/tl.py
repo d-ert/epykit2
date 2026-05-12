@@ -27,7 +27,20 @@ from .methyldata import MethylData
 from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
 
 
-def _auto_test(md: MethylData) -> str:
+def _auto_test(md: MethylData, design: str | None = None, covariates: list[str] | None = None) -> str:
+    """Pick a sensible test based on group size, accounting for covariates.
+
+    When a covariate design is supplied, we MUST use the binomial GLM path
+    (``"glm"``) because the closed-form ``lr`` / ``score`` paths don't admit
+    covariates. The choice is therefore unconditional whenever the user
+    asks for adjustment.
+    """
+    if design is not None or (covariates is not None and len(covariates) > 0):
+        return "glm"
+    return _auto_test_simple(md)
+
+
+def _auto_test_simple(md: MethylData) -> str:
     """Pick a sensible test based on group size.
 
     Current default at n>=2: ``"lr"`` — the quasi-binomial likelihood-ratio
@@ -177,6 +190,10 @@ def dmr(
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
+    # Covariate design (tile-method only) ----------------------------------
+    design: str | None = None,
+    covariates: list[str] | None = None,
+    treatment_col: str = "treatment",
     # Sliding-window options ------------------------------------------------
     window_bp: int = 500,
     step_bp: int = 250,
@@ -233,9 +250,33 @@ def dmr(
         DMR set.
     """
     if method == "tile":
-        selected_test = _auto_test(md) if test == "auto" else test
+        selected_test = (
+            _auto_test(md, design=design, covariates=covariates)
+            if test == "auto"
+            else test
+        )
         unite_info = md.uns.get("unite")
         unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
+
+        # ---- Build covariate design matrix when requested -----------------
+        design_full = None
+        design_reduced = None
+        coef_idx = None
+        term_names: list[str] = []
+        formula_used: str | None = None
+        if selected_test == "glm" or design is not None or covariates is not None:
+            from ._glm import build_design
+            samples_ordered = md.treatment_ids + md.control_ids
+            design_full, design_reduced, coef_idx, term_names, formula_used = build_design(
+                md.obs,
+                samples_ordered=samples_ordered,
+                formula=design,
+                covariates=covariates,
+                treatment_col=treatment_col,
+            )
+            # Force GLM regardless of what 'auto' resolved to: covariates only
+            # work with the GLM path.
+            selected_test = "glm"
 
         dmr_df = call_dmr_tile_based(
             methylstore_path=md.store,
@@ -252,6 +293,9 @@ def dmr(
             min_samples_control=min_samples_control,
             dispersion=dispersion,
             reference=reference,
+            design_full=design_full,
+            design_reduced=design_reduced,
+            coef_idx=coef_idx,
         )
 
         # Optional q-value post-filter (the tile path already filtered at
@@ -273,6 +317,11 @@ def dmr(
             "unite": unite,
             "dispersion": dispersion,
             "reference": reference,
+            "design": design,
+            "covariates": list(covariates) if covariates else None,
+            "treatment_col": treatment_col,
+            "formula_used": formula_used,
+            "design_terms": term_names if term_names else None,
         }
         return
 

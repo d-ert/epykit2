@@ -535,6 +535,9 @@ def call_dmr_tile_based(
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "chi2",
+    design_full: np.ndarray | None = None,
+    design_reduced: np.ndarray | None = None,
+    coef_idx: int | None = None,
 ) -> pl.DataFrame:
     """Call DMRs by aggregating read counts within fixed-size tiles.
 
@@ -669,6 +672,9 @@ def call_dmr_tile_based(
             min_samples_control=min_samples_control,
             dispersion=dispersion,
             reference=reference,
+            design_full=design_full,
+            design_reduced=design_reduced,
+            coef_idx=coef_idx,
         )
 
     if len(tile_dmc) == 0:
@@ -705,16 +711,21 @@ def call_dmr_tile_based(
               .otherwise(pl.lit("hypo"))
               .alias("dmr_type"),
         ])
-        .select([
-            "chrom", "start", "end", "n_cpgs",
-            "n_case", "n_control",
-            "mean_beta_case", "mean_beta_control",
-            "meth_diff", "log2_odds_ratio",
-            "pvalue", "qvalue",
-            "dmr_type",
-        ])
-        .sort(["chrom", "start"])
     )
+
+    out_cols = [
+        "chrom", "start", "end", "n_cpgs",
+        "n_case", "n_control",
+        "mean_beta_case", "mean_beta_control",
+        "meth_diff", "log2_odds_ratio",
+        "pvalue", "qvalue",
+        "dmr_type",
+    ]
+    # GLM path adds adjusted log-odds effect size for the treatment coefficient.
+    for extra in ("coef_treatment", "coef_se"):
+        if extra in dmr_df.columns:
+            out_cols.append(extra)
+    dmr_df = dmr_df.select(out_cols).sort(["chrom", "start"])
 
     logger.info("Tile-based DMR: %s tiles → %s significant DMRs",
                 f"{len(tile_dmc):,}", f"{len(dmr_df):,}")

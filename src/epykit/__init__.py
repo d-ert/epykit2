@@ -64,3 +64,4 @@ from .qc import (
     global_methylation_report,
     coverage_uniformity,
 )
+from ._glm import build_design

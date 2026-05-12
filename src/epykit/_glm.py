@@ -1,0 +1,478 @@
+"""Vectorised binomial GLM for covariate-aware methylation testing.
+
+This module provides the engine for ``test="glm"`` in the DMC/DMR pipeline.
+It fits one binomial logistic GLM per site (or per tile) on a *shared*
+design matrix derived from ``md.obs``, then exposes the per-site deviance
+and Pearson chi-squared so the caller can run a deviance LR test of the
+full design against a reduced design with the treatment column removed.
+
+The implementation is a single-pass batched IRLS:
+
+    eta_ij  = X_j · beta_i              # linear predictor at site i, sample j
+    mu_ij   = sigmoid(eta_ij)
+    w_ij    = n_ij · mu_ij · (1 - mu_ij) # binomial GLM weight (cov = trials)
+    z_ij    = eta_ij + (y_ij/n_ij - mu_ij) / (mu_ij · (1 - mu_ij))
+    beta_i  = (X' W_i X)^{-1} X' W_i z_i
+
+At each iteration we build a (n_sites, p, p) batch of normal equations via
+``np.einsum`` and solve them in a single batched ``np.linalg.solve`` call.
+With p <= 6 and tile-level n_sites ~ 10^4 to 10^5, the whole IRLS converges
+in well under a second.
+
+The hot path deliberately avoids ``statsmodels`` so we don't pay per-site
+Python overhead. ``patsy`` is used only once at design-matrix construction
+time (a tiny up-front cost).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional, Sequence
+
+import numpy as np
+import polars as pl
+
+logger = logging.getLogger(__name__)
+
+_EPS = 1e-9
+_PROP_CLIP = 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Design matrix construction
+# ---------------------------------------------------------------------------
+
+def build_design(
+    obs: pl.DataFrame,
+    samples_ordered: Sequence[str],
+    formula: Optional[str] = None,
+    covariates: Optional[Sequence[str]] = None,
+    treatment_col: str = "treatment",
+) -> tuple[np.ndarray, np.ndarray, int, list[str], str]:
+    """Build full + reduced model matrices from ``md.obs``.
+
+    Parameters
+    ----------
+    obs
+        ``md.obs`` polars DataFrame. Must contain ``sample_id`` and every
+        column referenced by ``formula`` / ``covariates``.
+    samples_ordered
+        Sample ids in the exact order the DMC/DMR engine will load them
+        (case ids first, then control ids). Rows of the returned design
+        matrices follow this order.
+    formula
+        patsy formula string, e.g. ``"~ treatment + age + donor"``. The
+        leading tilde is optional. If ``None`` it is synthesised from
+        ``treatment_col`` and ``covariates``.
+    covariates
+        Convenience list of column names. Combined with ``formula`` by
+        appending any name not already present.
+    treatment_col
+        Name of the binary 0/1 treatment column in ``obs``. The reduced
+        design drops exactly this column from the full design; that single
+        coefficient is the contrast tested by the deviance LR test.
+
+    Returns
+    -------
+    X_full        (n_samples, p)        full design matrix
+    X_reduced     (n_samples, p - 1)    X_full with the treatment column removed
+    coef_idx      column index of treatment in X_full
+    term_names    column names from patsy (length p)
+    formula_used  the formula actually fitted, after merging covariates
+    """
+    if treatment_col not in obs.columns:
+        raise ValueError(
+            f"Treatment column '{treatment_col}' not found in md.obs. "
+            f"Available: {obs.columns}"
+        )
+
+    # ---- Synthesise / normalise the formula --------------------------------
+    terms: list[str] = []
+    if formula is not None:
+        rhs = formula.strip()
+        if rhs.startswith("~"):
+            rhs = rhs[1:].strip()
+        # split on '+' but keep interactions ('a:b') and transforms intact
+        for term in rhs.split("+"):
+            t = term.strip()
+            if t and t not in terms:
+                terms.append(t)
+
+    if covariates:
+        for c in covariates:
+            if c not in terms:
+                terms.append(c)
+
+    if treatment_col not in terms:
+        terms.insert(0, treatment_col)
+
+    formula_used = "~ " + " + ".join(terms)
+
+    # ---- Reorder obs rows to samples_ordered -------------------------------
+    obs_pd = obs.to_pandas().set_index("sample_id")
+    missing = [s for s in samples_ordered if s not in obs_pd.index]
+    if missing:
+        raise ValueError(
+            f"Samples missing from md.obs: {missing}"
+        )
+    obs_pd = obs_pd.loc[list(samples_ordered)]
+
+    # ---- Validate covariate columns are present and complete ----------------
+    referenced_cols: set[str] = set()
+    for term in terms:
+        for tok in term.replace(":", " ").replace("*", " ").split():
+            tok = tok.strip("()")
+            if tok in obs_pd.columns:
+                referenced_cols.add(tok)
+    for col in referenced_cols:
+        nulls = obs_pd[col].isna()
+        if nulls.any():
+            bad = obs_pd.index[nulls].tolist()
+            raise ValueError(
+                f"Column '{col}' has missing values for samples {bad}. "
+                "Drop or impute these samples before calling the GLM."
+            )
+
+    # ---- Build design matrix via patsy --------------------------------------
+    try:
+        import patsy
+    except ImportError as e:  # pragma: no cover - patsy ships with statsmodels
+        raise ImportError(
+            "patsy is required for covariate-aware DMR. It ships with "
+            "statsmodels, which is already in epykit's dependencies."
+        ) from e
+
+    X_design = patsy.dmatrix(formula_used, data=obs_pd, return_type="matrix")
+    X_full = np.asarray(X_design, dtype=np.float64)
+    term_names: list[str] = list(X_design.design_info.column_names)
+
+    if treatment_col not in term_names:
+        raise ValueError(
+            f"Treatment column '{treatment_col}' did not appear as a column "
+            f"in the resulting design matrix (got {term_names}). It must be "
+            "numeric (0/1) so patsy keeps its name verbatim."
+        )
+    coef_idx = term_names.index(treatment_col)
+
+    n_samples, p_full = X_full.shape
+    if p_full >= n_samples:
+        raise ValueError(
+            f"Too many covariates: design has p={p_full} parameters but "
+            f"only n_samples={n_samples}. Mirrors methylKit's "
+            "calculateDiffMeth check ('Too many covariates/too few replicates')."
+        )
+    if p_full < 2:
+        raise ValueError(
+            "Design must contain at least the intercept and the treatment "
+            "column (p >= 2). Did you pass '~0 + ...'?"
+        )
+
+    # ---- Reduced design: drop the treatment column -------------------------
+    X_reduced = np.delete(X_full, coef_idx, axis=1)
+
+    return X_full, X_reduced, coef_idx, term_names, formula_used
+
+
+# ---------------------------------------------------------------------------
+# Batched IRLS for the binomial GLM
+# ---------------------------------------------------------------------------
+
+def irls_binomial_batch(
+    meth: np.ndarray,
+    cov: np.ndarray,
+    X: np.ndarray,
+    max_iter: int = 25,
+    tol: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Batched IRLS for binomial GLMs sharing a design matrix.
+
+    Fits one independent GLM per row (= per site / tile) where the response
+    is ``meth_ij`` successes out of ``cov_ij`` trials at sample j, modelled
+    as ``logit(mu_ij) = X_j · beta_i``.
+
+    Parameters
+    ----------
+    meth      (n_sites, n_samples) int32   methylated read counts
+    cov       (n_sites, n_samples) int32   total read counts (= weights)
+    X         (n_samples, p)       float   design matrix (shared across sites)
+    max_iter, tol
+        IRLS convergence controls. ``tol`` applies to the max-norm of
+        ``beta - beta_prev``.
+
+    Returns
+    -------
+    beta            (n_sites, p)        fitted coefficients
+    se_beta         (n_sites, p)        sqrt(diag((X' W X)^{-1})) at convergence
+    deviance        (n_sites,)          -2 logL at the fitted mu (binomial)
+    pearson_chi2    (n_sites,)          Sigma_j (y - n mu)^2 / (n mu (1-mu))
+    n_eff           (n_sites,)          number of samples with cov > 0
+    """
+    n_sites, n_samples = meth.shape
+    p = X.shape[1]
+    assert X.shape[0] == n_samples, "Design rows must match number of samples"
+
+    cov_f  = cov.astype(np.float64, copy=False)
+    meth_f = meth.astype(np.float64, copy=False)
+    has_cov = cov_f > 0
+    n_eff = has_cov.sum(axis=1).astype(np.int32)
+
+    # ---- Initialise beta from per-site clipped logit proportions -----------
+    # Use a single round of weighted least squares on the logit of the
+    # clipped sample proportions. Samples with zero coverage contribute zero
+    # weight so they fall out of the init naturally.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        prop_raw = np.where(has_cov, meth_f / np.maximum(cov_f, 1.0), 0.5)
+    prop_init = np.clip(prop_raw, _PROP_CLIP, 1.0 - _PROP_CLIP)
+    z_init = np.log(prop_init / (1.0 - prop_init))     # (n_sites, n_samples)
+    # weights for init: coverage (mass) only where covered
+    w_init = np.where(has_cov, cov_f, 0.0)
+
+    beta = _solve_weighted_lsq(X, z_init, w_init)       # (n_sites, p)
+    converged = np.zeros(n_sites, dtype=bool)
+
+    # ---- IRLS iterations ---------------------------------------------------
+    for it in range(max_iter):
+        eta = beta @ X.T                                # (n_sites, n_samples)
+        # clip eta to avoid sigmoid saturation breaking the weights
+        eta = np.clip(eta, -30.0, 30.0)
+        mu = 1.0 / (1.0 + np.exp(-eta))
+        mu = np.clip(mu, _PROP_CLIP, 1.0 - _PROP_CLIP)
+        var = mu * (1.0 - mu)
+
+        # Working weights: w = n · mu · (1 - mu). Zero where no coverage.
+        w = np.where(has_cov, cov_f * var, 0.0)
+        # Working response: z = eta + (y/n - mu) / var.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            resid_over_var = np.where(
+                has_cov, (meth_f / np.maximum(cov_f, 1.0) - mu) / var, 0.0
+            )
+        z = eta + resid_over_var
+
+        beta_new = _solve_weighted_lsq(X, z, w)
+
+        delta = np.max(np.abs(beta_new - beta), axis=1)
+        beta = beta_new
+        newly_converged = delta < tol
+        converged |= newly_converged
+        if converged.all():
+            break
+
+    # ---- Final diagnostics (deviance, Pearson chi-sq, SE) ------------------
+    eta = beta @ X.T
+    eta = np.clip(eta, -30.0, 30.0)
+    mu = 1.0 / (1.0 + np.exp(-eta))
+    mu = np.clip(mu, _PROP_CLIP, 1.0 - _PROP_CLIP)
+    var = mu * (1.0 - mu)
+
+    # Binomial deviance: 2 · Σ_j [y log(y/(n μ)) + (n-y) log((n-y)/(n(1-μ)))]
+    # with the convention 0 log 0 = 0. Zero-coverage samples contribute 0.
+    y = meth_f
+    n = cov_f
+    with np.errstate(invalid="ignore", divide="ignore"):
+        n_mu = n * mu
+        n_minus_y = np.maximum(n - y, 0.0)
+        n_one_minus_mu = n * (1.0 - mu)
+        term_a = np.where(
+            (y > 0) & has_cov,
+            y * np.log(np.maximum(y, _EPS) / np.maximum(n_mu, _EPS)),
+            0.0,
+        )
+        term_b = np.where(
+            (n_minus_y > 0) & has_cov,
+            n_minus_y * np.log(
+                np.maximum(n_minus_y, _EPS) / np.maximum(n_one_minus_mu, _EPS)
+            ),
+            0.0,
+        )
+    deviance = 2.0 * (term_a + term_b).sum(axis=1)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pearson_per = np.where(
+            has_cov & (var > 0),
+            (y - n_mu) ** 2 / np.maximum(n * var, _EPS),
+            0.0,
+        )
+    pearson_chi2 = pearson_per.sum(axis=1)
+
+    # Standard errors: sqrt(diag((X' W X)^{-1}))
+    w_final = np.where(has_cov, cov_f * var, 0.0)
+    XtWX = np.einsum("jp,ij,jq->ipq", X, w_final, X)
+    se_beta = np.full((n_sites, p), np.nan, dtype=np.float64)
+    try:
+        XtWX_inv = np.linalg.inv(XtWX)
+        diag = np.einsum("ipp->ip", XtWX_inv)
+        se_beta = np.sqrt(np.where(diag > 0, diag, np.nan))
+    except np.linalg.LinAlgError:
+        # Fall back per-site; rare in practice.
+        for i in range(n_sites):
+            try:
+                inv = np.linalg.inv(XtWX[i])
+                se_beta[i] = np.sqrt(np.where(np.diag(inv) > 0, np.diag(inv), np.nan))
+            except np.linalg.LinAlgError:
+                continue
+
+    # Sites that never accumulated weight are degenerate.
+    degenerate = n_eff < 2
+    deviance = np.where(degenerate, np.nan, deviance)
+    pearson_chi2 = np.where(degenerate, np.nan, pearson_chi2)
+    beta = np.where(degenerate[:, None], np.nan, beta)
+    se_beta = np.where(degenerate[:, None], np.nan, se_beta)
+
+    return beta, se_beta, deviance, pearson_chi2, n_eff
+
+
+def _solve_weighted_lsq(
+    X: np.ndarray,
+    z: np.ndarray,
+    w: np.ndarray,
+) -> np.ndarray:
+    """Batched solve of (X' W_i X) beta_i = X' W_i z_i across sites i.
+
+    X is (n_samples, p), z and w are (n_sites, n_samples).
+    Returns (n_sites, p). Sites with a singular X' W X get NaN.
+    """
+    # X' W_i X : (n_sites, p, p)
+    XtWX = np.einsum("jp,ij,jq->ipq", X, w, X)
+    # X' W_i z_i : (n_sites, p)
+    XtWz = np.einsum("jp,ij,ij->ip", X, w, z)
+
+    # Ridge guard for sites that have only a couple of covered samples or
+    # collinearity in their effective design. We add a tiny multiple of I
+    # *only* where the matrix is otherwise singular, so that well-posed
+    # sites stay numerically identical to a plain solve.
+    p = X.shape[1]
+    eye = np.eye(p, dtype=np.float64)
+
+    # NumPy 2.x: np.linalg.solve no longer broadcasts a 2-D RHS against a
+    # batched 3-D LHS, so we promote b to (n_sites, p, 1) and squeeze back.
+    try:
+        beta = np.linalg.solve(XtWX, XtWz[..., None])[..., 0]
+        return beta
+    except np.linalg.LinAlgError:
+        pass
+
+    # Per-site fallback with a ridge.
+    n_sites = z.shape[0]
+    beta = np.full((n_sites, p), np.nan, dtype=np.float64)
+    for i in range(n_sites):
+        A = XtWX[i]
+        try:
+            beta[i] = np.linalg.solve(A, XtWz[i])
+        except np.linalg.LinAlgError:
+            try:
+                beta[i] = np.linalg.solve(A + 1e-8 * eye, XtWz[i])
+            except np.linalg.LinAlgError:
+                pass
+    return beta
+
+
+# ---------------------------------------------------------------------------
+# Dispersion + reference-distribution helpers (shared with _score_finalize)
+# ---------------------------------------------------------------------------
+
+def compute_dispersion_phi(
+    pearson_per_site: np.ndarray,
+    df_per_site: np.ndarray,
+    dispersion: str = "site",
+    min_dispersion: float = 1.0,
+    shrink_pseudo_df: float = 4.0,
+    min_disp_sites: int = 100,
+    chrom_name: str = "?",
+) -> tuple[np.ndarray, float]:
+    """McCullagh-Nelder dispersion in the three modes used elsewhere.
+
+    Parameters
+    ----------
+    pearson_per_site
+        Per-site Pearson chi-sq from the full-model fit (n_sites,).
+    df_per_site
+        Per-site residual degrees of freedom (n_obs_i - p_full), n_sites.
+    dispersion
+        ``"site"`` (default): per-site phi_i = pearson_i / df_i.
+        ``"chrom"``: single chromosome-pooled phi.
+        ``"shrink"``: James-Stein-style weighted average of per-site and
+        chromosome estimates.
+    min_dispersion
+        Clamp on phi (default 1.0, the methylKit convention).
+
+    Returns
+    -------
+    phi_eff      (n_sites,) per-site dispersion used by the test
+    phi_hat      scalar chromosome-pooled phi (logged / returned for audit)
+    """
+    if dispersion not in {"site", "chrom", "shrink"}:
+        raise ValueError(
+            f"dispersion must be 'site', 'chrom', or 'shrink'; got {dispersion!r}"
+        )
+
+    usable = (df_per_site > 0) & np.isfinite(pearson_per_site)
+    n_usable = int(usable.sum())
+
+    if n_usable < min_disp_sites:
+        phi_hat = float(min_dispersion)
+        phi_raw = float(min_dispersion)
+        if dispersion == "chrom":
+            logger.warning(
+                "%s: only %d sites usable for dispersion estimation; "
+                "falling back to phi = %.2f.",
+                chrom_name, n_usable, min_dispersion,
+            )
+    else:
+        pearson_sum = float(pearson_per_site[usable].sum())
+        df_sum = float(df_per_site[usable].sum())
+        df_sum = max(df_sum, 1.0)
+        phi_raw = pearson_sum / df_sum
+        phi_hat = float(max(min_dispersion, phi_raw))
+        logger.info(
+            "%s: chrom-pooled phi = %.3f (raw %.3f, %d sites); dispersion='%s'",
+            chrom_name, phi_hat, phi_raw, n_usable, dispersion,
+        )
+
+    if dispersion == "chrom":
+        phi_eff = np.full(pearson_per_site.shape, phi_hat, dtype=np.float64)
+        return phi_eff, phi_hat
+
+    # site / shrink: per-site estimate
+    df_safe = np.where(df_per_site > 0, df_per_site, 1.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        phi_site = pearson_per_site / df_safe
+    phi_site = np.where(usable, phi_site, min_dispersion)
+    phi_site = np.maximum(phi_site, min_dispersion)
+
+    if dispersion == "site":
+        return phi_site, phi_hat
+
+    # shrink
+    w = float(shrink_pseudo_df)
+    num = df_safe * phi_site + w * phi_hat
+    den = df_safe + w
+    phi_eff = np.maximum(num / den, min_dispersion)
+    phi_eff = np.where(usable, phi_eff, phi_hat)
+    return phi_eff, phi_hat
+
+
+def reference_pvalues(
+    stat: np.ndarray,
+    phi_eff: np.ndarray,
+    df_resid: np.ndarray,
+    reference: str = "methylkit",
+) -> np.ndarray:
+    """Convert a (already dispersion-corrected) chi-sq statistic to p-values.
+
+    ``reference="methylkit"`` switches per-site between F(1, df_resid) where
+    phi_eff > 1 and chi2(1) where phi_eff was clamped, exactly matching
+    methylKit's ``logReg`` (R/diffMeth.R:273).
+    """
+    if reference not in {"methylkit", "F", "chi2"}:
+        raise ValueError(
+            f"reference must be 'methylkit', 'F', or 'chi2'; got {reference!r}"
+        )
+    from scipy import stats as sp_stats
+
+    if reference == "methylkit":
+        p_F = sp_stats.f.sf(stat, dfn=1, dfd=df_resid)
+        p_chi2 = sp_stats.chi2.sf(stat, df=1)
+        return np.where(phi_eff > 1.0, p_F, p_chi2)
+    if reference == "F":
+        return sp_stats.f.sf(stat, dfn=1, dfd=df_resid)
+    return sp_stats.chi2.sf(stat, df=1)

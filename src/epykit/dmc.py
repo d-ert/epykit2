@@ -1148,6 +1148,9 @@ def _process_one_chromosome(
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
+    design_full: Optional[np.ndarray] = None,
+    design_reduced: Optional[np.ndarray] = None,
+    coef_idx: Optional[int] = None,
 ) -> pl.DataFrame:
     """Run DMC for one chromosome, loading one sample at a time.
 
@@ -1347,10 +1350,100 @@ def _process_one_chromosome(
                 mean_ctrl, M2_ctrl, n_valid_ctrl,
             )
 
+    elif test == "glm":
+        # Covariate-aware binomial GLM with deviance LR test.
+        #
+        # We load every sample's (meth, cov) for this chromosome into an
+        # (n_sites, n_samples) stack so the batched IRLS can fit one GLM
+        # per site against the shared design matrix. At the tile level
+        # n_sites is small (~10^4-10^5), so this is a few MB of int32.
+        if design_full is None or design_reduced is None or coef_idx is None:
+            raise ValueError(
+                "test='glm' requires design_full, design_reduced, and "
+                "coef_idx. Build them via epykit._glm.build_design(md.obs, "
+                "samples_ordered=samples_case+samples_control, formula=...)."
+            )
+
+        all_samples = samples_case + samples_control
+        n_samples = len(all_samples)
+        if design_full.shape[0] != n_samples:
+            raise ValueError(
+                f"design_full has {design_full.shape[0]} rows but "
+                f"{n_samples} samples were passed. Rows must follow "
+                "samples_case + samples_control order."
+            )
+
+        meth_stack = np.zeros((n_sites, n_samples), dtype=np.int32)
+        cov_stack  = np.zeros((n_sites, n_samples), dtype=np.int32)
+        for j, sample in enumerate(all_samples):
+            meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+            meth_stack[:, j] = meth
+            cov_stack[:, j]  = cov
+            # Welford accumulators for the unadjusted mean_beta_* columns.
+            if j < len(samples_case):
+                _welford_update(mean_case, M2_case, n_valid_case, meth, cov)
+            else:
+                _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
+            del meth, cov
+
+        from . import _glm
+
+        beta_full, se_full, dev_full, pearson_full, n_eff = _glm.irls_binomial_batch(
+            meth_stack, cov_stack, design_full,
+        )
+        _beta_red, _se_red, dev_red, _pearson_red, _ne_red = _glm.irls_binomial_batch(
+            meth_stack, cov_stack, design_reduced,
+        )
+
+        # df_resid_i = n_eff_i - p_full   (per-site, since coverage gates samples)
+        p_full = design_full.shape[1]
+        df_resid_per_site = (n_eff.astype(np.float64) - float(p_full))
+        df_resid_safe = np.maximum(df_resid_per_site, 1.0)
+
+        phi_eff, _phi_hat = _glm.compute_dispersion_phi(
+            pearson_per_site=pearson_full,
+            df_per_site=df_resid_per_site,
+            dispersion=dispersion,
+            chrom_name=chrom,
+        )
+
+        # LR statistic with dispersion correction. Reduced model drops the
+        # treatment column => 1 df contrast.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            lr_raw = dev_red - dev_full
+            # tiny negative excursions can happen at numerical machine eps
+            lr_raw = np.where(lr_raw < 0, 0.0, lr_raw)
+            chi2_stat = np.where(phi_eff > 0, lr_raw / phi_eff, np.nan)
+
+        pvals = _glm.reference_pvalues(
+            chi2_stat, phi_eff, df_resid_safe, reference=reference,
+        )
+
+        # Effect-size columns from the GLM coefficient (log-odds) and its SE.
+        coef_treatment = beta_full[:, coef_idx].astype(np.float64)
+        coef_se        = se_full[:, coef_idx].astype(np.float64)
+
+        # Bookkeeping for the unified output block at the bottom.
+        log2_ors = (coef_treatment / np.log(2.0))   # log-odds -> log2 odds
+        degenerate = (
+            np.isnan(chi2_stat) | np.isnan(pvals) | (n_eff < 2)
+        )
+        pvals = np.where(degenerate, np.nan, pvals)
+        log2_ors = np.where(degenerate, np.nan, log2_ors)
+
+        # Stash for the schema additions below.
+        _glm_extras = {
+            "coef_treatment": coef_treatment,
+            "coef_se":        coef_se,
+        }
+        del meth_stack, cov_stack, beta_full, se_full, dev_full, dev_red
+        del pearson_full, n_eff
+
     else:
         raise NotImplementedError(
             f"Test '{test}' not implemented. "
-            "Choose 'lr', 'score', 'fisher', 'cmh', 'logit_t', or 'beta_binomial'."
+            "Choose 'lr', 'score', 'fisher', 'cmh', 'logit_t', "
+            "'beta_binomial', or 'glm'."
         )
 
     # --- BIO-3: equal-weight per-replicate mean beta ---
@@ -1387,7 +1480,7 @@ def _process_one_chromosome(
 
     del mean_case, M2_case, n_valid_case, mean_ctrl, M2_ctrl, n_valid_ctrl
 
-    return pl.DataFrame({
+    out_cols = {
         "chrom":             pl.Series([chrom] * n_sites, dtype=pl.Utf8),
         "pos":               canonical_df["pos"],
         "strand":            canonical_df["strand"],
@@ -1400,7 +1493,11 @@ def _process_one_chromosome(
         "pvalue":            pl.Series(pvals),
         "log2_odds_ratio":   pl.Series(log2_ors),
         "meth_diff":         pl.Series(meth_diff),
-    }).sort("pos")
+    }
+    if test == "glm":
+        out_cols["coef_treatment"] = pl.Series(_glm_extras["coef_treatment"])
+        out_cols["coef_se"]        = pl.Series(_glm_extras["coef_se"])
+    return pl.DataFrame(out_cols).sort("pos")
 
 
 def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
@@ -1462,6 +1559,9 @@ def process_chromosomes_dmc(
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
+    design_full: Optional[np.ndarray] = None,
+    design_reduced: Optional[np.ndarray] = None,
+    coef_idx: Optional[int] = None,
 ) -> pl.DataFrame:
     """Process differential methylation for all chromosomes.
 
@@ -1583,6 +1683,9 @@ def process_chromosomes_dmc(
                 min_samples_control=min_samples_control,
                 dispersion=dispersion,
                 reference=reference,
+                design_full=design_full,
+                design_reduced=design_reduced,
+                coef_idx=coef_idx,
             )
             del canonical_df
 

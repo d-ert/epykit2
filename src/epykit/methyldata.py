@@ -53,21 +53,32 @@ class MethylData:
 
     @property
     def dmc(self) -> Optional[pl.DataFrame]:
-        # Prefer annotated versions for plotting compatibility
-        preferred = [
-            "dmc_beta_binomial_annotated",
-            "dmc_fisher_annotated",
-            "dmc_auto_annotated",
-            "dmc_beta_binomial",
-            "dmc_fisher",
-            "dmc_auto",
+        # Prefer annotated tables: the plotting layer needs `feature_type`
+        # and `cpg_context` columns, which only exist on the *_annotated
+        # variant written by ep.tl.annotate(). Resolve by test priority so
+        # that scripts running multiple tests get the most-recently-rated
+        # path, then fall back to the raw DMC table.
+        dmc_keys = [k for k in self.varm if k.startswith("dmc")]
+        annotated = [k for k in dmc_keys if k.endswith("_annotated")]
+        unannotated = [k for k in dmc_keys if not k.endswith("_annotated")]
+
+        # Within each tier prefer the engine the user is likely to care most
+        # about (glm > lr > score > logit_t > beta_binomial > cmh > fisher).
+        priority = [
+            "dmc_glm", "dmc_lr", "dmc_score", "dmc_logit_t",
+            "dmc_beta_binomial", "dmc_cmh", "dmc_fisher", "dmc_auto",
         ]
-        for key in preferred:
-            if key in self.varm:
-                return self.varm[key]
-        for key in sorted(self.varm.keys()):
-            if key.startswith("dmc"):
-                return self.varm[key]
+        def _rank(name: str) -> int:
+            stem = name.removesuffix("_annotated")
+            try:
+                return priority.index(stem)
+            except ValueError:
+                return len(priority)
+
+        for key in sorted(annotated, key=_rank):
+            return self.varm[key]
+        for key in sorted(unannotated, key=_rank):
+            return self.varm[key]
         return None
 
     @property
