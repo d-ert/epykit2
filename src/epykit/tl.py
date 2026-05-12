@@ -30,15 +30,17 @@ from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylati
 def _auto_test(md: MethylData) -> str:
     """Pick a sensible test based on group size.
 
-    BIO-3 fix: previously this returned ``"fisher"`` for n<6, which then hit
-    the broken pooled-control CMH path in ``dmc.py``.
+    Current default at n>=2: ``"lr"`` — the quasi-binomial likelihood-ratio
+    chi-square with per-site McCullagh-Nelder dispersion. This is what
+    methylKit's ``calculateDiffMeth(overdispersion="MN", test="Chisq")``
+    reports, computed in closed form on the same streaming
+    (S0_g, S1_g, Σm²/n_g) accumulators we already keep for the score test.
+    LR is closer to nominal type-I error than the score test at the small
+    samples (n=6) and boundary proportions typical in WGBS.
 
-    Current default: ``"score"`` at n>=2 — the quasi-binomial score test
-    with chromosome-level overdispersion correction, matching methylKit's
-    ``calculateDiffMeth(overdispersion="MN", test="Chisq")``. This is a real
-    count-based test, replicate-aware (via the φ̂ inflation), and uses
-    closed-form streaming accumulators so it has the same O(n_sites) memory
-    profile as the other paths.
+    The score test (``test="score"``) is still available for users who want
+    a marginally more powerful (but mildly anti-conservative at the
+    boundaries) statistic on the same accumulators.
 
     At n=1 (single replicate per group) there is no between-replicate
     variability for φ̂ to estimate, so we fall back to Fisher exact with the
@@ -48,7 +50,7 @@ def _auto_test(md: MethylData) -> str:
     min_group = min(len(md.treatment_ids), len(md.control_ids))
     if min_group < 2:
         return "fisher"
-    return "score"
+    return "lr"
 
 
 def qc(md: MethylData, chh_context_store: str | None = None) -> None:
@@ -104,6 +106,8 @@ def dmc(
     chromosomes: list[str] | None = None,
     min_samples_case: int = 0,
     min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "chi2",
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -113,9 +117,13 @@ def dmc(
         Analysis object containing the methylstore path and the
         treatment/control sample lists.
     test : str
-        One of ``"auto"``, ``"logit_t"``, ``"beta_binomial"``, ``"cmh"``,
-        ``"fisher"``. ``"auto"`` resolves to ``"logit_t"`` at n<6 (BIO-3) and
-        ``"beta_binomial"`` at n>=6.
+        One of ``"auto"``, ``"lr"``, ``"score"``, ``"logit_t"``,
+        ``"beta_binomial"``, ``"cmh"``, ``"fisher"``. ``"auto"`` resolves to
+        ``"fisher"`` at n<2 and ``"lr"`` (methylKit parity) at n>=2.
+    dispersion : {"site", "chrom", "shrink"}
+        McCullagh-Nelder dispersion strategy used by the ``"lr"`` and
+        ``"score"`` tests. Default ``"site"`` matches methylKit
+        ``overdispersion="MN"``.
     chromosomes : list[str], optional
         Restrict to a subset of chromosomes. Auto-detected when None.
     min_samples_case, min_samples_control : int
@@ -138,6 +146,8 @@ def dmc(
         unite=unite,
         min_samples_case=min_samples_case,
         min_samples_control=min_samples_control,
+        dispersion=dispersion,
+        reference=reference,
     )
     result = apply_multiple_testing_correction(result, method="fdr_bh")
 
@@ -150,6 +160,8 @@ def dmc(
         "unite": unite,
         "min_samples_case": min_samples_case,
         "min_samples_control": min_samples_control,
+        "dispersion": dispersion,
+        "reference": reference,
     }
 
 
@@ -163,6 +175,8 @@ def dmr(
     chromosomes: list[str] | None = None,
     min_samples_case: int = 0,
     min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "chi2",
     # Sliding-window options ------------------------------------------------
     window_bp: int = 500,
     step_bp: int = 250,
@@ -236,6 +250,8 @@ def dmr(
             unite=unite,
             min_samples_case=min_samples_case,
             min_samples_control=min_samples_control,
+            dispersion=dispersion,
+            reference=reference,
         )
 
         # Optional q-value post-filter (the tile path already filtered at
@@ -255,6 +271,8 @@ def dmr(
             "min_samples_case": min_samples_case,
             "min_samples_control": min_samples_control,
             "unite": unite,
+            "dispersion": dispersion,
+            "reference": reference,
         }
         return
 

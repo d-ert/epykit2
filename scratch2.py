@@ -19,7 +19,8 @@ md = ep.read_bismark(
 print(md)
 
 ep.pp.filter_coverage(md, lo_count=10, hi_perc=99.9)
-ep.pp.unite(md, type="union")
+ep.pp.normalize_coverage(md, method="median")        # ← new
+ep.pp.unite(md, type="intersect")
 #ep.pp.smooth(md, bandwidth=1000)
 
 ep.tl.qc(md)
@@ -36,7 +37,7 @@ print(f"Percentage: {pct:.2f}%")
 print(f"\nEffect size summary:")
 print(md.dmc.filter(pl.col('qvalue') < 0.05).select('meth_diff').describe())
 
-ep.tl.dmr(md, window_bp=500, min_cpgs=5)
+ep.tl.dmr(md, tile_size_bp=500, min_cpgs_per_tile=5)
 
 # Check DMC results
 print(md.dmc.filter(pl.col("qvalue") < 0.05))

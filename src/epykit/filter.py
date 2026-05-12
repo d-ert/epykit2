@@ -277,6 +277,141 @@ def filter_sites(
     print(f"Filtered Parquet store written to {output_dir_path}")
 
 
+def normalize_coverage_store(
+    methylstore_path: str,
+    output_dir: str,
+    method: str = "median",
+) -> dict[str, float]:
+    """methylKit-parity per-sample coverage normalisation.
+
+    For each sample, compute a single scalar factor ``s_i`` so that the
+    chosen central statistic of coverage matches a common target across
+    the cohort:
+
+        method="median": target = median(per-sample medians)
+                         s_i    = target / median(cov_i)
+        method="mean":   target =   mean(per-sample means)
+                         s_i    = target /   mean(cov_i)
+
+    Each row's ``N_meth`` and ``N_unmeth (= coverage - N_meth)`` are then
+    scaled by ``s_i`` and rounded to int. ``coverage`` is rebuilt as
+    ``N_meth + N_unmeth`` so the equality holds exactly after rounding.
+    (methylKit rounds the three independently and can drift by 1; we keep
+    the strict invariant because downstream Polars joins rely on it.)
+
+    Mirrors methylKit's ``normalizeCoverage(obj, method='median')`` used
+    between ``filterByCoverage`` and ``tileMethylCounts`` to prevent
+    deeper-sequenced samples from dominating pooled-count tile tests.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Path to input partitioned Parquet methylstore.
+    output_dir : str
+        Path to write normalised store (mirrors input partitioning).
+    method : {"median", "mean"}
+        Central statistic to align.
+
+    Returns
+    -------
+    dict[str, float]
+        Mapping ``{sample_id: scaling_factor}``.
+    """
+    if method not in ("median", "mean"):
+        raise ValueError(f"method must be 'median' or 'mean', got {method!r}")
+
+    src = Path(methylstore_path)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    samples = sorted(
+        d.name.removeprefix("sample=") for d in src.glob("sample=*")
+    )
+    if not samples:
+        raise ValueError(f"No sample=* directories found in {src}")
+
+    # --- Pass 1: per-sample central coverage ------------------------------
+    summaries: dict[str, float] = {}
+    for samp in samples:
+        sample_dir = src / f"sample={samp}"
+        parts = [
+            part
+            for chrom_dir in sorted(sample_dir.glob("chrom=*"))
+            for part in chrom_dir.glob("part-*.parquet")
+        ]
+        if not parts:
+            raise ValueError(f"Sample {samp!r} has no parquet parts")
+        coverage_series = pl.concat([
+            pl.read_parquet(str(p), columns=["coverage"])["coverage"]
+            for p in parts
+        ])
+        if len(coverage_series) == 0:
+            raise ValueError(f"Sample {samp!r} has zero rows after read")
+        summaries[samp] = float(
+            coverage_series.median() if method == "median"
+            else coverage_series.mean()
+        )
+
+    summary_values = np.array(list(summaries.values()), dtype=np.float64)
+    target = float(
+        np.median(summary_values) if method == "median" else summary_values.mean()
+    )
+
+    factors: dict[str, float] = {
+        samp: (target / s if s > 0 else 1.0) for samp, s in summaries.items()
+    }
+
+    print(f"Coverage normalisation (method={method}, target={target:.2f}):")
+    for samp in samples:
+        print(
+            f"  {samp}: {method}_cov={summaries[samp]:.2f}, "
+            f"factor={factors[samp]:.4f}"
+        )
+
+    # --- Pass 2: scale and write ------------------------------------------
+    for samp in samples:
+        s = factors[samp]
+        sample_dir = src / f"sample={samp}"
+        for chrom_dir in sorted(sample_dir.glob("chrom=*")):
+            chrom = chrom_dir.name.removeprefix("chrom=")
+            parts = list(chrom_dir.glob("part-*.parquet"))
+            if not parts:
+                continue
+
+            chrom_df = pl.concat([pl.read_parquet(str(p)) for p in parts])
+
+            # Capture original N_unmeth before either column is overwritten,
+            # so the two scaled counts remain consistent and coverage is
+            # rebuilt from them exactly.
+            scaled = (
+                chrom_df
+                .with_columns(
+                    (pl.col("coverage") - pl.col("N_meth")).alias("_N_unmeth_orig")
+                )
+                .with_columns([
+                    (pl.col("N_meth").cast(pl.Float64) * s)
+                        .round().cast(pl.Int32).alias("N_meth"),
+                    (pl.col("_N_unmeth_orig").cast(pl.Float64) * s)
+                        .round().cast(pl.Int32).alias("_N_unmeth"),
+                ])
+                .with_columns(
+                    (pl.col("N_meth") + pl.col("_N_unmeth"))
+                    .cast(pl.Int32).alias("coverage")
+                )
+                .drop(["_N_unmeth_orig", "_N_unmeth"])
+            )
+
+            out_chrom_dir = out / f"sample={samp}" / f"chrom={chrom}"
+            out_chrom_dir.mkdir(parents=True, exist_ok=True)
+            scaled.write_parquet(
+                str(out_chrom_dir / "part-0.parquet"),
+                compression="zstd",
+            )
+
+    print(f"Normalised Parquet store written to {out}")
+    return factors
+
+
 def intersect_sites(
     methylstore_path: str,
     samples: list[str],

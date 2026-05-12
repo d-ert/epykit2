@@ -102,7 +102,7 @@ _EMPTY_SCHEMA = {
 
 _TEST_RECOMMENDATIONS = {
     range(1, 3):   "fisher (single-rep only; effect size dominates)",
-    range(3, 999): "score (quasi-binomial score test with overdispersion)",
+    range(3, 999): "lr (quasi-binomial likelihood-ratio with MN overdispersion)",
 }
 
 # Shared epsilon for boundary clipping in logit / log-OR computations.
@@ -563,8 +563,12 @@ def _score_finalize(
     chrom_name:     str   = "?",
     min_dispersion: float = 1.0,
     min_disp_sites: int   = 100,
+    dispersion:     str   = "site",
+    shrink_pseudo_df: float = 4.0,
+    statistic:      str   = "lr",
+    reference:      str   = "chi2",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    """Compute per-site score p-values and a chromosome-level dispersion.
+    """Compute per-site score p-values with McCullagh-Nelder overdispersion.
 
     Parameters
     ----------
@@ -578,9 +582,80 @@ def _score_finalize(
         clamping at 1 is the conservative choice and matches methylKit's
         default.  Set < 1 to allow underdispersion.
     min_disp_sites : int
-        If fewer than this many sites are usable for dispersion estimation
-        (e.g. tiny alt contigs), fall back to φ̂ = ``min_dispersion`` with a
-        warning instead of computing an unstable estimate.
+        If fewer than this many sites are usable for the chromosome-level
+        dispersion estimate (e.g. tiny alt contigs), fall back to
+        φ̂ = ``min_dispersion`` instead of computing an unstable estimate.
+        Used by the ``"chrom"`` and ``"shrink"`` modes; the ``"site"`` mode
+        is unaffected because each site provides its own φ̂_i.
+    dispersion : {"site", "chrom", "shrink"}
+        Strategy for the McCullagh-Nelder dispersion correction:
+
+        ``"site"`` (default, methylKit ``overdispersion="MN"`` parity)
+            Each site/tile gets its own φ̂_i computed from its 4-df Pearson
+            residual sum:  φ̂_i = (X²_case_i + X²_ctrl_i) / max(nv_i − 2, 1),
+            clamped at ``min_dispersion``. This is what R's
+            ``glm(family=quasibinomial)`` does on a per-site fit and is the
+            assumption baked into methylKit's reference pipeline. The
+            estimator is noisy with the typical 4 df, but it correctly
+            tracks region-specific dispersion (CpG-islands vs gene bodies
+            have different between-replicate variance).
+        ``"chrom"`` (previous default)
+            Single chromosome-pooled φ̂ from all qualifying sites. Most
+            powerful when between-replicate variance really is constant
+            along the chromosome, but anti-conservative when it is not.
+            Equivalent to fitting the quasi-binomial GLM as a single model
+            with one shared dispersion. Use when you want strictly more
+            power and you accept the modelling assumption.
+        ``"shrink"`` (methylKit ``overdispersion="shrinkMN"`` parity)
+            James-Stein-style shrinkage: φ̂_shrunk_i is a weighted average of
+            φ̂_site_i (with weight = site df) and the chromosome-pooled
+            φ̂_chrom (with weight = ``shrink_pseudo_df``, default 4).
+            Trades a small bias for a large variance reduction on the
+            per-site estimate; reproduces the published behaviour of
+            methylKit's shrunk dispersion and DSS's empirical Bayes prior.
+    shrink_pseudo_df : float
+        Pseudo-df weight on φ̂_chrom in the ``"shrink"`` mode (default 4 ≈
+        the typical real per-site df). Ignored otherwise.
+    statistic : {"lr", "score"}
+        Functional form of the test statistic. Both use the same per-group
+        sufficient statistics (S0_g = Σ_j n_ij and S1_g = Σ_j m_ij) and the
+        same dispersion correction, so the difference manifests only at
+        small effective sample sizes (n=6 is small):
+
+        ``"lr"`` (default, methylKit ``test='Chisq'`` parity)
+            Quasi-binomial likelihood-ratio chi-square. Closed-form in
+            S0_g and S1_g, so no per-tile GLM fit is required:
+              LRT = 2 · Σ_g [ S1_g·log(p̂_g/p̂_pool)
+                            + (S0_g − S1_g)·log((1 − p̂_g)/(1 − p̂_pool)) ]
+            divided by the dispersion φ̂_i. Closer to nominal coverage near
+            the boundaries (π̂ near 0 or 1) — exactly where DMR tiles tend
+            to live. This is what methylKit reports.
+
+        ``"score"`` (previous default; slightly more powerful)
+            Pearson score statistic U²/V_pool with quasi-binomial inflation.
+            Asymptotically equivalent to the LR test but mildly
+            anti-conservative at the boundaries. Kept as an option for
+            users who want the small extra power.
+    reference : {"chi2", "F"}
+        Reference distribution used to convert the test statistic to a
+        p-value.
+
+        ``"chi2"`` (default, methylKit-parity at the per-CpG level)
+            Standard quasi-binomial chi-squared:  p = 1 − χ²₁.cdf(stat).
+            This is what methylKit's ``calculateDiffMeth(test="Chisq")``
+            uses (and what its DMC behaviour empirically matches). Mildly
+            anti-conservative at very small samples, but the asymptotic
+            theory says it is correct as n → ∞.
+        ``"F"`` (small-sample corrected)
+            Per-site F-test:  p = 1 − F.cdf(stat, 1, df_i)
+            where df_i = (nv_case + nv_ctrl) − 2. This is the textbook
+            quasi-likelihood small-sample correction (McCullagh-Nelder
+            §8.3), which accounts for the variance of the estimated
+            dispersion φ̂. With df_i ≈ 4 it is much more conservative than
+            χ²₁ and will reject zero genome-wide CpG sites on typical
+            n=3+3 WGBS — use only if you understand the trade-off, or for
+            DMR-level analyses where the underlying statistics are large
+            enough to clear F's heavy tails.
 
     Returns
     -------
@@ -590,7 +665,21 @@ def _score_finalize(
         (= group MLE proportion under the full model). NaN where the
         corresponding group has zero coverage at the site.
     phi_hat : float
+        Chromosome-pooled dispersion estimate, returned for logging /
+        downstream introspection regardless of which mode was used.
     """
+    if dispersion not in {"site", "chrom", "shrink"}:
+        raise ValueError(
+            f"dispersion must be 'site', 'chrom', or 'shrink'; got {dispersion!r}"
+        )
+    if statistic not in {"lr", "score"}:
+        raise ValueError(
+            f"statistic must be 'lr' or 'score'; got {statistic!r}"
+        )
+    if reference not in {"F", "chi2"}:
+        raise ValueError(
+            f"reference must be 'F' or 'chi2'; got {reference!r}"
+        )
     eps = _BETA_EPSILON
 
     # --- Group MLE proportions under the full (unrestricted) model ---
@@ -625,18 +714,20 @@ def _score_finalize(
     sites_both    = (sn_case > 0) & (sn_ctrl > 0) & (nv_case > 0) & (nv_ctrl > 0)
     sites_dispers = sites_both & (den_case > 0) & (den_ctrl > 0)
 
-    # --- Chromosome-level dispersion φ̂ ---
+    # --- Chromosome-pooled φ̂ (always computed; used directly in "chrom"
+    #     mode, used as the shrinkage anchor in "shrink" mode, logged
+    #     otherwise) -----------------------------------------------------
     n_disp = int(sites_dispers.sum())
     if n_disp < min_disp_sites:
-        logger.warning(
-            "%s: only %d sites usable for dispersion estimation; "
-            "falling back to φ̂ = %.2f (no overdispersion correction).",
-            chrom_name, n_disp, min_dispersion,
-        )
+        if dispersion == "chrom":
+            logger.warning(
+                "%s: only %d sites usable for dispersion estimation; "
+                "falling back to φ̂ = %.2f (no overdispersion correction).",
+                chrom_name, n_disp, min_dispersion,
+            )
         phi_hat = float(min_dispersion)
+        phi_raw = float(min_dispersion)
     else:
-        # df = total observations contributing to the residual variance,
-        # minus the 2 fitted proportions per site.
         n_obs = int(nv_case[sites_dispers].sum() + nv_ctrl[sites_dispers].sum())
         df    = max(n_obs - 2 * n_disp, 1)
 
@@ -647,37 +738,106 @@ def _score_finalize(
         phi_hat = float(max(min_dispersion, phi_raw))
 
         logger.info(
-            "%s: φ̂ = %.3f  (raw %.3f from %s sites, %s obs, df=%s)",
+            "%s: chrom-pooled φ̂ = %.3f (raw %.3f, %s sites, %s obs, df=%s); "
+            "applying dispersion='%s'",
             chrom_name, phi_hat, phi_raw,
-            f"{n_disp:,}", f"{n_obs:,}", f"{df:,}",
+            f"{n_disp:,}", f"{n_obs:,}", f"{df:,}", dispersion,
         )
 
-    # --- Score test for H0: π_case = π_ctrl ---
+    # --- Per-site Pearson dispersion φ̂_i (only used when needed) ---------
+    if dispersion in ("site", "shrink"):
+        # df_i = (replicates_case + replicates_ctrl) − 2 fitted proportions.
+        # At a typical methylKit-style site with n=3 per group this is 4.
+        df_i = (nv_case + nv_ctrl).astype(np.float64) - 2.0
+        df_i_safe = np.where(df_i > 0, df_i, 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            phi_site = (chi_case + chi_ctrl) / df_i_safe
+
+        # Sites with zero dispersion contribution (perfect fit OR degenerate
+        # variance term) cannot inform φ̂_i. Apply the floor; the
+        # ``min_dispersion`` clamp also handles the underdispersion case.
+        phi_site = np.where(sites_dispers & (df_i > 0), phi_site, min_dispersion)
+        phi_site = np.maximum(phi_site, min_dispersion)
+
+        if dispersion == "site":
+            phi_eff = phi_site
+        else:  # "shrink": James-Stein-style weighted average toward chrom mean
+            # φ̂_shrunk_i = (df_i · φ̂_site_i + w · φ̂_chrom) / (df_i + w)
+            w   = float(shrink_pseudo_df)
+            num = df_i_safe * phi_site + w * phi_hat
+            den = df_i_safe + w
+            phi_eff = np.maximum(num / den, min_dispersion)
+            # Where the per-site estimator was unusable, fall back to the
+            # chromosome value rather than the floor.
+            phi_eff = np.where(sites_dispers & (df_i > 0), phi_eff, phi_hat)
+    else:  # "chrom"
+        phi_eff = np.full_like(sn_case, phi_hat, dtype=np.float64)
+
+    # --- Test for H0: π_case = π_ctrl --------------------------------------
+    # Both the score and LR statistics use the same per-group sufficient
+    # statistics (sn_*, sm_*) and the same dispersion φ̂_eff. They differ
+    # only in functional form; both are referenced to χ²₁ asymptotically.
     sn_total = sn_case + sn_ctrl
     sm_total = sm_case + sm_ctrl
     with np.errstate(invalid="ignore", divide="ignore"):
         pi_pool      = np.where(sn_total > 0, sm_total / sn_total, np.nan)
         pi_pool_safe = np.clip(pi_pool, eps, 1.0 - eps)
 
-        # Score  U = M_case − N_case · π̂_pool
-        U = sm_case - sn_case * pi_pool
-
-        # Null variance, before overdispersion inflation
+        # Variance of the null-MLE score U.  Used by both branches: the
+        # ``score`` test divides U² by it; the ``lr`` test only needs it
+        # as a degenerate-site guard (variance == 0 → no information at
+        # that site, so the LR is also undefined).
         var_U_bin = (
             (sn_case * sn_ctrl / np.maximum(sn_total, 1.0))
             * pi_pool_safe
             * (1.0 - pi_pool_safe)
         )
-        var_U = var_U_bin * phi_hat
 
-        chi2_stat = np.where(var_U > 0, U * U / var_U, np.nan)
+        if statistic == "score":
+            U = sm_case - sn_case * pi_pool
+            stat_raw = np.where(var_U_bin > 0, U * U / var_U_bin, np.nan)
+        else:  # "lr": closed-form quasi-binomial log-likelihood ratio
+            # LR = 2 · Σ_g [ S1_g · log(p̂_g/p̂_pool)
+            #             + (S0_g − S1_g) · log((1 − p̂_g)/(1 − p̂_pool)) ]
+            # Each term is x · log(y/z) where y, z ∈ [ε, 1-ε] after clipping,
+            # so log is bounded; the multiplicative 0 at x=0 cleanly zeroes
+            # the contribution (no special-casing needed).
+            pc_safe = np.clip(pi_case, eps, 1.0 - eps)
+            pk_safe = np.clip(pi_ctrl, eps, 1.0 - eps)
 
-    pvals = sp_stats.chi2.sf(chi2_stat, df=1)
+            u_case = sm_case
+            u_ctrl = sm_ctrl
+            v_case = sn_case - sm_case
+            v_ctrl = sn_ctrl - sm_ctrl
+
+            lr_terms = (
+                u_case * np.log(pc_safe / pi_pool_safe)
+                + v_case * np.log((1.0 - pc_safe) / (1.0 - pi_pool_safe))
+                + u_ctrl * np.log(pk_safe / pi_pool_safe)
+                + v_ctrl * np.log((1.0 - pk_safe) / (1.0 - pi_pool_safe))
+            )
+            stat_raw = 2.0 * lr_terms
+
+        # Apply quasi-binomial dispersion inflation per site/tile.
+        chi2_stat = np.where(phi_eff > 0, stat_raw / phi_eff, np.nan)
+        chi2_stat = np.where(var_U_bin > 0, chi2_stat, np.nan)
+
+    if reference == "F":
+        # Per-site df_residual = total replicates with coverage − 2 fitted
+        # proportions. Floors at 1 to keep the F-distribution well-defined;
+        # in practice all but the most degenerate sites have df_i ≥ 2.
+        df_resid = np.maximum(
+            (nv_case + nv_ctrl).astype(np.float64) - 2.0,
+            1.0,
+        )
+        pvals = sp_stats.f.sf(chi2_stat, dfn=1, dfd=df_resid)
+    else:
+        pvals = sp_stats.chi2.sf(chi2_stat, df=1)
 
     degenerate = (
         ~sites_both
         | np.isnan(chi2_stat)
-        | (var_U <= 0)
+        | (var_U_bin <= 0)
     )
     pvals = np.where(degenerate, np.nan, pvals)
 
@@ -974,6 +1134,8 @@ def _process_one_chromosome(
     test: str,
     min_samples_case: int = 0,
     min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "chi2",
 ) -> pl.DataFrame:
     """Run DMC for one chromosome, loading one sample at a time.
 
@@ -1102,11 +1264,12 @@ def _process_one_chromosome(
         pvals, log2_ors = _cmh_finalize(ome, var_sum, or_num, or_den)
         del ome, var_sum, or_num, or_den
 
-    elif test == "score":
-        # Quasi-binomial score test with chromosome-level overdispersion
-        # correction.  Streaming single-pass: per-group running sums of
-        # (n, m, m²/n) plus a replicate counter give both the score
-        # statistic and the closed-form Pearson dispersion estimate.
+    elif test in ("score", "lr"):
+        # Quasi-binomial count-model test with McCullagh-Nelder overdispersion.
+        # Both the score and likelihood-ratio statistics share the same
+        # streaming accumulators (sn, sm, sm²/n, nv per group) and the same
+        # dispersion machinery; ``_score_finalize`` picks the functional form
+        # based on the ``statistic=`` argument it receives.
         sn_case, sm_case, sm2n_case, nv_case = _score_init(n_sites)
         sn_ctrl, sm_ctrl, sm2n_ctrl, nv_ctrl = _score_init(n_sites)
 
@@ -1131,6 +1294,9 @@ def _process_one_chromosome(
             sn_case, sm_case, sm2n_case, nv_case,
             sn_ctrl, sm_ctrl, sm2n_ctrl, nv_ctrl,
             chrom_name=chrom,
+            dispersion=dispersion,
+            statistic=test,
+            reference=reference,
         )
 
         # Coverage-weighted (= pooled MLE) group methylation for output.
@@ -1172,7 +1338,7 @@ def _process_one_chromosome(
     else:
         raise NotImplementedError(
             f"Test '{test}' not implemented. "
-            "Choose 'score', 'fisher', 'cmh', 'logit_t', or 'beta_binomial'."
+            "Choose 'lr', 'score', 'fisher', 'cmh', 'logit_t', or 'beta_binomial'."
         )
 
     # --- BIO-3: equal-weight per-replicate mean beta ---
@@ -1258,8 +1424,8 @@ def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
     if test == "fisher" and min_n >= 2:
         logger.info(
             "Tip: 'fisher' pools reads across replicates and ignores between-"
-            "replicate variance. At n>=2 the 'score' test is statistically "
-            "preferable (quasi-binomial with overdispersion correction)."
+            "replicate variance. At n>=2 the 'lr' test is statistically "
+            "preferable (quasi-binomial likelihood-ratio with MN dispersion)."
         )
 
     if max_n / min_n > 2:
@@ -1277,11 +1443,13 @@ def process_chromosomes_dmc(
     methylstore_path: str,
     samples_case: list[str],
     samples_control: list[str],
-    test: str = "score",
+    test: str = "lr",
     chromosomes: Optional[list[str]] = None,
     unite: bool = True,
     min_samples_case: int = 0,
     min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "chi2",
 ) -> pl.DataFrame:
     """Process differential methylation for all chromosomes.
 
@@ -1291,22 +1459,25 @@ def process_chromosomes_dmc(
         Path to filtered partitioned Parquet methylstore.
     samples_case, samples_control : list[str]
         Sample identifiers for case and control groups.
-    test : {"score", "fisher", "cmh", "logit_t", "beta_binomial"}
+    test : {"lr", "score", "fisher", "cmh", "logit_t", "beta_binomial"}
         Statistical test.
-            "score"    (default) — Quasi-binomial score test on per-group
-                                   read counts with a chromosome-level
-                                   overdispersion correction estimated from
-                                   the full-model Pearson residuals.
-                                   Matches methylKit's calculateDiffMeth
+            "lr"       (default) — Quasi-binomial likelihood-ratio chi-square
+                                   on per-group read counts with per-site
+                                   McCullagh-Nelder dispersion. Matches
+                                   methylKit's calculateDiffMeth
                                    (overdispersion='MN', test='Chisq').
-                                   Recommended at n >= 3.
+                                   Recommended at n >= 2.
+            "score"              — Pearson score statistic on the same
+                                   accumulators. Marginally more powerful
+                                   than "lr" but mildly anti-conservative
+                                   when π̂ is near 0 or 1.
             "logit_t"            — Welch t on logit(beta), variance via
                                    Welford. Fallback when count-model
                                    assumptions are doubtful (e.g. very low
                                    coverage). Not a GLM.
             "beta_binomial"      — Welch t on raw betas. Despite the name,
                                    not a beta-binomial GLM; superseded by
-                                   "score". Kept for backward compatibility.
+                                   "lr". Kept for backward compatibility.
             "cmh"                — Cochran-Mantel-Haenszel with one stratum
                                    per (case_i, ctrl_j) pair.
             "fisher"             — Fisher exact on reads pooled across
@@ -1324,6 +1495,18 @@ def process_chromosomes_dmc(
         p-value masked to NaN before FDR correction. Use this with
         ``unite=False`` (union mode) to drop tests that effectively run on
         a singleton observation in one group.
+    dispersion : {"site", "chrom", "shrink"}
+        McCullagh-Nelder dispersion strategy used by ``test="lr"`` and
+        ``test="score"``. Default ``"site"`` matches methylKit
+        ``overdispersion="MN"``. See :func:`_score_finalize` for details.
+        Ignored for other tests.
+    reference : {"chi2", "F"}
+        Reference distribution for the quasi-binomial test statistic.
+        Default ``"chi2"`` matches methylKit's ``test="Chisq"`` at the
+        per-CpG level. ``"F"`` is the textbook small-sample correction
+        but is too conservative for genome-wide per-CpG BH-FDR on
+        typical n=3+3 designs. See :func:`_score_finalize`. Ignored for
+        other tests.
 
     Returns
     -------
@@ -1385,6 +1568,8 @@ def process_chromosomes_dmc(
                 samples_case, samples_control, test,
                 min_samples_case=min_samples_case,
                 min_samples_control=min_samples_control,
+                dispersion=dispersion,
+                reference=reference,
             )
             del canonical_df
 

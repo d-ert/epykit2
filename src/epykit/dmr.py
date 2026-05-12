@@ -533,6 +533,8 @@ def call_dmr_tile_based(
     unite: bool = True,
     min_samples_case: int = 0,
     min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "chi2",
 ) -> pl.DataFrame:
     """Call DMRs by aggregating read counts within fixed-size tiles.
 
@@ -665,6 +667,8 @@ def call_dmr_tile_based(
             unite=unite,
             min_samples_case=min_samples_case,
             min_samples_control=min_samples_control,
+            dispersion=dispersion,
+            reference=reference,
         )
 
     if len(tile_dmc) == 0:

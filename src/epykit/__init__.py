@@ -42,6 +42,7 @@ from .filter import (
     intersect_sites,
     load_chromosome_data,
     get_coverage_quantile,
+    normalize_coverage_store,
 )
 from .dmc import (
     process_chromosomes_dmc,

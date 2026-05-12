@@ -71,6 +71,70 @@ def filter_coverage(
         _append_store_history(md, "filtered", out, n_sites)
 
 
+def normalize_coverage(md: MethylData, method: str = "median") -> None:
+    """methylKit-parity coverage normalisation, in-place on a MethylData.
+
+    Computes a per-sample scaling factor so that each sample's central
+    coverage statistic (median by default, or mean) matches a common
+    target — the median (or mean) of the per-sample summaries. Read
+    counts are scaled and re-integerised, then ``md.store`` is repointed
+    at a new ``.cache/normalized`` (or ``<store>_normalized``) partition.
+
+    This prevents deeper-sequenced samples from dominating pooled-count
+    tile / region tests downstream. The per-CpG score test in
+    ``ep.tl.dmc`` is much less sensitive to coverage imbalance, but
+    ``ep.tl.dmr(method='tile')`` is — methylKit's reference pipeline
+    inserts ``normalizeCoverage`` between ``filterByCoverage`` and
+    ``tileMethylCounts`` for exactly this reason.
+
+    Call order: ``filter_coverage`` → ``normalize_coverage`` → ``unite``.
+
+    Parameters
+    ----------
+    md : MethylData
+        Object whose store has been ``filter_coverage``'d.
+    method : {"median", "mean"}
+        Central statistic to align. ``"median"`` matches methylKit's
+        default and is robust to extreme-coverage tails.
+
+    Raises
+    ------
+    ValueError
+        If ``filter_coverage`` has not been called yet.
+    """
+    if not md._filtered:
+        raise ValueError(
+            "Run ep.pp.filter_coverage(md) before ep.pp.normalize_coverage(md)."
+        )
+    if md._united:
+        logger.warning(
+            "normalize_coverage called after unite(); the recommended order "
+            "is filter → normalize → unite. Re-running unite() is a no-op "
+            "but downstream stats reflect the normalised store."
+        )
+
+    if md._analysis_root:
+        out = str(Path(md._analysis_root) / ".cache" / "normalized")
+    else:
+        out = f"{md.store}_normalized"
+
+    factors = filter_mod.normalize_coverage_store(
+        methylstore_path=md.store,
+        output_dir=out,
+        method=method,
+    )
+
+    md.store = out
+    md.uns["normalize"] = {
+        "method": method,
+        "factors": factors,
+    }
+    n_sites = _count_parquet_rows(out)
+    if n_sites is not None:
+        md.uns["n_sites_normalized"] = n_sites
+        _append_store_history(md, "normalized", out, n_sites)
+
+
 def unite(md: MethylData, type: str = "union") -> None:
     """Record the site-alignment strategy for downstream DMC processing.
 
