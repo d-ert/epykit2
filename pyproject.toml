@@ -18,6 +18,7 @@ dependencies = [
   "pyranges",
   "pyfaidx",
   "statsmodels",
+  "patsy>=0.5",
   "psutil>=7.2.2",
   "matplotlib>=3.9.4",
   "seaborn>=0.13.2",
@@ -32,3 +33,21 @@ dev = [
 
 [project.scripts]
 epykit = "epykit.cli:main"
+
+[tool.setuptools.package-data]
+epykit = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: tests that take more than ~5s; deselect with -m 'not slow'",
+]
+filterwarnings = [
+    # Allow our own DeprecationWarnings through so tests can assert on them
+    "default::DeprecationWarning:epykit",
+    "default::UserWarning:epykit",
+    # Silence third-party deprecation noise that flooded test output
+    "ignore::DeprecationWarning:pyarrow",
+    "ignore::DeprecationWarning:pyranges",
+]

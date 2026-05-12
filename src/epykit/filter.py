@@ -1,16 +1,13 @@
 """QC and filtering for Parquet methylation stores.
 
-Performance changes vs previous version:
-  PERF-1: Blacklist filtering now uses a single pyranges interval overlap instead
-          of a per-region .filter() loop (was O(n_regions) lazy nodes).
-  PERF-2: filter_sites reads each chromosome once: coverage column scanned first
-          for genome-wide quantile (lightweight), then per-chromosome reads for
-          filtering and writing — no second full-table scan.
-  PERF-3: intersect_sites uses a single group_by + count instead of an N-1
-          sequential join chain.
-
-Biological changes:
-  None in this module. See dmc.py for BIO-3/BIO-4 fixes.
+Notable design points:
+  - Blacklist filtering uses one pyranges interval overlap (not a per-region
+    .filter() loop).
+  - ``filter_sites`` reads each chromosome once: a lightweight coverage-only
+    scan computes the genome-wide quantile, then per-chromosome reads do
+    filtering + writing.
+  - ``intersect_sites`` uses one group_by + count rather than N-1 sequential
+    joins.
 """
 
 from __future__ import annotations
@@ -22,9 +19,7 @@ import numpy as np
 import polars as pl
 
 
-# ---------------------------------------------------------------------------
 # Internal helpers
-# ---------------------------------------------------------------------------
 
 def _genome_wide_quantile(
     sample_dir: Path,
@@ -87,9 +82,7 @@ def _apply_blacklist(df: pl.DataFrame, blacklist_bed: str) -> pl.DataFrame:
     return df.filter(keep)
 
 
-# ---------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
 
 def sample_summary(
     methylstore_path: str,

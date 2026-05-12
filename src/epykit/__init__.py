@@ -4,29 +4,29 @@ This package provides a complete WGBS analysis pipeline:
 
   - convert:   Bismark .cov → partitioned Parquet methylstore
   - filter:    QC / coverage filtering / site intersection
-  - dmc:       Differential methylation calling per CpG (Fisher or
-               beta-binomial)
-  - dmr:       DMR calling (sliding-window) and BSmooth-style smoothing
+  - dmc:       Differential methylation calling per CpG (lr is the default,
+               matching methylKit overdispersion="MN" test="Chisq"; other
+               backends: score, glm, logit_t, beta_binomial, cmh, fisher)
+  - dmr:       DMR calling (tile-based default, sliding-window legacy) and
+               BSmooth-style Gaussian smoothing
   - annotate:  Gene-feature and CpG-island context annotation
   - qc:        Bisulfite conversion rate, global methylation, coverage
                uniformity
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import version as _v, PackageNotFoundError
+
+try:
+    __version__ = _v("epykit")
+except PackageNotFoundError:
+    # editable install or running from source without install
+    __version__ = "0.0.0+unknown"
 
 from .methyldata import MethylData
 from .io import read_bismark, read_nfcore_methylseq, load
 from . import pp, tl, pl
 
 from .convert import convert_sample
-from .filter import (
-    sample_summary,
-    filter_sites,
-    intersect_sites,
-    load_chromosome_data,
-    get_coverage_quantile,
-    normalize_coverage_store,
-)
 from .dmc import (
     process_chromosomes_dmc,
     calculate_diff_meth_chromosome,
@@ -36,7 +36,8 @@ from .dmc import (
 )
 from .dmr import (
     call_dmr_sliding_window,
-    smooth_methylation_bsmooth,
+    smooth_methylation_gaussian,
+    smooth_methylation_bsmooth,  # deprecated alias; see dmr.py
 )
 from .annotate import (
     annotate_features,
@@ -48,3 +49,34 @@ from .qc import (
     coverage_uniformity,
 )
 from ._glm import build_design
+
+__all__ = [
+    # version
+    "__version__",
+    # data object
+    "MethylData",
+    # I/O
+    "read_bismark", "read_nfcore_methylseq", "load",
+    # namespaces (scanpy-style)
+    "pp", "tl", "pl",
+    # ingestion
+    "convert_sample",
+    # DMC engines (advanced users; tl.dmc is the recommended entry)
+    "process_chromosomes_dmc",
+    "calculate_diff_meth_chromosome",
+    "apply_multiple_testing_correction",
+    "fisher_exact_vectorized",
+    "beta_binomial_test",
+    # DMR engines
+    "call_dmr_sliding_window",
+    "smooth_methylation_gaussian",
+    # annotation
+    "annotate_features",
+    "annotate_cpg_islands",
+    # QC
+    "bisulfite_conversion_rate",
+    "global_methylation_report",
+    "coverage_uniformity",
+    # GLM design
+    "build_design",
+]

@@ -1,24 +1,14 @@
 """Genomic annotation for DMC / DMR results.
 
-Phase 3 of the epykit pipeline:
-  - annotate_features
-  - annotate_cpg_islands
+Public API: ``annotate_features`` (gene-feature overlap from a GTF) and
+``annotate_cpg_islands`` (island / shore / shelf / open-sea context from a
+UCSC CpG-island BED).
 
-Bug fixes vs previous version
-------------------------------
-FIX-1  pyranges join crash ("Unknown dtype str in a column Feature")
-       pyranges' null_types() cannot handle plain Python object / str
-       dtype columns.  Casting the Feature column to pandas Categorical
-       before constructing the PyRanges object resolves this.  Without
-       this fix the join silently failed and every site was labelled
-       "intergenic".
-
-FIX-2  GTF parsed twice when both DMC and DMR sets are annotated in the
-       same script run.  A module-level cache (_GTF_CACHE) keyed on the
-       canonical file path avoids the 70-second re-parse.
-
-Memory design: per-chromosome join loop — peak memory is bounded by the
-largest single chromosome rather than the whole genome.
+The per-chromosome join loop bounds peak memory by the largest single
+chromosome rather than the whole genome. GTFs are parsed once per process
+and cached in ``_GTF_CACHE`` keyed on the canonical file path; the Feature
+column is cast to pandas Categorical before constructing PyRanges because
+pyranges' null_types() can't handle plain str dtype.
 """
 
 from __future__ import annotations
@@ -47,52 +37,21 @@ _FEATURE_PRIORITY: dict[str, int] = {
 
 _FEAT_COLS = ["Chromosome", "Start", "End", "Strand", "Feature", "gene_id", "gene_name"]
 
-# Module-level GTF cache: path -> (genes_pd, exons_pd)
-# Avoids re-parsing the 8 M-line GTF when annotating both DMC and DMR sets.
+# GTF cache: path -> (genes_pd, exons_pd). Skips re-parsing on repeat calls.
 _GTF_CACHE: dict[str, tuple[Any, Any]] = {}
-
-# Module-level verbose flag (set to False to disable logging)
-_VERBOSE: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
-def _mb() -> str:
-    try:
-        import psutil, os
-        rss = psutil.Process(os.getpid()).memory_info().rss
-        return f"  [mem {rss / 1e9:.2f} GB RSS]"
-    except Exception:
-        return ""
 
 
 def _log(msg: str) -> None:
-    if not _VERBOSE:
-        return
-    full = f"[annotate] {msg}{_mb()}"
-    print(full, flush=True)
-    logger.info(msg)
+    """Debug-level annotation log (silent at default INFO)."""
+    logger.debug("[annotate] %s", msg)
 
 
 def _df_info(name: str, df) -> str:
     try:
-        rows = len(df)
-        if hasattr(df, "memory_usage"):
-            mem_mb = df.memory_usage(deep=True).sum() / 1e6
-        elif hasattr(df, "estimated_size"):
-            mem_mb = df.estimated_size() / 1e6
-        else:
-            mem_mb = 0.0
-        return f"{name}: {rows:,} rows  {mem_mb:.1f} MB"
+        return f"{name}: {len(df):,} rows"
     except Exception:
         return f"{name}: (unknown shape)"
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _sites_to_pyranges(sites: pl.DataFrame) -> "pr.PyRanges":
     import pyranges as pr
@@ -190,9 +149,8 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
                 feature = parts[2]
                 if feature not in ('gene', 'exon'):
                     continue
-                # FIX-3: GTF uses 1-based closed intervals; PyRanges expects
-                # 0-based half-open intervals.  Subtract 1 from start only —
-                # the GTF end is already the correct half-open end.
+                # GTF 1-based closed → PyRanges 0-based half-open: subtract
+                # 1 from start; end already correct.
                 start  = int(parts[3]) - 1
                 end    = int(parts[4])
                 strand = parts[6]
@@ -242,14 +200,7 @@ def _annotate_chromosome_chunk(
     chrom_sites: pl.DataFrame,
     chrom_features_df: "pd.DataFrame",
 ) -> "pd.DataFrame":
-    """Run overlap + best-pick for one chromosome. Returns pandas DataFrame.
-
-    FIX-1: The Feature column must be cast to pandas Categorical before
-    constructing the PyRanges object.  pyranges' null_types() does not
-    handle plain object/str dtype and raises:
-        Exception: Unknown dtype str in a column Feature
-    Casting to Categorical gives pyranges a known dtype it can null-fill.
-    """
+    """Run overlap + best-pick for one chromosome. Returns pandas DataFrame."""
     import pyranges as pr
     import pandas as pd
 
@@ -282,7 +233,7 @@ def _annotate_chromosome_chunk(
     _log(f"  {chrom}: building features PyRanges ({len(chrom_features_df):,} features)")
     t0 = time.time()
     try:
-        # FIX-1: cast Feature to Categorical so pyranges can null-fill it
+        # Cast Feature to Categorical so pyranges null_types() accepts it.
         feat_df = chrom_features_df.copy()
         for _col in feat_df.select_dtypes(include=["object"]).columns:
             feat_df[_col] = feat_df[_col].astype("category")
@@ -345,9 +296,7 @@ def _annotate_chromosome_chunk(
     return result
 
 
-# ---------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
 
 def annotate_features(
     sites: pl.DataFrame,
@@ -583,10 +532,8 @@ def annotate_features(
         .to_numpy(dtype=np.float64, na_value=np.nan)
     )
 
-    # FIX-4: TSS distance must respect strand.
-    # For + strand: positive distance = downstream of TSS (higher genomic coord). ✓
-    # For − strand: TSS is at genomic End; a higher coordinate is *upstream*,
-    # so the sign must be flipped to keep "positive = downstream" consistent.
+    # TSS distance: positive = downstream. On - strand, TSS sits at End and a
+    # higher genomic coordinate is upstream, so flip the sign.
     _strand_lut = (
         genes_pd[["gene_id", "Strand"]]
         .drop_duplicates("gene_id")

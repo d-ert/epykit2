@@ -1,18 +1,9 @@
-"""High-level tools for the standard WGBS analysis flow.
+"""High-level orchestrators for the standard WGBS analysis flow.
 
-Changes vs prior version (see analysis report for bug numbers):
-
-* BIO-3 — ``_auto_test`` no longer routes n<6 designs to the broken
-  ``"fisher"`` path. It returns ``"logit_t"`` at n<6 (replicate-aware Welch
-  t-test on logit-transformed betas) and ``"beta_binomial"`` at n>=6.
-* BIO-5 — ``dmr()`` gains a ``method`` parameter: ``"tile"`` (new, default)
-  runs methylKit-style tile-based DMR with read pooling per tile, and
-  ``"sliding_window"`` (legacy) runs the prior per-CpG p-value combining path.
-* BIO-7 — ``dmc()`` and the tile-based DMR pass ``min_samples_case`` /
-  ``min_samples_control`` through to the underlying engine so that union-mode
-  tests on singleton-covered sites can be filtered out before correction.
-* BIO-10 — the DMR-level filter now applies to ``combined_qvalue`` (BH-
-  corrected at the DMR level) rather than the raw ``combined_pvalue``.
+Public entry points: ``qc``, ``dmc``, ``dmr``, ``annotate``. Each mutates a
+``MethylData`` in place — results land in ``md.obs`` / ``md.varm`` /
+``md.uns``. See the module docstrings of ``dmc.py`` and ``dmr.py`` for the
+underlying engines.
 """
 
 from __future__ import annotations
@@ -27,20 +18,74 @@ from .methyldata import MethylData
 from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
 
 
-def _auto_test(md: MethylData, design: str | None = None, covariates: list[str] | None = None) -> str:
+def _auto_test(
+    md: MethylData,
+    design: str | None = None,
+    covariates: list[str] | None = None,
+    allow_n1: bool = False,
+) -> str:
     """Pick a sensible test based on group size, accounting for covariates.
 
     When a covariate design is supplied, we MUST use the binomial GLM path
     (``"glm"``) because the closed-form ``lr`` / ``score`` paths don't admit
     covariates. The choice is therefore unconditional whenever the user
     asks for adjustment.
+
+    ``allow_n1`` is forwarded to :func:`_auto_test_simple` and only takes
+    effect when there are fewer than 2 replicates per group.
     """
     if design is not None or (covariates is not None and len(covariates) > 0):
         return "glm"
-    return _auto_test_simple(md)
+    return _auto_test_simple(md, allow_n1=allow_n1)
 
 
-def _auto_test_simple(md: MethylData) -> str:
+# One-shot warning gate: ``tl.dmc`` emits a UserWarning the first time a
+# user explicitly selects ``test="fisher"`` in a session. We don't want to
+# spam them across thousands of chromosomes/sites — once is enough.
+_FISHER_WARNED = False
+
+
+def _warn_fisher_once() -> None:
+    """Emit a one-shot UserWarning when the user explicitly picks fisher."""
+    global _FISHER_WARNED
+    if _FISHER_WARNED:
+        return
+    _FISHER_WARNED = True
+    import warnings
+    warnings.warn(
+        "test='fisher' ignores between-replicate variance; p-values are "
+        "anti-conservative. Prefer test='lr' at n >= 2.",
+        UserWarning, stacklevel=3,
+    )
+
+
+def _check_n1_and_union_footgun(
+    md: MethylData,
+    allow_n1: bool,
+    min_samples_case: int,
+    min_samples_control: int,
+    unit: str = "sites",
+) -> None:
+    """Enforce n>=2 per group (unless allow_n1) and warn on union+0/0 (B6/B8)."""
+    if min(len(md.treatment_ids), len(md.control_ids)) < 2 and not allow_n1:
+        _auto_test_simple(md, allow_n1=False)  # raises ValueError
+    unite_info = md.uns.get("unite")
+    if (
+        unite_info is not None
+        and unite_info.get("type") == "union"
+        and min_samples_case == 0
+        and min_samples_control == 0
+    ):
+        import warnings
+        warnings.warn(
+            f"unite='union' with min_samples_case=min_samples_control=0 will "
+            f"test {unit} covered in only one sample per group. Recommended: "
+            f"both >= 2 (or unite='intersect').",
+            UserWarning, stacklevel=3,
+        )
+
+
+def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
     """Pick a sensible test based on group size.
 
     Current default at n>=2: ``"lr"`` — the quasi-binomial likelihood-ratio
@@ -51,17 +96,38 @@ def _auto_test_simple(md: MethylData) -> str:
     LR is closer to nominal type-I error than the score test at the small
     samples (n=6) and boundary proportions typical in WGBS.
 
+    The default returned here MUST match the CLI ``--test`` default (lr) and
+    the ``--test`` default for ``dmr`` (lr). See cli.py for the single source
+    of truth.
+
     The score test (``test="score"``) is still available for users who want
     a marginally more powerful (but mildly anti-conservative at the
     boundaries) statistic on the same accumulators.
 
     At n=1 (single replicate per group) there is no between-replicate
-    variability for φ̂ to estimate, so we fall back to Fisher exact with the
-    understanding that no statistical test is genuinely reliable in that
-    regime.
+    variability for φ̂ to estimate. By default this is treated as a hard error
+    (statistical inference is not credible). Pass ``allow_n1=True`` to opt
+    into the Fisher exact fallback (anti-conservative; warns at runtime).
     """
     min_group = min(len(md.treatment_ids), len(md.control_ids))
     if min_group < 2:
+        if not allow_n1:
+            raise ValueError(
+                f"At least 2 replicates per group are required for valid "
+                f"statistical inference (got treatment={len(md.treatment_ids)}, "
+                f"control={len(md.control_ids)}). To proceed anyway with "
+                f"Fisher exact on pooled reads (no between-replicate variance), "
+                f"pass allow_n1=True to ep.tl.dmc(). Be aware p-values from "
+                f"this path are anti-conservative and should not be reported "
+                f"as evidence of differential methylation."
+            )
+        import warnings
+        warnings.warn(
+            "n<2 per group: falling back to Fisher exact on pooled reads. "
+            "Between-replicate variance is ignored and p-values are anti-conservative.",
+            UserWarning,
+            stacklevel=3,
+        )
         return "fisher"
     return "lr"
 
@@ -121,6 +187,7 @@ def dmc(
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
+    allow_n1: bool = False,
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -146,18 +213,27 @@ def dmc(
         that union-introduced zero-coverage rows aren't treated as real
         observations.
     """
-    selected_test = _auto_test(md) if test == "auto" else test
+    # Unconditional n=1 guard: applies whether test is "auto" or explicit.
+    # _auto_test_simple raises ValueError when allow_n1=False; trigger that
+    # check up front so explicit test="lr"/"fisher" with n<2 also gets
+    # caught instead of silently running on degenerate data.
+    _check_n1_and_union_footgun(
+        md, allow_n1, min_samples_case, min_samples_control,
+    )
+    selected_test = _auto_test(md, allow_n1=allow_n1) if test == "auto" else test
+    if selected_test == "fisher":
+        _warn_fisher_once()
     unite_info = md.uns.get("unite")
     unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
 
     result = process_chromosomes_dmc(
         methylstore_path=md.store,
-        samples_case=md.treatment_ids,
+        samples_treatment=md.treatment_ids,
         samples_control=md.control_ids,
         test=selected_test,
         chromosomes=chromosomes,
         unite=unite,
-        min_samples_case=min_samples_case,
+        min_samples_treatment=min_samples_case,
         min_samples_control=min_samples_control,
         dispersion=dispersion,
         reference=reference,
@@ -175,6 +251,10 @@ def dmc(
         "min_samples_control": min_samples_control,
         "dispersion": dispersion,
         "reference": reference,
+        # S5: explicit pointer so MethylData.get_dmc() / .dmc resolve to the
+        # table the user just wrote, regardless of which other tests have
+        # been run in the same session.
+        "last_key": key,
     }
 
 
@@ -203,6 +283,8 @@ def dmr(
     alpha: float = 0.05,
     min_abs_meth_diff: float = 0.1,
     min_mean_qvalue: float | None = 0.05,
+    # Replicate-count guard --------------------------------------------------
+    allow_n1: bool = False,
 ) -> None:
     """Run DMR calling and store result in ``md.uns['dmr']``.
 
@@ -250,11 +332,16 @@ def dmr(
         DMR set.
     """
     if method == "tile":
+        _check_n1_and_union_footgun(
+            md, allow_n1, min_samples_case, min_samples_control, unit="tiles",
+        )
         selected_test = (
-            _auto_test(md, design=design, covariates=covariates)
+            _auto_test(md, design=design, covariates=covariates, allow_n1=allow_n1)
             if test == "auto"
             else test
         )
+        if selected_test == "fisher":
+            _warn_fisher_once()
         unite_info = md.uns.get("unite")
         unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
 
@@ -280,7 +367,7 @@ def dmr(
 
         dmr_df = call_dmr_tile_based(
             methylstore_path=md.store,
-            samples_case=md.treatment_ids,
+            samples_treatment=md.treatment_ids,
             samples_control=md.control_ids,
             tile_size_bp=tile_size_bp,
             test=selected_test,
@@ -289,7 +376,7 @@ def dmr(
             alpha=alpha,
             min_abs_meth_diff=min_abs_meth_diff,
             unite=unite,
-            min_samples_case=min_samples_case,
+            min_samples_treatment=min_samples_case,
             min_samples_control=min_samples_control,
             dispersion=dispersion,
             reference=reference,

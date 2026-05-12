@@ -1,35 +1,16 @@
 """Bismark .cov → partitioned Parquet converter.
 
-Changes vs previous version:
-  - Strand note: Bismark merged .cov files do not carry explicit strand
-    information in the data columns. Strand inference requires a reference
-    FASTA and is tracked as BIO-1 in plan.md.  For now, strand is stored
-    as "+" for cytosines whose 0-based start position carries a C in the
-    reference, and "-" otherwise — but only when a reference is supplied
-    via the optional `reference_fasta` argument. Without a reference the
-    field defaults to "*" as before, and CpG-pair merging (BIO-2) is
-    deferred to a post-conversion step once strand is known.
-  - context column added ("CpG" default; expandable to CHG/CHH).
-  - Minor: use str.removeprefix instead of str.replace for robustness.
+Coordinate system: ``start`` is treated as **0-based** (BED-format), which
+is what ``bismark2bedGraph`` and nf-core/methylseq emit. The 1-based
+output of ``bismark_methylation_extractor --comprehensive`` /
+``coverage2cytosine`` must be pre-shifted by -1 before being passed here;
+otherwise every CpG ends up offset by 1 bp relative to GTF / CpG-island
+annotations. (Quick check: a 0-based file has ``start = end - 1``; a
+1-based file has ``start == end``.)
 
-Coordinate system (FIX-7)
---------------------------
-This converter treats the ``start`` column of .cov files as a **0-based**
-position, storing it verbatim as the ``pos`` column in the Parquet store.
-This is correct for files produced by ``bismark2bedGraph`` (BED-format,
-0-based half-open intervals), which is the output format used by
-nf-core/methylseq ``*.cov.gz`` files.
-
-**Important**: ``bismark_methylation_extractor --comprehensive`` can produce
-**1-based** coverage reports (``CX_report`` / ``coverage2cytosine`` output).
-Those files require ``start - 1`` before storing.  Do **not** pass 1-based
-Bismark extractor output directly to this converter without pre-converting
-coordinates; doing so will shift every CpG position by +1 bp relative to
-annotation features and CpG island intervals.
-
-If you are unsure which format your files are in, inspect the first few
-lines: a 0-based file will show ``start = end - 1`` for CpG sites (1 bp
-wide), whereas a 1-based file will show ``start == end``.
+Strand: not present in Bismark merged .cov files. When ``reference_fasta``
+is provided, strand is inferred from the reference base at ``pos`` (``+``
+for C, ``-`` otherwise); without a reference it defaults to ``*``.
 """
 
 from __future__ import annotations
@@ -57,9 +38,7 @@ _COV_SCHEMA: dict[str, type[pl.DataType]] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Manifest helpers
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class _SampleManifest:
@@ -155,9 +134,7 @@ def _promote_sample_dir(temp_sample_dir: Path, final_sample_dir: Path) -> None:
             shutil.rmtree(backup_dir)
 
 
-# ---------------------------------------------------------------------------
 # CpG strand merging (BIO-2)
-# ---------------------------------------------------------------------------
 
 def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
     """Merge + and - strand CpG pairs into single sites at the + strand position.
@@ -234,9 +211,7 @@ def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
     return merged.sort("pos")
 
 
-# ---------------------------------------------------------------------------
 # Optional strand inference
-# ---------------------------------------------------------------------------
 
 def _infer_strand(df: pl.DataFrame, reference_fasta: str) -> pl.Series:
     """Infer strand from reference sequence for each CpG position.
@@ -290,9 +265,7 @@ def _infer_strand(df: pl.DataFrame, reference_fasta: str) -> pl.Series:
     return pl.Series("strand", strands, dtype=pl.Utf8)
 
 
-# ---------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
 
 def convert_sample(
     input_path: str,

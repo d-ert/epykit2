@@ -1,75 +1,27 @@
 """Differential methylation calling (DMC) on partitioned Parquet stores.
 
-Memory model
-------------
-The previous implementation kept per-replicate beta arrays and, for
-beta_binomial, per-replicate meth/coverage matrices stacked into an
-(n_sites × n_replicates) array before running the test.  For chr1 with
-42 M CpGs (outer-join / unite=False) and 6 samples that was ~2 GB for
-the float64 count matrix alone, causing OOM.
+Per-replicate state is accumulated via Welford's online algorithm, so peak
+memory is O(n_sites) per chromosome, independent of sample count.
 
-This version replaces all per-replicate accumulation with Welford's online
-algorithm.  Peak memory per chromosome is now strictly O(n_sites):
-
-    Fisher (pooled): 4 int64 running sums (meth/cov × case/ctrl)
-    CMH (stratified): 4 float64 accumulators + case data cached at int32
-    beta_binomial:   6 arrays per group — float64 mean, float64 M2,
-                     int32 n_valid — derived from Welford updates
-
-This scaling is independent of sample count (for non-CMH paths), so the
-same code handles 20+ samples on 40 M+ sites without additional memory
-pressure.
-
-Statistical tests
------------------
-  score        — (RECOMMENDED DEFAULT) Quasi-binomial score test for
-                 differential methylation, with a chromosome-level
-                 overdispersion correction estimated from Pearson residuals
-                 under the full model. The score statistic is computed on
-                 per-group count sums (M_case, N_case, M_ctrl, N_ctrl) under
-                 H0: π_case = π_ctrl, and the variance is inflated by the
-                 global dispersion ϕ̂ to account for between-replicate
-                 variability. This matches methylKit's
-                 calculateDiffMeth(overdispersion='MN', test='Chisq') and is
-                 the closest in-tree analogue to the DSS workflow without
-                 empirical-Bayes per-site dispersion shrinkage. Streaming /
-                 single-pass: no per-sample caching is needed.
-  fisher       — Fisher exact on reads POOLED across replicates. Fast and
-                 widely understood, but ignores between-replicate variance
-                 and is anti-conservative at high WGBS coverage. Emits a
-                 warning when called. Use for parity with single-rep tools
-                 only.
-  cmh          — Cochran-Mantel-Haenszel with one 2×2 stratum per
-                 (case_i, ctrl_j) pair. Preserves between-sample variance
-                 via the per-stratum variance term.
-  logit_t      — Welch t-test on logit-transformed per-replicate beta values
-                 derived from Welford accumulators. Variance-stabilising;
-                 fallback when count-model assumptions are doubtful (e.g.
-                 very low coverage).
-  beta_binomial — Welch t-test on per-replicate beta values (untransformed).
-                 Despite the name, this is NOT a beta-binomial GLM. Use
-                 ``score`` for a real count-based test with overdispersion.
-
-Biological fixes:
-  BIO-3: equal-weight per-replicate beta averaging via Welford mean
-         (mathematically identical to nanmean, but O(n_sites) memory).
-  BIO-4: missing sites filled with 0 counts; excluded from beta mean
-         via the n_valid counter in Welford accumulators.
-  BIO-5 (this revision): the previous "cmh" / "fisher" path pooled all
-         control reads into a single super-sample and ran one stratum
-         per case sample against that pool. This is equivalent to Fisher
-         exact on pooled reads (with inflated effective N), not a
-         properly stratified CMH. The two paths are now distinct:
-         "fisher" calls fisher_exact_vectorized on per-group read sums,
-         and "cmh" implements true per-pair stratification.
-  BIO-6 (this revision): log2_odds_ratio now uses a symmetric clamp on
-         both group means in [epsilon, 1-epsilon], so the OR is bounded
-         even when one group has β=1 or β=0 exactly. Previously the
-         numerator mean/(1-mean) could diverge to ±inf.
-  BIO-7 (this revision): optional per-site min_samples guard drops sites
-         with fewer than `min_samples_case` / `min_samples_control` valid
-         replicates after the test. Avoids singleton-observation tests
-         in union (outer-join) mode.
+Tests
+-----
+  lr            — Quasi-binomial likelihood-ratio chi-square with per-site
+                  McCullagh-Nelder dispersion. Default; matches methylKit
+                  calculateDiffMeth(overdispersion='MN', test='Chisq').
+  score         — Pearson score on the same dispersion-corrected
+                  accumulators as lr. Marginally more powerful but mildly
+                  anti-conservative at π̂ near 0/1.
+  glm           — Binomial GLM via batched IRLS (see _glm.py). Required for
+                  covariate-adjusted designs.
+  logit_t       — Welch t on logit(beta) via Welford. Variance-stabilising
+                  fallback.
+  beta_binomial — Welch t on raw betas. NOT a beta-binomial GLM despite the
+                  name; kept for backward compatibility.
+  cmh           — Cochran-Mantel-Haenszel with one 2×2 stratum per
+                  (case_i, ctrl_j) pair.
+  fisher        — Fisher exact on reads pooled across replicates. Ignores
+                  between-replicate variance; anti-conservative. Warns once
+                  per session.
 """
 
 from __future__ import annotations
@@ -109,9 +61,40 @@ _TEST_RECOMMENDATIONS = {
 _BETA_EPSILON: float = 1e-6
 
 
-# ---------------------------------------------------------------------------
+def _resolve_treatment_aliases(
+    samples_treatment, samples_case, min_samples_treatment, min_samples_case
+):
+    """Resolve deprecated samples_case / min_samples_case kwargs (S9).
+
+    Returns ``(samples_treatment, min_samples_treatment)`` with the
+    deprecation warning fired iff the legacy alias was used.
+    """
+    if samples_case is not None:
+        warnings.warn(
+            "samples_case is deprecated; use samples_treatment.",
+            DeprecationWarning, stacklevel=3,
+        )
+        if samples_treatment is not None:
+            raise TypeError("Pass either samples_treatment or samples_case, not both")
+        samples_treatment = samples_case
+    if samples_treatment is None:
+        raise TypeError("Missing required argument: samples_treatment")
+    if min_samples_case is not None:
+        warnings.warn(
+            "min_samples_case is deprecated; use min_samples_treatment.",
+            DeprecationWarning, stacklevel=3,
+        )
+        if min_samples_treatment is not None:
+            raise TypeError(
+                "Pass either min_samples_treatment or min_samples_case, not both"
+            )
+        min_samples_treatment = min_samples_case
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
+    return samples_treatment, min_samples_treatment
+
+
 # Core statistical tests (public, used by unit tests)
-# ---------------------------------------------------------------------------
 
 def fisher_exact_vectorized(
     meth_a: np.ndarray,
@@ -294,9 +277,7 @@ def _beta_binom_statsmodels(
     return pvals, meth_diff
 
 
-# ---------------------------------------------------------------------------
 # CMH test — O(n_sites) memory, statistically correct for replicates
-# ---------------------------------------------------------------------------
 
 def _cmh_init(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Allocate CMH accumulators. Memory: ~32 bytes × n_sites total."""
@@ -380,9 +361,7 @@ def _cmh_finalize(
     return pvals, log2_mh_or
 
 
-# ---------------------------------------------------------------------------
 # Welford online statistics — O(n_sites) memory regardless of n_samples
-# ---------------------------------------------------------------------------
 
 def _welford_init(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Allocate Welford accumulators for n sites.
@@ -483,7 +462,6 @@ def _safe_log2_odds_ratio(
         return np.log2(odds_case / odds_ctrl)
 
 
-# ---------------------------------------------------------------------------
 # Quasi-binomial score test with chromosome-level overdispersion correction
 # (a.k.a. "Version 1" of the count-model DMC family).
 #
@@ -512,7 +490,6 @@ def _safe_log2_odds_ratio(
 # replicates* via φ̂, not with the number of pooled reads), it is a real
 # count-based test (does not throw away the information that 5/10 carries
 # less weight than 500/1000), and it is single-pass / O(n_sites) memory.
-# ---------------------------------------------------------------------------
 
 def _score_init(
     n: int,
@@ -912,10 +889,18 @@ def _beta_binom_mom_from_welford_logit(
 
     pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
 
-    # Mark degenerate cases
+    # Mark degenerate cases. B3.2: a site where EITHER group has zero
+    # observed between-replicate variance (M2 = 0 with n_valid >= 2 — i.e.
+    # all covered replicates returned identical β by binomial sampling
+    # chance) cannot have a valid Welch t. The other group's variance still
+    # produces a non-zero SE, so the t-stat fires; under H0 at boundary β
+    # this produces ~50% false-positive rate. Treat as NaN.
+    zero_var_case = (n_valid_case >= 2) & (M2_case <= 0.0)
+    zero_var_ctrl = (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
     degenerate = (
         np.isnan(mean_case) | np.isnan(mean_ctrl) | np.isnan(t_stat)
         | (n_valid_case == 0) | (n_valid_ctrl == 0)
+        | zero_var_case | zero_var_ctrl
     )
     pvals[degenerate] = np.nan
 
@@ -962,9 +947,16 @@ def _beta_binom_mom_from_welford(
 
     pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
 
+    # B3.2: same zero-variance check as the logit_t path — if either
+    # group has all-identical replicates (M2 = 0, n_valid >= 2), the
+    # single-group SE is artificially small and the Welch t-test is
+    # anti-conservative. Treat as NaN.
+    zero_var_case = (n_valid_case >= 2) & (M2_case <= 0.0)
+    zero_var_ctrl = (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
     degenerate = (
         np.isnan(mean_case) | np.isnan(mean_ctrl) | np.isnan(t_stat)
         | (n_valid_case == 0) | (n_valid_ctrl == 0)
+        | zero_var_case | zero_var_ctrl
     )
     pvals[degenerate] = np.nan
 
@@ -976,9 +968,7 @@ def _beta_binom_mom_from_welford(
     return pvals, log2_ors
 
 
-# ---------------------------------------------------------------------------
 # Internal per-chromosome helpers
-# ---------------------------------------------------------------------------
 
 def _detect_chromosomes(methylstore_path: Path) -> list[str]:
     chroms: set[str] = set()
@@ -1209,16 +1199,10 @@ def _process_one_chromosome(
         # makes the pooling explicit and routes it through the well-tested
         # fisher_exact_vectorized() helper.
         #
-        # NOTE: this test ignores between-replicate variability. Use
-        # logit_t or beta_binomial for replicate-aware testing at n ≥ 3.
-        warnings.warn(
-            "test='fisher' pools reads across replicates; "
-            "between-sample variance is ignored and p-values may be "
-            "anti-conservative at WGBS coverage. "
-            "Prefer test='logit_t' or test='cmh' for n ≥ 3 replicates.",
-            UserWarning,
-            stacklevel=2,
-        )
+        # NOTE: this test ignores between-replicate variability. The user
+        # facing warning fires once per call from
+        # ``_validate_sample_size_and_warn`` — not here, to avoid the
+        # per-chromosome warning spam this used to produce.
         meth_case_sum = np.zeros(n_sites, dtype=np.int64)
         cov_case_sum  = np.zeros(n_sites, dtype=np.int64)
         meth_ctrl_sum = np.zeros(n_sites, dtype=np.int64)
@@ -1531,10 +1515,16 @@ def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
         )
 
     if test == "fisher" and min_n >= 2:
-        logger.info(
-            "Tip: 'fisher' pools reads across replicates and ignores between-"
-            "replicate variance. At n>=2 the 'lr' test is statistically "
-            "preferable (quasi-binomial likelihood-ratio with MN dispersion)."
+        # Fires once per process_chromosomes_dmc() call (not per chromosome).
+        # tl.dmc gates its own one-shot-per-session warning on top of this;
+        # direct API users see this every call.
+        warnings.warn(
+            "test='fisher' pools reads across replicates; between-sample "
+            "variance is ignored and p-values may be anti-conservative at "
+            "WGBS coverage. Prefer test='lr' at n>=2 (quasi-binomial LR "
+            "with MN dispersion).",
+            UserWarning,
+            stacklevel=3,
         )
 
     if max_n / min_n > 2:
@@ -1544,24 +1534,25 @@ def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
 
 def process_chromosomes_dmc(
     methylstore_path: str,
-    samples_case: list[str],
-    samples_control: list[str],
+    samples_treatment: Optional[list[str]] = None,
+    samples_control: Optional[list[str]] = None,
     test: str = "lr",
     chromosomes: Optional[list[str]] = None,
     unite: bool = True,
-    min_samples_case: int = 0,
+    min_samples_treatment: Optional[int] = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
     design_full: Optional[np.ndarray] = None,
     design_reduced: Optional[np.ndarray] = None,
     coef_idx: Optional[int] = None,
+    *,
+    samples_case: Optional[list[str]] = None,       # deprecated alias
+    min_samples_case: Optional[int] = None,         # deprecated alias
 ) -> pl.DataFrame:
     """Process differential methylation for all chromosomes.
 
@@ -1633,6 +1624,15 @@ def process_chromosomes_dmc(
         unweighted per-replicate mean (Welford). The two differ when
         per-replicate coverage is uneven.
     """
+    samples_treatment, min_samples_treatment = _resolve_treatment_aliases(
+        samples_treatment, samples_case, min_samples_treatment, min_samples_case
+    )
+    if samples_control is None:
+        raise TypeError("Missing required argument: samples_control")
+    # Internal body keeps the original names.
+    samples_case = samples_treatment
+    min_samples_case = min_samples_treatment
+
     store       = Path(methylstore_path)
     all_samples = samples_case + samples_control
 

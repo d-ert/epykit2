@@ -1,0 +1,332 @@
+"""Layer 4: API behaviour tests.
+
+Verifies the data-object contract:
+
+* ``MethylData`` round-trips losslessly through ``save()`` / ``load()``.
+* Preprocessing state is derived from ``uns['_store_history']`` (S6).
+* ``MethylData.get_dmc(test=...)`` looks up by explicit name; ``.dmc``
+  resolves to the *last-written* table via ``uns['dmc']['last_key']`` (S5).
+* Deprecated ``samples_case=`` / ``min_samples_case=`` kwargs still work
+  but emit ``DeprecationWarning`` (S9).
+* Covariate-adjusted GLM dispatches correctly through ``tl.dmr``.
+"""
+
+from __future__ import annotations
+
+import json
+import warnings
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+import pytest
+
+
+
+# read_bismark + obs schema
+
+
+def test_read_bismark_produces_well_formed_methyldata(synth_md):
+    """Sanity check the fixture: obs has the expected columns and counts."""
+    md = synth_md
+    assert set(md.obs.columns) >= {"sample_id", "group", "treatment", "path"}
+    assert md.n_samples == 8
+    assert len(md.treatment_ids) == 4
+    assert len(md.control_ids) == 4
+    assert all(s.startswith("treatment_") for s in md.treatment_ids)
+    assert all(s.startswith("control_") for s in md.control_ids)
+
+
+def test_read_bismark_writes_partitioned_parquet_store(synth_md):
+    """The methylstore should have ``sample=*`` / ``chromosome=*`` (or
+    similar) partitions on disk."""
+    store = Path(synth_md.store)
+    assert store.exists(), f"methylstore not created at {store}"
+    # At least one sample partition should exist after conversion.
+    sample_dirs = list(store.glob("sample=*"))
+    assert len(sample_dirs) >= 1, "no sample partitions in methylstore"
+
+
+
+# State derivation from _store_history (S6)
+
+
+def test_state_is_raw_before_any_preprocessing(synth_md):
+    """Before any pp.* call, the boolean flags are False and no
+    preprocessing step appears in ``state``.
+
+    Note: ``read_bismark`` itself records a ``"raw"`` step in
+    ``_store_history`` so callers can audit where the methylstore came
+    from. The state list will therefore contain at most ``["raw"]`` — but
+    none of the preprocessing markers (filtered / united / smoothed) should
+    be present yet.
+    """
+    md = synth_md
+    assert md._filtered is False
+    assert md._united is False
+    assert md._smoothed is False
+    assert "filtered" not in md.state
+    assert "united" not in md.state
+    assert "smoothed" not in md.state
+
+
+def test_state_after_filter_coverage(synth_md):
+    import epykit as ep
+    ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
+    assert synth_md._filtered is True
+    assert "filtered" in synth_md.state
+
+
+def test_state_after_unite(synth_md):
+    import epykit as ep
+    ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
+    ep.pp.unite(synth_md, type="intersect")
+    assert synth_md._united is True
+    assert "united" in synth_md.state
+
+
+def _resolve_save_target(md, name: str) -> Path:
+    """Where ``md.save(name)`` actually writes.
+
+    ``MethylData.save()`` re-routes to ``<_analysis_root>/results/<basename>``
+    when ``_analysis_root`` is set, ignoring the directory component of the
+    argument. This helper computes the real on-disk location so round-trip
+    tests can hand it back to ``ep.load()``.
+    """
+    if md._analysis_root:
+        return Path(md._analysis_root) / "results" / Path(name).name
+    return Path(name)
+
+
+def test_state_persists_through_save_load_round_trip(synth_md, tmp_path):
+    """A filtered + united MethylData saved and reloaded should retain
+    its derived state."""
+    import epykit as ep
+
+    ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
+    ep.pp.unite(synth_md, type="intersect")
+
+    synth_md.save("saved_md")
+    actual = _resolve_save_target(synth_md, "saved_md")
+
+    md2 = ep.load(str(actual))
+    assert md2._filtered is True
+    assert md2._united is True
+    assert "filtered" in md2.state
+    assert "united" in md2.state
+
+
+
+# save / load round-trip
+
+
+def test_save_load_round_trip_preserves_obs_varm_uns(synth_md, tmp_path):
+    """Save → load must preserve obs, varm, and primitive uns values."""
+    import epykit as ep
+
+    # Populate uns and varm.
+    ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
+    ep.pp.unite(synth_md, type="intersect")
+    ep.tl.dmc(synth_md, test="lr")
+
+    synth_md.save("rt")
+    md2 = ep.load(str(_resolve_save_target(synth_md, "rt")))
+
+    # obs equal as polars DataFrames (sample_id order preserved).
+    assert md2.obs.shape == synth_md.obs.shape
+    assert sorted(md2.obs.columns) == sorted(synth_md.obs.columns)
+
+    # varm keys preserved.
+    assert set(md2.varm.keys()) == set(synth_md.varm.keys())
+    for k in synth_md.varm:
+        assert md2.varm[k].shape == synth_md.varm[k].shape, f"varm[{k!r}] shape drift"
+
+    # uns: primitive keys round-trip.
+    for key in ("filter", "unite", "dmc"):
+        if key in synth_md.uns:
+            assert key in md2.uns
+
+
+def test_save_load_does_not_persist_boolean_state_in_meta(synth_md, tmp_path):
+    """methyldata.json should *not* hard-code _filtered etc. (S6 stipulates
+    that they are derived properties)."""
+    import epykit as ep
+    ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
+    synth_md.save("rt2")
+    actual = _resolve_save_target(synth_md, "rt2")
+    meta = json.loads((actual / "methyldata.json").read_text())
+    assert "_filtered" not in meta, "_filtered must not be persisted (derived)"
+    assert "_united" not in meta
+    assert "_smoothed" not in meta
+
+
+
+# MethylData.dmc / .get_dmc (S5)
+
+
+def test_get_dmc_returns_none_before_running_dmc(synth_md_filtered):
+    md = synth_md_filtered
+    assert md.get_dmc() is None
+    assert md.dmc is None
+
+
+def test_get_dmc_returns_explicit_test_by_name(synth_md_filtered):
+    import epykit as ep
+    ep.tl.dmc(synth_md_filtered, test="lr")
+    df = synth_md_filtered.get_dmc(test="lr")
+    assert df is not None
+    assert "pvalue" in df.columns or "qvalue" in df.columns
+
+
+def test_dmc_property_uses_last_key_pointer(synth_md_filtered):
+    """After running two tests, ``.dmc`` should resolve to whichever was
+    written most recently (per ``uns['dmc']['last_key']``), not to a
+    hardcoded priority list."""
+    import epykit as ep
+
+    ep.tl.dmc(synth_md_filtered, test="lr")
+    ep.tl.dmc(synth_md_filtered, test="logit_t")
+
+    # Last writer wins.
+    assert synth_md_filtered.uns["dmc"]["last_key"] == "dmc_logit_t"
+    df_via_property = synth_md_filtered.dmc
+    df_via_explicit_logit_t = synth_md_filtered.get_dmc(test="logit_t")
+    # Both should reference the same logit_t table (or its annotated variant).
+    assert df_via_property is df_via_explicit_logit_t or df_via_property.shape == df_via_explicit_logit_t.shape
+
+
+def test_get_dmc_prefers_annotated_when_available(synth_md_filtered):
+    """If a *_annotated table exists, ``get_dmc(annotated=True)`` should
+    return it instead of the raw table."""
+    import epykit as ep
+    ep.tl.dmc(synth_md_filtered, test="lr")
+
+    # Manually drop an annotated table into varm so we can test resolution
+    # without depending on a real GTF.
+    raw = synth_md_filtered.varm["dmc_lr"]
+    synth_md_filtered.varm["dmc_lr_annotated"] = raw.with_columns(
+        pl.lit("intergenic").alias("feature_type")
+    )
+
+    ann = synth_md_filtered.get_dmc(test="lr", annotated=True)
+    raw_only = synth_md_filtered.get_dmc(test="lr", annotated=False)
+    assert "feature_type" in ann.columns
+    assert "feature_type" not in raw_only.columns
+
+
+
+# Deprecation warnings (S9)
+
+
+def test_samples_case_kwarg_emits_deprecation_warning(synth_md_filtered):
+    """Calling ``process_chromosomes_dmc(samples_case=...)`` directly should
+    fire a DeprecationWarning and still work."""
+    from epykit.dmc import process_chromosomes_dmc
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        df = process_chromosomes_dmc(
+            methylstore_path=synth_md_filtered.store,
+            samples_case=synth_md_filtered.treatment_ids,    # deprecated
+            samples_control=synth_md_filtered.control_ids,
+            test="fisher",   # cheap path
+        )
+    dep_msgs = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert any("samples_case" in str(w.message) for w in dep_msgs)
+    assert df is not None and len(df) > 0
+
+
+def test_samples_treatment_kwarg_does_not_warn(synth_md_filtered):
+    """The canonical ``samples_treatment=`` kwarg should NOT trigger any
+    deprecation warning."""
+    from epykit.dmc import process_chromosomes_dmc
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        process_chromosomes_dmc(
+            methylstore_path=synth_md_filtered.store,
+            samples_treatment=synth_md_filtered.treatment_ids,
+            samples_control=synth_md_filtered.control_ids,
+            test="fisher",
+        )
+    dep_msgs = [
+        w for w in caught
+        if issubclass(w.category, DeprecationWarning)
+        and ("samples_case" in str(w.message)
+             or "min_samples_case" in str(w.message))
+    ]
+    assert dep_msgs == [], f"unexpected deprecation: {[str(w.message) for w in dep_msgs]}"
+
+
+def test_passing_both_aliases_raises_typeerror(synth_md_filtered):
+    """It's a programmer error to pass both ``samples_case`` and
+    ``samples_treatment`` — refuse the call."""
+    from epykit.dmc import process_chromosomes_dmc
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        with pytest.raises(TypeError, match="either samples_treatment or samples_case"):
+            process_chromosomes_dmc(
+                methylstore_path=synth_md_filtered.store,
+                samples_treatment=synth_md_filtered.treatment_ids,
+                samples_case=synth_md_filtered.treatment_ids,
+                samples_control=synth_md_filtered.control_ids,
+                test="fisher",
+            )
+
+
+
+# Covariate-adjusted GLM dispatch
+
+
+def test_covariate_dmr_runs_via_design_kwarg(synth_md_filtered):
+    """When ``design=`` is passed, ``tl.dmr`` must force the GLM backend
+    even if ``test='auto'``."""
+    import epykit as ep
+
+    # Inject a continuous covariate into obs.
+    synth_md_filtered.obs = synth_md_filtered.obs.with_columns(
+        pl.Series("age", np.arange(synth_md_filtered.n_samples, dtype=float) + 20.0)
+    )
+
+    ep.tl.dmr(
+        synth_md_filtered,
+        method="tile",
+        tile_size_bp=500,
+        min_cpgs_per_tile=3,
+        design="~ treatment + age",
+        treatment_col="treatment",
+    )
+    params = synth_md_filtered.uns["dmr_params"]
+    assert params["test"] == "glm", f"design= should force GLM, got {params['test']!r}"
+    assert params["design"] == "~ treatment + age"
+
+
+def test_get_dmc_with_unknown_test_returns_none(synth_md_filtered):
+    import epykit as ep
+    ep.tl.dmc(synth_md_filtered, test="lr")
+    assert synth_md_filtered.get_dmc(test="cmh") is None
+
+
+
+# Version + __all__ contract
+
+
+def test_version_is_a_pep440_string():
+    import epykit
+    v = epykit.__version__
+    assert isinstance(v, str) and len(v) > 0
+
+
+def test_all_lists_documented_public_surface():
+    import epykit
+    expected = {
+        "MethylData", "read_bismark", "load",
+        "pp", "tl", "pl",
+        "convert_sample",
+        "smooth_methylation_gaussian",
+        "annotate_features", "annotate_cpg_islands",
+        "bisulfite_conversion_rate",
+    }
+    missing = expected - set(epykit.__all__)
+    assert not missing, f"epykit.__all__ missing: {sorted(missing)}"

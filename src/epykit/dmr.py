@@ -1,56 +1,22 @@
 """Differentially Methylated Region (DMR) calling.
 
-Two complementary algorithms are exposed:
+Two algorithms:
 
-call_dmr_sliding_window(dmc_results, ...)
-    Operates on a precomputed per-CpG DMC table. Slides a window across the
-    genome, collects per-CpG p-values within each window, and combines them
-    via signed Stouffer's Z. Best when you already have a DMC table and
-    want a cheap region-level summary.
+``call_dmr_tile_based(methylstore_path, samples_treatment, samples_control,
+...)``
+    methylKit-parity tile aggregation: sums (N_meth, coverage) across CpGs
+    per sample within each fixed-size tile, then runs a full DMC test on
+    the tile-level counts. Recommended path.
 
-call_dmr_tile_based(methylstore_path, samples_case, samples_control, ...)
-    Operates directly on the methylstore. For each fixed-size tile, sums
-    N_meth and coverage across CpGs PER SAMPLE, then runs the full DMC
-    test on the tile-level counts. This is the methylKit-style approach
-    (tileMethylCounts → calculateDiffMeth). Read-pooling within tiles
-    aggregates evidence across CpGs before testing, so windows whose
-    individual CpGs lack the per-site significance the sliding-window
-    method needs are still recovered. Recommended for methylKit parity
-    and for studies where per-CpG coverage is modest.
+``call_dmr_sliding_window(dmc_results, ...)``
+    Operates on a precomputed per-CpG DMC table; combines p-values per
+    window via signed Stouffer's Z. Faster but lower-power; sign comes
+    from each CpG's meth_diff so mixed-direction windows are downweighted.
+    Direction (hyper / hypo / mixed) is set by the sign of the mean
+    meth_diff rather than a raw site tally.
 
-Performance notes
------------------
-call_dmr_sliding_window
-  All window boundaries are generated with ``np.arange``, then
-  ``np.searchsorted`` locates each boundary in O(log n_sites). Per-window
-  CpG and significance counts are answered in O(1) using prefix cumulative
-  sums.
-
-smooth_methylation_bsmooth
-  Raw betas are projected onto a regular grid, smoothed with
-  scipy.ndimage.gaussian_filter1d (O(G) where G = grid size), then
-  interpolated back. ~500× faster than statsmodels LOESS on WGBS data.
-
-Statistical fixes vs previous revision
---------------------------------------
-BIO-9:  p-value combination uses signed Stouffer's Z instead of Brown's
-        method. Brown's required a correlation matrix of the test
-        statistics; the old implementation substituted a position-based
-        correlation between CpG states, which has the wrong scale and
-        systematically inflates the correlation factor f, dividing χ² and
-        weakening combined p-values. Signed Stouffer's is robust to mild
-        positive correlation without estimating it explicitly, and its
-        sign comes from each CpG's meth_diff so the test naturally
-        downweights mixed-direction windows.
-BIO-10: direction (hyper / hypo / mixed) is determined from the sign of
-        the mean meth_diff in the window, not from a tally of hyper vs
-        hypo sites. A window with 6 +0.12 sites and 4 -0.40 sites is now
-        correctly called "hypo" (or "mixed" when the sign tally is close)
-        rather than "hyper" by raw count.
-BIO-5 (cross-module): the new call_dmr_tile_based path provides
-        methylKit-parity DMR calling by aggregating reads within tiles
-        before testing. The sliding-window path is preserved as a
-        secondary, lower-power method.
+``smooth_methylation_gaussian`` is a coverage-weighted Gaussian-kernel
+approximation to BSmooth — see its own docstring.
 """
 
 from __future__ import annotations
@@ -111,9 +77,7 @@ _MAX_DMR_BP: int = 10_000
 _MIXED_DIRECTION_THRESHOLD: float = 0.6
 
 
-# ---------------------------------------------------------------------------
 # Internal helpers — p-value combination
-# ---------------------------------------------------------------------------
 
 def _stouffer_combine_signed(
     pvals: np.ndarray,
@@ -305,9 +269,7 @@ def _recompute_dmr_stats(
     }
 
 
-# ---------------------------------------------------------------------------
 # Public API — sliding-window DMR calling (works from a DMC table)
-# ---------------------------------------------------------------------------
 
 def call_dmr_sliding_window(
     dmc_results: pl.DataFrame,
@@ -470,9 +432,7 @@ def call_dmr_sliding_window(
     return dmr_df
 
 
-# ---------------------------------------------------------------------------
 # Public API — tile-based DMR calling (methylKit-style)
-# ---------------------------------------------------------------------------
 
 def _aggregate_sample_to_tiles(
     src_part_file: Path,
@@ -522,8 +482,8 @@ def _aggregate_sample_to_tiles(
 
 def call_dmr_tile_based(
     methylstore_path: str,
-    samples_case: list[str],
-    samples_control: list[str],
+    samples_treatment: list[str] | None = None,
+    samples_control: list[str] | None = None,
     tile_size_bp: int = 1000,
     test: str = "logit_t",
     chromosomes: list[str] | None = None,
@@ -531,13 +491,16 @@ def call_dmr_tile_based(
     alpha: float = 0.05,
     min_abs_meth_diff: float = 0.1,
     unite: bool = True,
-    min_samples_case: int = 0,
+    min_samples_treatment: int | None = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "chi2",
     design_full: np.ndarray | None = None,
     design_reduced: np.ndarray | None = None,
     coef_idx: int | None = None,
+    *,
+    samples_case: list[str] | None = None,         # deprecated alias
+    min_samples_case: int | None = None,           # deprecated alias
 ) -> pl.DataFrame:
     """Call DMRs by aggregating read counts within fixed-size tiles.
 
@@ -598,7 +561,19 @@ def call_dmr_tile_based(
                  mean_beta_case, mean_beta_control, meth_diff,
                  log2_odds_ratio, pvalue, qvalue, dmr_type.
     """
-    from .dmc import process_chromosomes_dmc, apply_multiple_testing_correction
+    from .dmc import (
+        process_chromosomes_dmc,
+        apply_multiple_testing_correction,
+        _resolve_treatment_aliases,
+    )
+
+    samples_treatment, min_samples_treatment = _resolve_treatment_aliases(
+        samples_treatment, samples_case, min_samples_treatment, min_samples_case
+    )
+    if samples_control is None:
+        raise TypeError("Missing required argument: samples_control")
+    samples_case = samples_treatment
+    min_samples_case = min_samples_treatment
 
     store       = Path(methylstore_path)
     all_samples = samples_case + samples_control
@@ -663,12 +638,12 @@ def call_dmr_tile_based(
 
         tile_dmc = process_chromosomes_dmc(
             methylstore_path=str(tile_store),
-            samples_case=samples_case,
+            samples_treatment=samples_case,
             samples_control=samples_control,
             test=test,
             chromosomes=chromosomes,
             unite=unite,
-            min_samples_case=min_samples_case,
+            min_samples_treatment=min_samples_case,
             min_samples_control=min_samples_control,
             dispersion=dispersion,
             reference=reference,
@@ -734,11 +709,9 @@ def call_dmr_tile_based(
     return dmr_df
 
 
-# ---------------------------------------------------------------------------
 # Public API — fast Gaussian smoothing (replaces statsmodels LOESS)
-# ---------------------------------------------------------------------------
 
-def smooth_methylation_bsmooth(
+def smooth_methylation_gaussian(
     methylstore_path: str,
     samples: list[str],
     bandwidth: int = 1000,
@@ -747,11 +720,18 @@ def smooth_methylation_bsmooth(
 ) -> pl.DataFrame | None:
     """Smooth per-sample beta values with a fast Gaussian kernel.
 
-    Implements the spirit of BSmooth pre-processing: within each chromosome
-    and sample, raw beta values are smoothed along the genomic axis.  The
-    implementation projects raw betas onto a regular grid, applies a Gaussian
-    filter (``scipy.ndimage.gaussian_filter1d``), then interpolates back to
-    the original CpG positions.  This is O(G) where G is the grid size,
+    .. note::
+       This is a Gaussian-kernel approximation, not the local-LOESS smoother
+       used by Hansen et al.'s BSmooth. The function was previously named
+       ``smooth_methylation_bsmooth``; that alias is kept for one
+       deprecation cycle. A true LOESS-based BSmooth implementation is on
+       the roadmap.
+
+    Within each chromosome and sample, raw beta values are smoothed along
+    the genomic axis. The implementation projects raw betas onto a regular
+    grid, applies a coverage-weighted Gaussian filter
+    (``scipy.ndimage.gaussian_filter1d``), then interpolates back to the
+    original CpG positions. This is O(G) where G is the grid size,
     versus O(n²) for LOESS — typically 100-500× faster on WGBS-scale data.
     """
     try:
@@ -855,3 +835,23 @@ def smooth_methylation_bsmooth(
         return pl.DataFrame(schema=_SMOOTH_EMPTY_SCHEMA)
 
     return pl.concat(records).sort(["chrom", "pos", "sample"])
+
+
+# Deprecated alias — remove in v0.3
+
+def smooth_methylation_bsmooth(*args, **kwargs):
+    """Deprecated alias for :func:`smooth_methylation_gaussian`.
+
+    The implementation is Gaussian convolution on a regular grid, not the
+    local LOESS used by Hansen et al.'s BSmooth. The old name was misleading.
+    """
+    import warnings
+    warnings.warn(
+        "smooth_methylation_bsmooth is deprecated; use "
+        "smooth_methylation_gaussian instead. The implementation is "
+        "Gaussian-kernel smoothing, not local LOESS, so the old name "
+        "misrepresented the method.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return smooth_methylation_gaussian(*args, **kwargs)

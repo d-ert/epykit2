@@ -59,7 +59,8 @@ def filter_coverage(
         blacklist_bed=blacklist_bed,
     )
     md.store = out
-    md._filtered = True
+    # _filtered is a derived property; appending to _store_history below is
+    # what makes md._filtered evaluate to True.
     md.uns["filter"] = {
         "lo_count": lo_count,
         "hi_perc": hi_perc,
@@ -149,8 +150,9 @@ def unite(md: MethylData, type: str = "union") -> None:
     if type not in {"intersect", "union"}:
         raise ValueError("type must be 'intersect' or 'union'")
 
-    md._united = True
+    # _united is a derived property — recording in uns is enough.
     md.uns["unite"] = {"type": type}
+    _append_store_history(md, "united", md.store, None)
 
 def smooth(
     md: MethylData,
@@ -198,7 +200,7 @@ def smooth(
             "Run ep.pp.filter_coverage(md) before ep.pp.smooth(md)."
         )
 
-    from .dmr import smooth_methylation_bsmooth
+    from .dmr import smooth_methylation_gaussian
 
     samples = md.obs.get_column("sample_id").to_list()
     
@@ -210,7 +212,7 @@ def smooth(
     
     logger.info(f"Running BSmooth smoothing to {smooth_path}...")
     
-    smooth_methylation_bsmooth(
+    smooth_methylation_gaussian(
         methylstore_path=md.store,
         samples=samples,
         bandwidth=bandwidth,
@@ -218,12 +220,13 @@ def smooth(
         output_path=smooth_path,
     )
     
-    md._smoothed = True
+    # _smoothed is a derived property — recording in uns is enough.
     md.uns["smooth_path"] = smooth_path
     md.uns["smooth_params"] = {
         "bandwidth": bandwidth,
         "grid_resolution_bp": grid_resolution_bp,
     }
+    _append_store_history(md, "smoothed", smooth_path, None)
     
     logger.info(
         f"✓ Smoothing complete ({len(samples)} samples, {bandwidth} bp bandwidth). "

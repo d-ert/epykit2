@@ -38,9 +38,7 @@ _EPS = 1e-9
 _PROP_CLIP = 1e-6
 
 
-# ---------------------------------------------------------------------------
 # Design matrix construction
-# ---------------------------------------------------------------------------
 
 def build_design(
     obs: pl.DataFrame,
@@ -173,9 +171,7 @@ def build_design(
     return X_full, X_reduced, coef_idx, term_names, formula_used
 
 
-# ---------------------------------------------------------------------------
 # Batched IRLS for the binomial GLM
-# ---------------------------------------------------------------------------
 
 def irls_binomial_batch(
     meth: np.ndarray,
@@ -366,9 +362,7 @@ def _solve_weighted_lsq(
     return beta
 
 
-# ---------------------------------------------------------------------------
 # Dispersion + reference-distribution helpers (shared with _score_finalize)
-# ---------------------------------------------------------------------------
 
 def compute_dispersion_phi(
     pearson_per_site: np.ndarray,

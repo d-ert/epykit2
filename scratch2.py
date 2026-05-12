@@ -32,68 +32,22 @@ sig = md.dmc.filter(pl.col('qvalue') < 0.05).height
 pct = 100 * sig / total
 
 print(f"Total sites tested: {total:,}")
-print(f"Significant DMCs: {sig:,}")
+print(f"Significant DMCs: {sig:,}")  
 print(f"Percentage: {pct:.2f}%")
 print(f"\nEffect size summary:")
 print(md.dmc.filter(pl.col('qvalue') < 0.05).select('meth_diff').describe())
 
-# ---------------------------------------------------------------------------
-# Covariate design: extract donor id from each sample name and add it to
-# md.obs as a categorical column. The samplesheet has ctrl_d3_*, cd55_d3_*,
-# ctrl_d4_*, cd55_d4_* — i.e. each donor (d3, d4) contributes a control and
-# a treated sample. Adding `donor` as a covariate runs the paired analysis.
-# ---------------------------------------------------------------------------
-md.obs = md.obs.with_columns(
-    pl.col("sample_id").str.extract(r"_(d\d+)_", 1).alias("donor")
-)
-print("\nSample → donor mapping:")
-print(md.obs.select(["sample_id", "group", "treatment", "donor"]))
-
-# --- Unpaired DMR (no covariate, current default behaviour) ----------------
 ep.tl.dmr(md, tile_size_bp=500, min_cpgs_per_tile=5)
-print(f"\nUnpaired tile DMR: {len(md.uns['dmr']):,} tiles")
-print(f"  significant (q<0.05): "
-      f"{md.uns['dmr'].filter(pl.col('qvalue') < 0.05).height:,}")
-dmr_unpaired = md.uns["dmr"].clone()      # keep a copy for comparison
 
-# --- Paired DMR — donor as a covariate -------------------------------------
-# Equivalent to: design="~ treatment + donor"
-ep.tl.dmr(
-    md,
-    tile_size_bp=500,
-    min_cpgs_per_tile=5,
-    covariates=["donor"],                 # or: design="~ treatment + donor"
-)
-print(f"\nPaired tile DMR (covariate=donor): {len(md.uns['dmr']):,} tiles")
-print(f"  significant (q<0.05): "
-      f"{md.uns['dmr'].filter(pl.col('qvalue') < 0.05).height:,}")
-print(f"  formula fitted   : {md.uns['dmr_params']['formula_used']}")
-print(f"  design terms     : {md.uns['dmr_params']['design_terms']}")
-print(f"  test used        : {md.uns['dmr_params']['test']}")
-
-# The GLM path adds two extra columns: coef_treatment (log-odds effect on
-# the treatment coefficient, adjusted for donor) and coef_se.
-print("\nTop 5 paired DMRs by qvalue:")
-print(
-    md.uns["dmr"]
-    .filter(pl.col("qvalue") < 0.05)
-    .sort("qvalue")
-    .select(["chrom", "start", "end", "meth_diff",
-             "coef_treatment", "coef_se", "pvalue", "qvalue"])
-    .head(5)
-)
-
-# --- Check DMC results -----------------------------------------------------
+# Check DMC results
 print(md.dmc.filter(pl.col("qvalue") < 0.05))
 
-# --- Check DMR results (paired result, currently in md.uns["dmr"]) ---------
+# Check DMR results  
 print(md.uns["dmr"].filter(pl.col("qvalue") < 0.05))
 
-ep.tl.annotate(
-    md,
-    gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf",
-    cpg_islands="raw_data/hg38_cpg_islands.bed",
-)
+
+
+ep.tl.annotate(md, gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf", cpg_islands="raw_data/hg38_cpg_islands.bed")
 
 md.save("cd55_analysis")
 

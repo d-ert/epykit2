@@ -29,9 +29,7 @@ _MIN_GENOME_COVERAGE_FRACTION = 0.80   # 80 % of CpGs at ≥1×
 _CONVERSION_WARNING_THRESHOLD  = 0.005  # 0.5 % CHH methylation
 
 
-# ---------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
 
 def bisulfite_conversion_rate(
     methylstore_path: str,

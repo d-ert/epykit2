@@ -1,16 +1,23 @@
 """Command-line entry point for epykit.
 
-Changes vs prior version (see analysis report for bug numbers):
+Default DMC test is ``lr`` everywhere (CLI, Python API, docstrings) — the
+quasi-binomial likelihood-ratio chi-square with per-site McCullagh-Nelder
+dispersion. This matches methylKit's ``calculateDiffMeth(overdispersion="MN",
+test="Chisq")`` and is the recommended path at n >= 2 replicates per group.
 
-* BIO-3 / BIO-1: ``dmc --test`` now exposes ``logit_t`` (default), ``cmh``,
-  ``beta_binomial``, and ``fisher``. Default changed from ``fisher`` (broken
-  pooled-CMH at n<6) to ``logit_t`` (statistically sound replicate-aware
-  Welch t-test on logit-transformed betas).
-* BIO-7: ``dmc`` gains ``--min-samples-case`` / ``--min-samples-control``
-  flags that propagate to ``process_chromosomes_dmc``.
-* BIO-5: ``dmr`` gains ``--method {tile,sliding_window}``, ``--tile-size-bp``,
-  ``--min-cpgs-per-tile``, and the tile path takes a methylstore +
-  samplesheet (not a precomputed DMC table) to enable read-pooling per tile.
+Historical note: earlier development iterations defaulted to ``fisher`` (n<6
+pooled), then briefly to ``logit_t``, then to ``score``. ``lr`` is now the
+single canonical default; the other engines (``score``, ``logit_t``, ``glm``,
+``beta_binomial``, ``cmh``, ``fisher``) remain available via ``--test``.
+
+CLI surface:
+* ``dmc`` — per-CpG calling with ``--test {lr,score,glm,logit_t,beta_binomial,
+  cmh,fisher}``, ``--min-samples-case`` / ``--min-samples-control`` filters,
+  and ``--allow-n1`` to opt into the (anti-conservative) Fisher fallback when
+  there are fewer than 2 replicates per group.
+* ``dmr`` — ``--method {tile,sliding_window}``. The tile path takes a
+  methylstore + samplesheet and pools reads per tile; the sliding-window path
+  takes a DMC parquet and combines per-CpG p-values.
 """
 
 import argparse
@@ -19,16 +26,6 @@ from pathlib import Path
 from .convert import convert_sample
 from . import filter, dmc
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-
-
-# ---------------------------------------------------------------------------
-# Internal helper: samplesheet → (treatment_samples, control_samples)
-# ---------------------------------------------------------------------------
 
 def _read_samplesheet_groups(samplesheet: str, treatment_group: str, control_group: str):
     import csv
@@ -51,10 +48,6 @@ def _read_samplesheet_groups(samplesheet: str, treatment_group: str, control_gro
 
     return treatment_samples, control_samples
 
-
-# ---------------------------------------------------------------------------
-# Subcommand handlers
-# ---------------------------------------------------------------------------
 
 def _cmd_convert(args: argparse.Namespace):
     """Handler for 'convert' subcommand."""
@@ -87,11 +80,37 @@ def _cmd_sample_summary(args: argparse.Namespace):
         print(df)
 
 
+def _cli_n1_and_footgun_checks(args, unit: str = "sites") -> None:
+    """Mirror tl.* guards on the CLI side (B6 + B8)."""
+    treatment_samples, control_samples = args._samples  # set by caller
+    if min(len(treatment_samples), len(control_samples)) < 2 and not args.allow_n1:
+        raise SystemExit(
+            f"error: at least 2 replicates per group required "
+            f"(treatment={len(treatment_samples)}, control={len(control_samples)}). "
+            f"Pass --allow-n1 to opt into the Fisher fallback."
+        )
+    import warnings
+    if args.test == "fisher":
+        warnings.warn(
+            "test='fisher' is anti-conservative; prefer 'lr' at n >= 2.",
+            UserWarning, stacklevel=2,
+        )
+    if (not args.unite) and args.min_samples_case == 0 and args.min_samples_control == 0:
+        warnings.warn(
+            f"--no-unite + min_samples_*=0 will test {unit} covered in only "
+            f"one sample per group. Recommended: --min-samples-case 2 "
+            f"--min-samples-control 2.",
+            UserWarning, stacklevel=2,
+        )
+
+
 def _cmd_dmc(args: argparse.Namespace):
     """Handler for 'dmc' subcommand."""
     treatment_samples, control_samples = _read_samplesheet_groups(
         args.samplesheet, args.treatment_group, args.control_group
     )
+    args._samples = (treatment_samples, control_samples)
+    _cli_n1_and_footgun_checks(args, unit="sites")
 
     print(f"Treatment samples: {treatment_samples}")
     print(f"Control samples:   {control_samples}")
@@ -109,7 +128,7 @@ def _cmd_dmc(args: argparse.Namespace):
         control_samples,
         test=args.test,
         unite=args.unite,
-        min_samples_case=args.min_samples_case,
+        min_samples_treatment=args.min_samples_case,
         min_samples_control=args.min_samples_control,
     )
     results = dmc.apply_multiple_testing_correction(results, method="fdr_bh")
@@ -136,6 +155,8 @@ def _cmd_dmr(args: argparse.Namespace):
         treatment_samples, control_samples = _read_samplesheet_groups(
             args.samplesheet, args.treatment_group, args.control_group
         )
+        args._samples = (treatment_samples, control_samples)
+        _cli_n1_and_footgun_checks(args, unit="tiles")
 
         print(f"Treatment samples: {treatment_samples}")
         print(f"Control samples:   {control_samples}")
@@ -144,7 +165,7 @@ def _cmd_dmr(args: argparse.Namespace):
 
         dmr_results = call_dmr_tile_based(
             methylstore_path=args.methylstore,
-            samples_case=treatment_samples,
+            samples_treatment=treatment_samples,
             samples_control=control_samples,
             tile_size_bp=args.tile_size_bp,
             test=args.test,
@@ -152,7 +173,7 @@ def _cmd_dmr(args: argparse.Namespace):
             alpha=args.alpha,
             min_abs_meth_diff=args.min_abs_meth_diff,
             unite=args.unite,
-            min_samples_case=args.min_samples_case,
+            min_samples_treatment=args.min_samples_case,
             min_samples_control=args.min_samples_control,
         )
     else:
@@ -240,12 +261,12 @@ def _cmd_qc_report(args: argparse.Namespace):
 
 
 def _cmd_smooth(args: argparse.Namespace):
-    """Handler for 'smooth' subcommand (BSmooth-style)."""
-    from .dmr import smooth_methylation_bsmooth
+    """Handler for 'smooth' subcommand (Gaussian-kernel smoothing)."""
+    from .dmr import smooth_methylation_gaussian
 
     samples = args.samples.split(",")
     smooth_path = args.output
-    smooth_methylation_bsmooth(
+    smooth_methylation_gaussian(
         args.methylstore,
         samples,
         bandwidth=args.bandwidth,
@@ -254,19 +275,46 @@ def _cmd_smooth(args: argparse.Namespace):
     print(f"Smoothed betas written to {smooth_path}")
 
 
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
+def _configure_logging(verbosity: int) -> None:
+    """Configure logging only when running as a CLI.
+
+    Library code never calls ``logging.basicConfig``; doing so at import time
+    would override the host application's logging configuration. The CLI is
+    allowed to configure logging because the user has explicitly invoked it.
+
+    ``verbosity`` is the net of ``-v`` (count) minus ``-q`` (count):
+      0  → INFO (default)
+      ≥1 → DEBUG
+      ≤−1 → WARNING
+    """
+    if verbosity >= 1:
+        level = logging.DEBUG
+    elif verbosity <= -1:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
+    # Guard against overriding handlers a host program (e.g. tests, notebooks)
+    # may already have installed.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+    else:
+        logging.getLogger().setLevel(level)
+
 
 def main():
     ap  = argparse.ArgumentParser(
         prog="epykit", description="Methylation Parquet store tools"
     )
+    ap.add_argument("-v", "--verbose", action="count", default=0,
+                    help="Increase logging verbosity (-v: DEBUG)")
+    ap.add_argument("-q", "--quiet", action="count", default=0,
+                    help="Decrease logging verbosity (-q: WARNING and above)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # ------------------------------------------------------------------
     # convert
-    # ------------------------------------------------------------------
     p_conv = sub.add_parser("convert", help="Convert a Bismark .cov file to Parquet")
     p_conv.add_argument("--input",        required=True)
     p_conv.add_argument("--sample-id",    required=True)
@@ -279,9 +327,7 @@ def main():
     p_conv.add_argument("--no-merge-cpg", dest="merge_cpg", action="store_false")
     p_conv.set_defaults(merge_cpg=None, func=_cmd_convert)
 
-    # ------------------------------------------------------------------
     # filter
-    # ------------------------------------------------------------------
     p_filt = sub.add_parser("filter", help="Filter low-coverage CpGs")
     p_filt.add_argument("--methylstore",           required=True)
     p_filt.add_argument("--output-dir",            required=True)
@@ -291,18 +337,14 @@ def main():
     p_filt.add_argument("--sample")
     p_filt.set_defaults(func=_cmd_filter)
 
-    # ------------------------------------------------------------------
     # summary
-    # ------------------------------------------------------------------
     p_sum = sub.add_parser("summary", help="Per-sample summary statistics")
     p_sum.add_argument("--methylstore", required=True)
     p_sum.add_argument("--sample",      required=True)
     p_sum.add_argument("--output")
     p_sum.set_defaults(func=_cmd_sample_summary)
 
-    # ------------------------------------------------------------------
     # dmc
-    # ------------------------------------------------------------------
     p_dmc = sub.add_parser("dmc", help="Differential methylation calling (per-CpG)")
     p_dmc.add_argument("--methylstore",      required=True)
     p_dmc.add_argument("--samplesheet",      required=True,
@@ -312,17 +354,23 @@ def main():
     p_dmc.add_argument("--output",           required=True)
     p_dmc.add_argument(
         "--test",
-        choices=["score", "logit_t", "beta_binomial", "cmh", "fisher"],
-        default="score",
+        choices=["lr", "score", "glm", "logit_t", "beta_binomial", "cmh", "fisher"],
+        default="lr",
         help=(
-            "Statistical test (default: score). "
-            "score — Quasi-binomial score test with chromosome-level "
-            "overdispersion correction, replicate-aware. Matches methylKit's "
+            "Statistical test (default: lr). "
+            "lr — Quasi-binomial likelihood-ratio chi-square with per-site "
+            "McCullagh-Nelder dispersion. Matches methylKit's "
             "calculateDiffMeth(overdispersion='MN', test='Chisq'). "
-            "Recommended at n>=3. "
+            "Recommended default at n>=2. "
+            "score — Quasi-binomial score test on the same dispersion-corrected "
+            "accumulators as lr; marginally more powerful but mildly "
+            "anti-conservative at the boundaries. "
+            "glm — Binomial GLM with covariates (requires a design via the "
+            "Python API: ep.tl.dmr(..., design='~ treatment + sex + batch')). "
             "logit_t — Welch t on logit(beta), variance-stabilising fallback. "
-            "beta_binomial — Welch t on raw betas (NOT a GLM; superseded by score). "
-            "cmh — Cochran-Mantel-Haenszel with proper per-pair stratification. "
+            "beta_binomial — Welch t on raw betas (NOT a true beta-binomial "
+            "GLM; superseded by lr/score). "
+            "cmh — Cochran-Mantel-Haenszel on per-pair strata. "
             "fisher — Fisher exact on reads pooled across replicates "
             "(anti-conservative, kept for backward compatibility; warns)."
         ),
@@ -343,11 +391,17 @@ def main():
         "--min-samples-control", type=int, default=0,
         help="Per-site minimum number of control samples with non-zero coverage.",
     )
+    p_dmc.add_argument(
+        "--allow-n1", action="store_true", default=False,
+        help=(
+            "Allow n<2 per group: fall back to Fisher exact on pooled reads. "
+            "Default is to refuse — between-replicate variance is ignored "
+            "and p-values are anti-conservative under this fallback."
+        ),
+    )
     p_dmc.set_defaults(func=_cmd_dmc)
 
-    # ------------------------------------------------------------------
     # dmr
-    # ------------------------------------------------------------------
     p_dmr = sub.add_parser("dmr", help="DMR calling (tile-based or sliding-window)")
     p_dmr.add_argument(
         "--method",
@@ -377,9 +431,10 @@ def main():
     p_dmr.add_argument("--min-cpgs-per-tile",  type=int,   default=5,
                        help="(tile only) Minimum CpGs per tile per sample.")
     p_dmr.add_argument(
-        "--test", choices=["score", "logit_t", "beta_binomial", "cmh", "fisher"],
-        default="score",
-        help="(tile only) Statistical test applied to tile-level counts.",
+        "--test", choices=["lr", "score", "glm", "logit_t", "beta_binomial", "cmh", "fisher"],
+        default="lr",
+        help="(tile only) Statistical test applied to tile-level counts. "
+             "Default 'lr' matches methylKit overdispersion='MN' test='Chisq'.",
     )
     p_dmr.add_argument(
         "--no-unite", action="store_false", dest="unite", default=True,
@@ -389,6 +444,14 @@ def main():
                        help="(tile only) Per-tile minimum treatment samples.")
     p_dmr.add_argument("--min-samples-control", type=int, default=0,
                        help="(tile only) Per-tile minimum control samples.")
+    p_dmr.add_argument(
+        "--allow-n1", action="store_true", default=False,
+        help=(
+            "(tile only) Allow n<2 per group: fall back to Fisher exact on "
+            "pooled reads. Default is to refuse — between-replicate variance "
+            "is ignored and p-values are anti-conservative."
+        ),
+    )
 
     # Sliding-window-method options
     p_dmr.add_argument("--dmc-results",
@@ -403,9 +466,7 @@ def main():
     p_dmr.add_argument("--min-abs-meth-diff",    type=float, default=0.1)
     p_dmr.set_defaults(func=_cmd_dmr)
 
-    # ------------------------------------------------------------------
     # annotate
-    # ------------------------------------------------------------------
     p_ann = sub.add_parser(
         "annotate", help="Annotate DMC/DMR results with genomic features"
     )
@@ -424,9 +485,7 @@ def main():
     p_ann.add_argument("--promoter-downstream-bp", type=int, default=200)
     p_ann.set_defaults(func=_cmd_annotate)
 
-    # ------------------------------------------------------------------
     # qc-report
-    # ------------------------------------------------------------------
     p_qc = sub.add_parser("qc-report", help="QC and coverage uniformity report")
     p_qc.add_argument("--methylstore", required=True)
     p_qc.add_argument(
@@ -439,10 +498,16 @@ def main():
     )
     p_qc.set_defaults(func=_cmd_qc_report)
 
-    # ------------------------------------------------------------------
     # smooth
-    # ------------------------------------------------------------------
-    p_sm = sub.add_parser("smooth", help="BSmooth-style LOESS beta smoothing")
+    p_sm = sub.add_parser(
+        "smooth",
+        help="Gaussian-kernel methylation beta smoothing (approximates BSmooth)",
+        description=(
+            "Gaussian-kernel methylation beta smoothing. Approximates BSmooth "
+            "via scipy.ndimage.gaussian_filter1d on a regular grid — not a "
+            "true local LOESS. ~500x faster than statsmodels LOESS."
+        ),
+    )
     p_sm.add_argument("--methylstore", required=True)
     p_sm.add_argument(
         "--samples", required=True,
@@ -455,6 +520,7 @@ def main():
     p_sm.set_defaults(func=_cmd_smooth)
 
     args = ap.parse_args()
+    _configure_logging(verbosity=args.verbose - args.quiet)
     args.func(args)
 
 
