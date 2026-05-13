@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from ._utils import _get_ax, _save_fig
 from ..methyldata import MethylData
-import polars as pl
 
 
 def genomic_context_bar(md: MethylData, ax=None, figsize=(7, 4), save: str | None = None):
