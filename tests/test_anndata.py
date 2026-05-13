@@ -16,19 +16,28 @@ def test_to_anndata_requires_unite(synth_md_filtered):
         md.to_anndata()
 
 
-def test_to_anndata_shape_and_layers(synth_md_filtered):
+def test_to_anndata_shape_default(synth_md_filtered):
+    """Default call: only adata.X is filled (memory-conscious)."""
     import epykit as ep
     pytest.importorskip("anndata")
     adata = synth_md_filtered.to_anndata(layer="beta")
     assert adata.shape[0] == synth_md_filtered.n_samples
     assert adata.shape[1] > 0
-    # Layers populated
-    for layer in ("coverage", "N_meth", "N_unmeth"):
-        assert layer in adata.layers
-        assert adata.layers[layer].shape == adata.shape
+    # No extra layers by default — keeps OOM at bay on real WGBS
+    assert list(adata.layers.keys()) == []
     # Provenance keys
     assert adata.uns.get("epykit_assembly") == synth_md_filtered.assembly
     assert adata.uns.get("epykit_context") == synth_md_filtered.context
+
+
+def test_to_anndata_populate_layers_opt_in(synth_md_filtered):
+    """When the user explicitly opts in, every additional layer materialises."""
+    import epykit as ep
+    pytest.importorskip("anndata")
+    adata = synth_md_filtered.to_anndata(layer="beta", populate_layers=True)
+    for extra in ("coverage", "N_meth", "N_unmeth"):
+        assert extra in adata.layers
+        assert adata.layers[extra].shape == adata.shape
 
 
 def test_to_anndata_beta_in_unit_interval(synth_md_filtered):

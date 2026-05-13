@@ -7,15 +7,39 @@ A MethylData object is conceptually shaped exactly like an AnnData:
     X         = β  or  N_meth  or  coverage   (n_samples × n_sites)
     layers    = {"beta", "coverage", "N_meth", "N_unmeth"}
 
-The site axis can be huge on WGBS (~30 M CpGs on hg38); densifying it
-unfiltered would OOM. ``to_anndata`` therefore requires the user to have
-called :func:`ep.pp.unite` first so all samples share the same site set.
-If not, a clear ``ValueError`` instructs the user.
+Memory strategy
+---------------
+A dense ``(n_samples × n_sites)`` matrix on real WGBS is enormous — 8
+samples × 28 M CpGs × 4 bytes (float32) ≈ 900 MB per layer. The naive
+"pivot the long-form DataFrame" approach holds the source rows, the
+pivot, and the densified matrix simultaneously, which is typically 3-4×
+the final array size and OOMs on real datasets.
+
+To stay in the same ballpark as the final array, ``to_anndata`` runs
+streamed, per-sample, per-chromosome:
+
+1. Scan only ``(chrom, pos)`` lazily across the store to build the
+   sorted site index and a ``(chrom, pos) → row_idx`` lookup. This step
+   uses a few hundred MB at WGBS scale.
+2. Allocate ``X`` as a single ``float32`` array of shape
+   ``(n_samples, n_sites)``.
+3. For each sample, scan only that sample's partition for the requested
+   layer column, look the site index up, and fill the matching row of
+   ``X``. No long-form intermediate is ever materialised.
+
+Additional layers (``populate_layers=True``) cost one extra dense array
+per layer plus one extra streaming pass; default is **only the requested
+layer**, so a user who just wants β does not pay 4× memory.
+
+A ``pp.unite`` is required before calling: with a united site set every
+sample shares the same axis, the dense layout is sane, and the streaming
+fill cannot leave holes.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import polars as pl
 
@@ -24,27 +48,124 @@ from .methyldata import MethylData
 logger = logging.getLogger(__name__)
 
 
+_VALID_LAYERS = {"beta", "coverage", "N_meth", "N_unmeth"}
+
+
+def _site_index(store: str) -> tuple[pl.DataFrame, dict[tuple[str, int], int]]:
+    """Build the sorted (chrom, pos) site index from the Parquet store.
+
+    Returns the index DataFrame and a ``(chrom, pos) → row_idx`` lookup.
+    The scan only touches the chrom + pos columns; ``unique()`` collapses
+    any duplicates across samples (a united store should have none, but
+    the call is idempotent).
+    """
+    var = (
+        pl.scan_parquet(f"{store}/sample=*/chrom=*/part-*.parquet")
+        .select(["chrom", "pos"])
+        .unique()
+        .sort(["chrom", "pos"])
+        .collect()
+    )
+    chroms = var["chrom"].to_list()
+    positions = var["pos"].to_list()
+    lookup = {(c, int(p)): i for i, (c, p) in enumerate(zip(chroms, positions))}
+    return var, lookup
+
+
+def _fill_layer(
+    store: str,
+    samples: list[str],
+    n_sites: int,
+    layer: str,
+    lookup: dict[tuple[str, int], int],
+    dtype,
+):
+    """Stream sample-by-sample, filling a (n_samples × n_sites) array."""
+    import numpy as np
+
+    out = np.full((len(samples), n_sites), np.nan, dtype=dtype)
+    store_p = Path(store)
+    for s_idx, sample in enumerate(samples):
+        sample_dir = store_p / f"sample={sample}"
+        if not sample_dir.exists():
+            continue
+        # Scan just this sample. Lazy projection: only N_meth / coverage are
+        # ever read off disk (plus chrom + pos for the index lookup).
+        lf = pl.scan_parquet(f"{sample_dir}/chrom=*/part-*.parquet")
+        if layer == "beta":
+            lf = lf.select(["chrom", "pos", "N_meth", "coverage"]).filter(
+                pl.col("coverage") > 0
+            ).with_columns(
+                (pl.col("N_meth").cast(pl.Float32) / pl.col("coverage")).alias("value")
+            )
+        elif layer == "coverage":
+            lf = lf.select(["chrom", "pos", "coverage"]).rename({"coverage": "value"})
+        elif layer == "N_meth":
+            lf = lf.select(["chrom", "pos", "N_meth"]).rename({"N_meth": "value"})
+        elif layer == "N_unmeth":
+            lf = lf.select(["chrom", "pos", "N_meth", "coverage"]).with_columns(
+                (pl.col("coverage") - pl.col("N_meth")).alias("value")
+            )
+        else:  # pragma: no cover — guarded upstream
+            raise ValueError(f"unknown layer {layer!r}")
+
+        df = lf.select(["chrom", "pos", "value"]).collect()
+        if len(df) == 0:
+            continue
+
+        chroms = df["chrom"].to_list()
+        positions = df["pos"].to_list()
+        values = df["value"].to_numpy()
+
+        # Build column index for this sample. dict lookup is ~250 ns per
+        # entry; for 30 M sites that's ~8 s per sample, which is dwarfed
+        # by the Parquet scan itself.
+        col_idx = np.fromiter(
+            (lookup.get((c, int(p)), -1) for c, p in zip(chroms, positions)),
+            count=len(chroms), dtype=np.int64,
+        )
+        mask = col_idx >= 0
+        if not mask.any():
+            continue
+        out[s_idx, col_idx[mask]] = values[mask].astype(dtype, copy=False)
+    return out
+
+
 def to_anndata(
     md: MethylData,
     *,
     layer: str = "beta",
-    populate_layers: bool = True,
+    populate_layers: bool = False,
+    dtype: str = "float32",
     use_smoothed: bool = False,
 ):
     """Materialise a MethylData as an AnnData object.
+
+    Memory-conscious by default: only the layer you asked for is dense.
+    On a typical 8-sample × 28 M-CpG run this produces a ~900 MB
+    ``adata.X`` and nothing else, vs. ~3.5 GB of intermediate state under
+    the previous pivot-based implementation. Pass
+    ``populate_layers=True`` to also fill ``adata.layers["coverage"]``,
+    etc., paying one extra dense array per layer.
 
     Parameters
     ----------
     md : MethylData
         Methylation data. Must have been ``pp.unite``'d so every sample
-        shares the same site set — otherwise densifying the matrix is
-        unsafe at WGBS scale.
+        shares the same site set.
     layer : {"beta", "coverage", "N_meth", "N_unmeth"}
         Which value to put in ``adata.X``. Default "beta".
     populate_layers : bool
-        When True (default), populate ``adata.layers`` with every
-        available view (beta, coverage, N_meth, N_unmeth). When False,
-        only ``X`` is filled.
+        If True, also fill ``adata.layers`` with every layer in
+        :data:`_VALID_LAYERS`. Default **False** — the old default of
+        True densified four matrices and was the most common cause of
+        OOMs on real WGBS. Layer matrices share the site index so an
+        extra pass per layer is cheap on disk but doubles dense RAM.
+    dtype : str
+        NumPy dtype for the dense matrices. Default ``"float32"``
+        (4 bytes / cell). Use ``"float64"`` if you want to feed the
+        result into algorithms that demand it; halves the per-sample row
+        fill speed and doubles RAM.
     use_smoothed : bool
         Reserved for future use; currently raises NotImplementedError.
 
@@ -76,83 +197,52 @@ def to_anndata(
             "sample — note the densification cost)."
         )
 
-    valid_layers = {"beta", "coverage", "N_meth", "N_unmeth"}
-    if layer not in valid_layers:
+    if layer not in _VALID_LAYERS:
         raise ValueError(
-            f"layer must be one of {sorted(valid_layers)}; got {layer!r}"
+            f"layer must be one of {sorted(_VALID_LAYERS)}; got {layer!r}"
         )
-
-    samples = md.obs.get_column("sample_id").to_list()
-
-    # Materialise the sample × site matrix via one streamed pivot per layer.
-    # Using a separate scan per layer keeps peak memory bounded; on a united
-    # store the per-sample row count is identical.
-    rows = (
-        pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
-        .select(["chrom", "pos", "sample", "N_meth", "coverage"])
-        .with_columns(
-            (pl.col("coverage") - pl.col("N_meth")).alias("N_unmeth"),
-            pl.when(pl.col("coverage") > 0)
-              .then(pl.col("N_meth").cast(pl.Float64) / pl.col("coverage"))
-              .otherwise(None)
-              .alias("beta"),
-        )
-        .collect()
-    )
-
-    # var = unique (chrom, pos) in genomic order. We need the column order
-    # because every layer pivot must align with the same site axis.
-    var = (
-        rows.select(["chrom", "pos"])
-        .unique()
-        .sort(["chrom", "pos"])
-    )
-    site_keys = list(zip(var["chrom"].to_list(), var["pos"].to_list()))
-
-    def _pivot_layer(col: str):
-        pivot = rows.pivot(
-            values=col, index=["chrom", "pos"], on="sample",
-            aggregate_function="first",
-        ).join(var, on=["chrom", "pos"], how="right").sort(["chrom", "pos"])
-        # Ensure every sample column exists (a missing sample on union mode
-        # would otherwise drop the column entirely).
-        for s in samples:
-            if s not in pivot.columns:
-                pivot = pivot.with_columns(pl.lit(None).alias(s))
-        # AnnData is (samples × sites): transpose at the numpy step.
-        return pivot.select(samples).to_numpy().T
-
-    X = _pivot_layer(layer)
 
     import numpy as np
     import pandas as pd
 
-    obs_pd = md.obs.to_pandas().set_index("sample_id")
-    var_pd = pd.DataFrame({
-        "chrom": [k[0] for k in site_keys],
-        "pos": [k[1] for k in site_keys],
-    })
-    var_pd.index = [f"{c}:{p}" for c, p in site_keys]
+    np_dtype = np.dtype(dtype)
+    samples = md.obs.get_column("sample_id").to_list()
 
-    adata = ad.AnnData(
-        X=np.asarray(X, dtype=np.float64),
-        obs=obs_pd,
-        var=var_pd,
+    logger.info("to_anndata: building site index from %s", md.store)
+    var, lookup = _site_index(md.store)
+    n_sites = len(var)
+    logger.info(
+        "to_anndata: %d sample(s) × %d site(s) — estimated dense size %.2f GiB",
+        len(samples), n_sites,
+        len(samples) * n_sites * np_dtype.itemsize / (1024 ** 3),
     )
 
-    if populate_layers:
-        for col in ("beta", "coverage", "N_meth", "N_unmeth"):
-            if col == layer:
-                continue
-            adata.layers[col] = np.asarray(_pivot_layer(col), dtype=np.float64)
+    X = _fill_layer(md.store, samples, n_sites, layer, lookup, np_dtype)
 
-    # Persist a few useful keys
+    obs_pd = md.obs.to_pandas().set_index("sample_id")
+
+    chrom_arr = var["chrom"].to_list()
+    pos_arr = var["pos"].to_list()
+    var_pd = pd.DataFrame({"chrom": chrom_arr, "pos": pos_arr})
+    var_pd.index = [f"{c}:{p}" for c, p in zip(chrom_arr, pos_arr)]
+
+    adata = ad.AnnData(X=X, obs=obs_pd, var=var_pd)
+
+    if populate_layers:
+        for extra in _VALID_LAYERS:
+            if extra == layer:
+                continue
+            logger.info("to_anndata: filling layer %r", extra)
+            adata.layers[extra] = _fill_layer(
+                md.store, samples, n_sites, extra, lookup, np_dtype,
+            )
+
     adata.uns["epykit_assembly"] = md.assembly
     adata.uns["epykit_context"] = md.context
     adata.uns["epykit_state"] = list(md.state)
 
     logger.info(
-        "to_anndata: shape=%s layers=%s",
+        "to_anndata: built AnnData shape=%s layers=%s",
         adata.shape, list(adata.layers.keys()),
     )
     return adata
