@@ -62,7 +62,7 @@ def _warn_fisher_once() -> None:
 def _check_n1_and_union_footgun(
     md: MethylData,
     allow_n1: bool,
-    min_samples_case: int,
+    min_samples_treatment: int,
     min_samples_control: int,
     unit: str = "sites",
 ) -> None:
@@ -73,16 +73,42 @@ def _check_n1_and_union_footgun(
     if (
         unite_info is not None
         and unite_info.get("type") == "union"
-        and min_samples_case == 0
+        and min_samples_treatment == 0
         and min_samples_control == 0
     ):
         import warnings
         warnings.warn(
-            f"unite='union' with min_samples_case=min_samples_control=0 will "
-            f"test {unit} covered in only one sample per group. Recommended: "
-            f"both >= 2 (or unite='intersect').",
+            f"unite='union' with min_samples_treatment=min_samples_control=0 "
+            f"will test {unit} covered in only one sample per group. "
+            f"Recommended: both >= 2 (or unite='intersect').",
             UserWarning, stacklevel=3,
         )
+
+
+def _resolve_min_samples_aliases(
+    min_samples_treatment: int | None,
+    min_samples_case: int | None,
+    default: int = 0,
+) -> int:
+    """Accept the deprecated ``min_samples_case`` kwarg with a DeprecationWarning (S9).
+
+    Returns the resolved canonical value. Either both None (use default), one
+    set, or — illegally — both set (TypeError).
+    """
+    import warnings
+    if min_samples_case is not None:
+        warnings.warn(
+            "min_samples_case is deprecated; use min_samples_treatment.",
+            DeprecationWarning, stacklevel=3,
+        )
+        if min_samples_treatment is not None:
+            raise TypeError(
+                "Pass either min_samples_treatment or min_samples_case, not both"
+            )
+        return int(min_samples_case)
+    if min_samples_treatment is None:
+        return default
+    return int(min_samples_treatment)
 
 
 def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
@@ -183,11 +209,13 @@ def dmc(
     md: MethylData,
     test: str = "auto",
     chromosomes: list[str] | None = None,
-    min_samples_case: int = 0,
+    min_samples_treatment: int | None = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
     allow_n1: bool = False,
+    *,
+    min_samples_case: int | None = None,  # deprecated alias (S9)
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -206,19 +234,25 @@ def dmc(
         ``overdispersion="MN"``.
     chromosomes : list[str], optional
         Restrict to a subset of chromosomes. Auto-detected when None.
-    min_samples_case, min_samples_control : int
+    min_samples_treatment, min_samples_control : int
         BIO-7: per-site minimum number of samples with non-zero coverage in
         each group. Sites that fail are NaN'd out before FDR correction.
         Primarily useful when ``ep.pp.unite(..., type="union")`` was used so
         that union-introduced zero-coverage rows aren't treated as real
         observations.
+
+        ``min_samples_case`` is accepted as a deprecated alias for
+        ``min_samples_treatment`` (S9 naming unification).
     """
+    min_samples_treatment = _resolve_min_samples_aliases(
+        min_samples_treatment, min_samples_case, default=0,
+    )
     # Unconditional n=1 guard: applies whether test is "auto" or explicit.
     # _auto_test_simple raises ValueError when allow_n1=False; trigger that
     # check up front so explicit test="lr"/"fisher" with n<2 also gets
     # caught instead of silently running on degenerate data.
     _check_n1_and_union_footgun(
-        md, allow_n1, min_samples_case, min_samples_control,
+        md, allow_n1, min_samples_treatment, min_samples_control,
     )
     selected_test = _auto_test(md, allow_n1=allow_n1) if test == "auto" else test
     if selected_test == "fisher":
@@ -233,7 +267,7 @@ def dmc(
         test=selected_test,
         chromosomes=chromosomes,
         unite=unite,
-        min_samples_treatment=min_samples_case,
+        min_samples_treatment=min_samples_treatment,
         min_samples_control=min_samples_control,
         dispersion=dispersion,
         reference=reference,
@@ -247,8 +281,11 @@ def dmc(
         "test_used": selected_test,
         "n_sites": len(result),
         "unite": unite,
-        "min_samples_case": min_samples_case,
+        "min_samples_treatment": min_samples_treatment,
         "min_samples_control": min_samples_control,
+        # Back-compat alias: legacy readers that look up "min_samples_case"
+        # still find the value; new code should read "min_samples_treatment".
+        "min_samples_case": min_samples_treatment,
         "dispersion": dispersion,
         "reference": reference,
         # S5: explicit pointer so MethylData.get_dmc() / .dmc resolve to the
@@ -266,7 +303,7 @@ def dmr(
     min_cpgs_per_tile: int = 5,
     test: str = "auto",
     chromosomes: list[str] | None = None,
-    min_samples_case: int = 0,
+    min_samples_treatment: int | None = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
     reference: str = "methylkit",
@@ -285,6 +322,8 @@ def dmr(
     min_mean_qvalue: float | None = 0.05,
     # Replicate-count guard --------------------------------------------------
     allow_n1: bool = False,
+    *,
+    min_samples_case: int | None = None,  # deprecated alias (S9)
 ) -> None:
     """Run DMR calling and store result in ``md.uns['dmr']``.
 
@@ -312,8 +351,10 @@ def dmr(
         ``"auto"`` resolves the same way as in :func:`dmc`.
     chromosomes : list[str], optional
         Restrict tile-method processing to these chromosomes.
-    min_samples_case, min_samples_control : int
+    min_samples_treatment, min_samples_control : int
         Per-tile sample-count guard for tile-method (BIO-7).
+        ``min_samples_case`` is accepted as a deprecated alias for
+        ``min_samples_treatment`` (S9 naming unification).
     window_bp, step_bp, min_cpgs, min_sites_significant : int
         Sliding-window method options.
     alpha : float
@@ -331,9 +372,12 @@ def dmr(
         to the uncorrected p-value, which was not FDR-controlled across the
         DMR set.
     """
+    min_samples_treatment = _resolve_min_samples_aliases(
+        min_samples_treatment, min_samples_case, default=0,
+    )
     if method == "tile":
         _check_n1_and_union_footgun(
-            md, allow_n1, min_samples_case, min_samples_control, unit="tiles",
+            md, allow_n1, min_samples_treatment, min_samples_control, unit="tiles",
         )
         selected_test = (
             _auto_test(md, design=design, covariates=covariates, allow_n1=allow_n1)
@@ -376,7 +420,7 @@ def dmr(
             alpha=alpha,
             min_abs_meth_diff=min_abs_meth_diff,
             unite=unite,
-            min_samples_treatment=min_samples_case,
+            min_samples_treatment=min_samples_treatment,
             min_samples_control=min_samples_control,
             dispersion=dispersion,
             reference=reference,
@@ -399,8 +443,10 @@ def dmr(
             "alpha": alpha,
             "min_abs_meth_diff": min_abs_meth_diff,
             "min_mean_qvalue": min_mean_qvalue,
-            "min_samples_case": min_samples_case,
+            "min_samples_treatment": min_samples_treatment,
             "min_samples_control": min_samples_control,
+            # Back-compat alias for legacy readers.
+            "min_samples_case": min_samples_treatment,
             "unite": unite,
             "dispersion": dispersion,
             "reference": reference,

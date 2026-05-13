@@ -99,7 +99,7 @@ def test_union_with_zero_min_samples_warns(synth_md, tmp_path):
 
     with pytest.warns(UserWarning, match=r"unite='union'"):
         ep.tl.dmc(synth_md, test="lr",
-                  min_samples_case=0, min_samples_control=0)
+                  min_samples_treatment=0, min_samples_control=0)
 
 
 def test_union_with_explicit_min_samples_does_not_warn(synth_md):
@@ -111,7 +111,7 @@ def test_union_with_explicit_min_samples_does_not_warn(synth_md):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         ep.tl.dmc(synth_md, test="lr",
-                  min_samples_case=2, min_samples_control=2)
+                  min_samples_treatment=2, min_samples_control=2)
     union_warns = [
         w for w in caught
         if issubclass(w.category, UserWarning) and "unite='union'" in str(w.message)
@@ -125,12 +125,34 @@ def test_intersect_mode_never_warns_about_union(synth_md_filtered):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         ep.tl.dmc(synth_md_filtered, test="lr",
-                  min_samples_case=0, min_samples_control=0)
+                  min_samples_treatment=0, min_samples_control=0)
     union_warns = [
         w for w in caught
         if issubclass(w.category, UserWarning) and "unite='union'" in str(w.message)
     ]
     assert union_warns == []
+
+
+# S9: deprecated min_samples_case kwarg on tl.dmc / tl.dmr
+
+
+def test_min_samples_case_kwarg_warns_on_dmc(synth_md_filtered):
+    """``tl.dmc(min_samples_case=...)`` still works but emits a DeprecationWarning."""
+    import epykit as ep
+    with pytest.warns(DeprecationWarning, match=r"min_samples_case is deprecated"):
+        ep.tl.dmc(synth_md_filtered, test="lr",
+                  min_samples_case=2, min_samples_control=2)
+
+
+def test_min_samples_case_and_treatment_together_raises(synth_md_filtered):
+    """Passing both the canonical kwarg and the deprecated alias is a TypeError."""
+    import epykit as ep
+    with pytest.raises(TypeError, match=r"either min_samples_treatment or min_samples_case"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            ep.tl.dmc(synth_md_filtered, test="lr",
+                      min_samples_treatment=1, min_samples_case=2,
+                      min_samples_control=2)
 
 
 

@@ -85,31 +85,20 @@ def test_state_after_unite(synth_md):
     assert "united" in synth_md.state
 
 
-def _resolve_save_target(md, name: str) -> Path:
-    """Where ``md.save(name)`` actually writes.
-
-    ``MethylData.save()`` re-routes to ``<_analysis_root>/results/<basename>``
-    when ``_analysis_root`` is set, ignoring the directory component of the
-    argument. This helper computes the real on-disk location so round-trip
-    tests can hand it back to ``ep.load()``.
-    """
-    if md._analysis_root:
-        return Path(md._analysis_root) / "results" / Path(name).name
-    return Path(name)
-
-
 def test_state_persists_through_save_load_round_trip(synth_md, tmp_path):
-    """A filtered + united MethylData saved and reloaded should retain
-    its derived state."""
+    """A filtered + united MethylData saved and reloaded retains its
+    derived state. Save/load are symmetric for paths with directory
+    components — the previous test workaround helper is no longer needed.
+    """
     import epykit as ep
 
     ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
     ep.pp.unite(synth_md, type="intersect")
 
-    synth_md.save("saved_md")
-    actual = _resolve_save_target(synth_md, "saved_md")
+    save_path = tmp_path / "saved_md"
+    synth_md.save(str(save_path))
+    md2 = ep.load(str(save_path))
 
-    md2 = ep.load(str(actual))
     assert md2._filtered is True
     assert md2._united is True
     assert "filtered" in md2.state
@@ -129,8 +118,9 @@ def test_save_load_round_trip_preserves_obs_varm_uns(synth_md, tmp_path):
     ep.pp.unite(synth_md, type="intersect")
     ep.tl.dmc(synth_md, test="lr")
 
-    synth_md.save("rt")
-    md2 = ep.load(str(_resolve_save_target(synth_md, "rt")))
+    save_path = tmp_path / "rt"
+    synth_md.save(str(save_path))
+    md2 = ep.load(str(save_path))
 
     # obs equal as polars DataFrames (sample_id order preserved).
     assert md2.obs.shape == synth_md.obs.shape
@@ -152,9 +142,9 @@ def test_save_load_does_not_persist_boolean_state_in_meta(synth_md, tmp_path):
     that they are derived properties)."""
     import epykit as ep
     ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
-    synth_md.save("rt2")
-    actual = _resolve_save_target(synth_md, "rt2")
-    meta = json.loads((actual / "methyldata.json").read_text())
+    save_path = tmp_path / "rt2"
+    synth_md.save(str(save_path))
+    meta = json.loads((save_path / "methyldata.json").read_text())
     assert "_filtered" not in meta, "_filtered must not be persisted (derived)"
     assert "_united" not in meta
     assert "_smoothed" not in meta

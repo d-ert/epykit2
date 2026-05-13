@@ -12,6 +12,17 @@ This package provides a complete WGBS analysis pipeline:
   - annotate:  Gene-feature and CpG-island context annotation
   - qc:        Bisulfite conversion rate, global methylation, coverage
                uniformity
+
+Logging convention (S3)
+-----------------------
+Library modules (everything under ``epykit.*`` except ``epykit.cli``) emit
+progress and diagnostics through the standard :mod:`logging` module via
+``logger = logging.getLogger(__name__)`` — they never call :func:`print`.
+The CLI entry point (``epykit.cli``) reserves :func:`print` for the
+final user-facing result lines on stdout; structured progress logs flow
+through the same logging hierarchy and are controlled via ``-v`` / ``-q``.
+This split lets host applications and notebooks consume epykit without
+having their stdout polluted, while CLI users see the expected output.
 """
 
 from importlib.metadata import version as _v, PackageNotFoundError

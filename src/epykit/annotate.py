@@ -6,9 +6,11 @@ UCSC CpG-island BED).
 
 The per-chromosome join loop bounds peak memory by the largest single
 chromosome rather than the whole genome. GTFs are parsed once per process
-and cached in ``_GTF_CACHE`` keyed on the canonical file path; the Feature
-column is cast to pandas Categorical before constructing PyRanges because
-pyranges' null_types() can't handle plain str dtype.
+and cached in a bounded LRU (``_GTF_CACHE``, default 2 slots; override via
+``EPYKIT_GTF_CACHE_SIZE`` or :func:`set_gtf_cache_size`) keyed on the
+canonical file path; the Feature column is cast to pandas Categorical
+before constructing PyRanges because pyranges' null_types() can't handle
+plain str dtype.
 """
 
 from __future__ import annotations
@@ -16,10 +18,12 @@ from __future__ import annotations
 import gc
 import gzip
 import logging
+import os
 import re
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +41,48 @@ _FEATURE_PRIORITY: dict[str, int] = {
 
 _FEAT_COLS = ["Chromosome", "Start", "End", "Strand", "Feature", "gene_id", "gene_name"]
 
-# GTF cache: path -> (genes_pd, exons_pd). Skips re-parsing on repeat calls.
-_GTF_CACHE: dict[str, tuple[Any, Any]] = {}
+# GTF cache: bounded LRU of {path -> (genes_pd, exons_pd)}.
+#
+# A parsed human GTF can be ~1.5 GB resident in pandas form. The default of 2
+# slots is enough to keep two genomes hot (e.g. annotating DMC + DMR against
+# the same GTF, or comparing mouse + human in one session) without unbounded
+# growth in long-running notebooks. Override via the ``EPYKIT_GTF_CACHE_SIZE``
+# env var or :func:`set_gtf_cache_size`.
+_GTF_CACHE_MAX_SIZE: int = max(1, int(os.environ.get("EPYKIT_GTF_CACHE_SIZE", "2")))
+_GTF_CACHE: "OrderedDict[str, tuple[Any, Any]]" = OrderedDict()
+
+
+def set_gtf_cache_size(max_size: int) -> None:
+    """Set the maximum number of parsed GTFs held in memory.
+
+    The cache is keyed by canonical file path; one slot per distinct GTF.
+    Decreasing the size evicts the least-recently-used entries immediately.
+    """
+    global _GTF_CACHE_MAX_SIZE
+    if max_size < 1:
+        raise ValueError(f"max_size must be >= 1, got {max_size}")
+    _GTF_CACHE_MAX_SIZE = int(max_size)
+    while len(_GTF_CACHE) > _GTF_CACHE_MAX_SIZE:
+        evicted, _ = _GTF_CACHE.popitem(last=False)
+        logger.debug("[annotate] GTF cache evicted (resize): %s", evicted)
+
+
+def _gtf_cache_get(key: str) -> tuple[Any, Any] | None:
+    val = _GTF_CACHE.get(key)
+    if val is not None:
+        _GTF_CACHE.move_to_end(key)
+    return val
+
+
+def _gtf_cache_put(key: str, value: tuple[Any, Any]) -> None:
+    if key in _GTF_CACHE:
+        _GTF_CACHE.move_to_end(key)
+        _GTF_CACHE[key] = value
+        return
+    _GTF_CACHE[key] = value
+    while len(_GTF_CACHE) > _GTF_CACHE_MAX_SIZE:
+        evicted, _ = _GTF_CACHE.popitem(last=False)
+        logger.debug("[annotate] GTF cache evicted (LRU): %s", evicted)
 
 
 def _log(msg: str) -> None:
@@ -124,9 +168,10 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
     import pandas as pd
 
     cache_key = str(Path(gtf_path).resolve())
-    if cache_key in _GTF_CACHE:
+    cached = _gtf_cache_get(cache_key)
+    if cached is not None:
         _log(f"  GTF cache hit for {cache_key}")
-        return _GTF_CACHE[cache_key]
+        return cached
 
     gene_rows: list[dict] = []
     exon_rows: list[dict] = []
@@ -179,7 +224,7 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
     exons_pd = pd.DataFrame(exon_rows) if exon_rows else pd.DataFrame(columns=_empty_cols)
 
     result = (genes_pd, exons_pd)
-    _GTF_CACHE[cache_key] = result
+    _gtf_cache_put(cache_key, result)
     return result
 
 

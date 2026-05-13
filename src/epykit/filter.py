@@ -12,11 +12,14 @@ Notable design points:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import polars as pl
+
+logger = logging.getLogger(__name__)
 
 
 # Internal helpers
@@ -213,19 +216,19 @@ def filter_sites(
         samples_to_filter = [d.name.removeprefix("sample=") for d in sorted(sample_dirs)]
 
     for samp in samples_to_filter:
-        print(f"Filtering sample {samp}...")
+        logger.info("Filtering sample %s...", samp)
         sample_dir = methylstore_path / f"sample={samp}"
 
         # --- PERF-2: pass 1 — coverage column only, genome-wide quantile ---
         max_cov = _genome_wide_quantile(sample_dir, max_coverage_quantile)
-        print(f"  Max coverage quantile ({max_coverage_quantile}): {max_cov}")
+        logger.info("  Max coverage quantile (%s): %s", max_coverage_quantile, max_cov)
 
         out_sample_dir = output_dir_path / f"sample={samp}"
         out_sample_dir.mkdir(parents=True, exist_ok=True)
 
         chrom_dirs = sorted(sample_dir.glob("chrom=*"))
         if not chrom_dirs:
-            print(f"  Warning: no chrom=* dirs found for {samp}; skipping")
+            logger.warning("  no chrom=* dirs found for %s; skipping", samp)
             continue
 
         # --- PERF-2: pass 2 — per-chromosome read → filter → write ---
@@ -265,9 +268,9 @@ def filter_sites(
             1
             for f in out_sample_dir.rglob("part-*.parquet")
         )
-        print(f"  Written {n_out} chromosome file(s) for {samp}")
+        logger.info("  Written %d chromosome file(s) for %s", n_out, samp)
 
-    print(f"Filtered Parquet store written to {output_dir_path}")
+    logger.info("Filtered Parquet store written to %s", output_dir_path)
 
 
 def normalize_coverage_store(
@@ -354,11 +357,11 @@ def normalize_coverage_store(
         samp: (target / s if s > 0 else 1.0) for samp, s in summaries.items()
     }
 
-    print(f"Coverage normalisation (method={method}, target={target:.2f}):")
+    logger.info("Coverage normalisation (method=%s, target=%.2f):", method, target)
     for samp in samples:
-        print(
-            f"  {samp}: {method}_cov={summaries[samp]:.2f}, "
-            f"factor={factors[samp]:.4f}"
+        logger.info(
+            "  %s: %s_cov=%.2f, factor=%.4f",
+            samp, method, summaries[samp], factors[samp],
         )
 
     # --- Pass 2: scale and write ------------------------------------------
@@ -401,7 +404,7 @@ def normalize_coverage_store(
                 compression="zstd",
             )
 
-    print(f"Normalised Parquet store written to {out}")
+    logger.info("Normalised Parquet store written to %s", out)
     return factors
 
 

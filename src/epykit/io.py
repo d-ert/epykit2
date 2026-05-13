@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import csv
+import logging
 from pathlib import Path
 
 import polars as pl
 
 from .convert import ensure_converted_sample
 from .methyldata import MethylData
+
+logger = logging.getLogger(__name__)
 
 
 def _count_store_rows(store_dir: str) -> int | None:
@@ -83,7 +86,7 @@ def read_bismark(
             reference_fasta=reference_fasta,
         )
         status = "converted" if converted else "cached"
-        print(f"  {sample_id}: {status}", flush=True)
+        logger.info("  %s: %s", sample_id, status)
 
     n_sites_raw = _count_store_rows(cache_store_dir)
     uns = {
@@ -206,7 +209,7 @@ def read_nfcore_methylseq(
                 obs_row[key] = value
         obs_rows.append(obs_row)
 
-        print(f"  {sample_id} ({group}) ← {cov_path}", flush=True)
+        logger.info("  %s (%s) <- %s", sample_id, group, cov_path)
         ensure_converted_sample(cov_path, sample_id, cache_store_dir, context=context)
 
     if not obs_rows:

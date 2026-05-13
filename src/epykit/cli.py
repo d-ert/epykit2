@@ -12,7 +12,8 @@ single canonical default; the other engines (``score``, ``logit_t``, ``glm``,
 
 CLI surface:
 * ``dmc`` — per-CpG calling with ``--test {lr,score,glm,logit_t,beta_binomial,
-  cmh,fisher}``, ``--min-samples-case`` / ``--min-samples-control`` filters,
+  cmh,fisher}``, ``--min-samples-treatment`` / ``--min-samples-control`` filters
+  (the older ``--min-samples-case`` is accepted as a deprecated alias, S9),
   and ``--allow-n1`` to opt into the (anti-conservative) Fisher fallback when
   there are fewer than 2 replicates per group.
 * ``dmr`` — ``--method {tile,sliding_window}``. The tile path takes a
@@ -22,9 +23,61 @@ CLI surface:
 
 import argparse
 import logging
+import warnings
 from pathlib import Path
 from .convert import convert_sample
 from . import filter, dmc
+
+
+def _add_min_samples_args(p: argparse.ArgumentParser, scope_help_prefix: str = "") -> None:
+    """Register ``--min-samples-treatment`` (canonical) + deprecated alias.
+
+    The legacy ``--min-samples-case`` is parsed into a separate hidden
+    attribute and resolved post-parse by :func:`_resolve_min_samples_case`
+    with a DeprecationWarning (S9).
+    """
+    p.add_argument(
+        "--min-samples-treatment", type=int, default=0,
+        dest="min_samples_treatment",
+        help=(
+            f"{scope_help_prefix}Per-site minimum number of treatment samples "
+            f"with non-zero coverage. Sites failing the threshold are NaN'd "
+            f"before FDR. Useful with --no-unite (BIO-7)."
+        ),
+    )
+    p.add_argument(
+        "--min-samples-case", type=int, default=None,
+        dest="_min_samples_case_legacy",
+        help=argparse.SUPPRESS,  # deprecated alias; warns at runtime
+    )
+    p.add_argument(
+        "--min-samples-control", type=int, default=0,
+        dest="min_samples_control",
+        help=f"{scope_help_prefix}Per-site minimum number of control samples "
+             f"with non-zero coverage.",
+    )
+
+
+def _resolve_min_samples_case(args: argparse.Namespace) -> None:
+    """Promote legacy ``--min-samples-case`` to ``min_samples_treatment``.
+
+    Emits a DeprecationWarning when the legacy flag was used; raises
+    SystemExit if both are passed (ambiguous).
+    """
+    legacy = getattr(args, "_min_samples_case_legacy", None)
+    if legacy is None:
+        return
+    warnings.warn(
+        "--min-samples-case is deprecated; use --min-samples-treatment.",
+        DeprecationWarning, stacklevel=2,
+    )
+    # Only treat the canonical flag as "explicitly set" when it differs from
+    # the default of 0; otherwise the user just passed the legacy alias.
+    if args.min_samples_treatment not in (0, None):
+        raise SystemExit(
+            "error: pass either --min-samples-treatment or --min-samples-case, not both"
+        )
+    args.min_samples_treatment = int(legacy)
 
 
 def _read_samplesheet_groups(samplesheet: str, treatment_group: str, control_group: str):
@@ -95,10 +148,10 @@ def _cli_n1_and_footgun_checks(args, unit: str = "sites") -> None:
             "test='fisher' is anti-conservative; prefer 'lr' at n >= 2.",
             UserWarning, stacklevel=2,
         )
-    if (not args.unite) and args.min_samples_case == 0 and args.min_samples_control == 0:
+    if (not args.unite) and args.min_samples_treatment == 0 and args.min_samples_control == 0:
         warnings.warn(
             f"--no-unite + min_samples_*=0 will test {unit} covered in only "
-            f"one sample per group. Recommended: --min-samples-case 2 "
+            f"one sample per group. Recommended: --min-samples-treatment 2 "
             f"--min-samples-control 2.",
             UserWarning, stacklevel=2,
         )
@@ -106,6 +159,7 @@ def _cli_n1_and_footgun_checks(args, unit: str = "sites") -> None:
 
 def _cmd_dmc(args: argparse.Namespace):
     """Handler for 'dmc' subcommand."""
+    _resolve_min_samples_case(args)
     treatment_samples, control_samples = _read_samplesheet_groups(
         args.samplesheet, args.treatment_group, args.control_group
     )
@@ -116,9 +170,9 @@ def _cmd_dmc(args: argparse.Namespace):
     print(f"Control samples:   {control_samples}")
     print(f"Test:              {args.test}")
     print(f"Unite mode:        {'intersect' if args.unite else 'union'}")
-    if args.min_samples_case or args.min_samples_control:
+    if args.min_samples_treatment or args.min_samples_control:
         print(
-            f"Per-site guards:   min_samples_case={args.min_samples_case}, "
+            f"Per-site guards:   min_samples_treatment={args.min_samples_treatment}, "
             f"min_samples_control={args.min_samples_control}"
         )
 
@@ -128,7 +182,7 @@ def _cmd_dmc(args: argparse.Namespace):
         control_samples,
         test=args.test,
         unite=args.unite,
-        min_samples_treatment=args.min_samples_case,
+        min_samples_treatment=args.min_samples_treatment,
         min_samples_control=args.min_samples_control,
     )
     results = dmc.apply_multiple_testing_correction(results, method="fdr_bh")
@@ -152,6 +206,7 @@ def _cmd_dmr(args: argparse.Namespace):
                 "--treatment-group and --control-group."
             )
 
+        _resolve_min_samples_case(args)
         treatment_samples, control_samples = _read_samplesheet_groups(
             args.samplesheet, args.treatment_group, args.control_group
         )
@@ -173,7 +228,7 @@ def _cmd_dmr(args: argparse.Namespace):
             alpha=args.alpha,
             min_abs_meth_diff=args.min_abs_meth_diff,
             unite=args.unite,
-            min_samples_treatment=args.min_samples_case,
+            min_samples_treatment=args.min_samples_treatment,
             min_samples_control=args.min_samples_control,
         )
     else:
@@ -379,18 +434,7 @@ def main():
         "--no-unite", action="store_false", dest="unite", default=True,
         help="Include sites seen in at least one sample (default: only sites in all samples)",
     )
-    p_dmc.add_argument(
-        "--min-samples-case", type=int, default=0,
-        help=(
-            "Per-site minimum number of treatment samples with non-zero "
-            "coverage. Sites failing the threshold are NaN'd before FDR. "
-            "Useful with --no-unite (BIO-7)."
-        ),
-    )
-    p_dmc.add_argument(
-        "--min-samples-control", type=int, default=0,
-        help="Per-site minimum number of control samples with non-zero coverage.",
-    )
+    _add_min_samples_args(p_dmc)
     p_dmc.add_argument(
         "--allow-n1", action="store_true", default=False,
         help=(
@@ -440,10 +484,7 @@ def main():
         "--no-unite", action="store_false", dest="unite", default=True,
         help="(tile only) Test tiles covered in at least one sample (default: intersect).",
     )
-    p_dmr.add_argument("--min-samples-case",    type=int, default=0,
-                       help="(tile only) Per-tile minimum treatment samples.")
-    p_dmr.add_argument("--min-samples-control", type=int, default=0,
-                       help="(tile only) Per-tile minimum control samples.")
+    _add_min_samples_args(p_dmr, scope_help_prefix="(tile only) ")
     p_dmr.add_argument(
         "--allow-n1", action="store_true", default=False,
         help=(
