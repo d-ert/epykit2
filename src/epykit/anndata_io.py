@@ -51,14 +51,26 @@ logger = logging.getLogger(__name__)
 _VALID_LAYERS = {"beta", "coverage", "N_meth", "N_unmeth"}
 
 
-def _site_index(store: str) -> tuple[pl.DataFrame, dict[tuple[str, int], int]]:
-    """Build the sorted (chrom, pos) site index from the Parquet store.
+def _site_index(store: str):
+    """Build the sorted (chrom, pos) site index plus per-chromosome position
+    arrays for sorted-search lookup.
 
-    Returns the index DataFrame and a ``(chrom, pos) → row_idx`` lookup.
-    The scan only touches the chrom + pos columns; ``unique()`` collapses
-    any duplicates across samples (a united store should have none, but
-    the call is idempotent).
+    Returns
+    -------
+    var : pl.DataFrame
+        Sorted (chrom, pos) DataFrame, length ``n_sites``.
+    chrom_index : dict[str, tuple[int, np.ndarray]]
+        ``{chrom: (start_idx, positions_int64)}`` — the slice
+        ``var[start_idx:start_idx + len(positions_int64)]`` is the
+        chromosome's contiguous block.
+
+    Memory cost is dominated by the per-chromosome int64 position arrays
+    (8 B / site). On a 338 M-CpG hg38 union store this is ~2.7 GB, vs.
+    the previous Python-dict design which needed ≥ 6-10 GB for the same
+    information.
     """
+    import numpy as np
+
     var = (
         pl.scan_parquet(f"{store}/sample=*/chrom=*/part-*.parquet")
         .select(["chrom", "pos"])
@@ -66,10 +78,49 @@ def _site_index(store: str) -> tuple[pl.DataFrame, dict[tuple[str, int], int]]:
         .sort(["chrom", "pos"])
         .collect()
     )
-    chroms = var["chrom"].to_list()
-    positions = var["pos"].to_list()
-    lookup = {(c, int(p)): i for i, (c, p) in enumerate(zip(chroms, positions))}
-    return var, lookup
+    chrom_index: dict[str, tuple[int, "np.ndarray"]] = {}
+    # Build per-chromosome contiguous slices via a single group_by — we
+    # don't materialise a dict of (chrom, pos) tuples.
+    offsets = (
+        var
+        .with_row_index("_idx")
+        .group_by("chrom", maintain_order=True)
+        .agg([
+            pl.col("_idx").min().alias("start"),
+            pl.col("pos").alias("positions"),
+        ])
+    )
+    for row in offsets.iter_rows(named=True):
+        chrom_index[row["chrom"]] = (
+            int(row["start"]),
+            np.asarray(row["positions"], dtype=np.int64),
+        )
+    return var, chrom_index
+
+
+def _value_lazyframe(lf: "pl.LazyFrame", chrom: str, layer: str) -> "pl.LazyFrame":
+    """Return a lazy frame with columns (pos, value) for one chromosome."""
+    lf = lf.filter(pl.col("chrom") == chrom)
+    if layer == "beta":
+        return (
+            lf.select(["pos", "N_meth", "coverage"])
+            .filter(pl.col("coverage") > 0)
+            .with_columns(
+                (pl.col("N_meth").cast(pl.Float32) / pl.col("coverage")).alias("value")
+            )
+            .select(["pos", "value"])
+        )
+    if layer == "coverage":
+        return lf.select(["pos", "coverage"]).rename({"coverage": "value"})
+    if layer == "N_meth":
+        return lf.select(["pos", "N_meth"]).rename({"N_meth": "value"})
+    if layer == "N_unmeth":
+        return (
+            lf.select(["pos", "N_meth", "coverage"])
+            .with_columns((pl.col("coverage") - pl.col("N_meth")).alias("value"))
+            .select(["pos", "value"])
+        )
+    raise ValueError(f"unknown layer {layer!r}")  # pragma: no cover
 
 
 def _fill_layer(
@@ -77,57 +128,52 @@ def _fill_layer(
     samples: list[str],
     n_sites: int,
     layer: str,
-    lookup: dict[tuple[str, int], int],
+    chrom_index: dict[str, tuple[int, "object"]],
     dtype,
 ):
-    """Stream sample-by-sample, filling a (n_samples × n_sites) array."""
+    """Stream sample × chromosome, filling a (n_samples × n_sites) array.
+
+    For each (sample, chromosome) we read just that partition file, then
+    use ``np.searchsorted`` against the chromosome's pre-built position
+    array to compute the destination column indices in O(n_rows · log n_chrom).
+    No Python-side dict is ever built — the only persistent index
+    structures are the per-chromosome int64 position arrays.
+    """
     import numpy as np
 
     out = np.full((len(samples), n_sites), np.nan, dtype=dtype)
     store_p = Path(store)
+
     for s_idx, sample in enumerate(samples):
         sample_dir = store_p / f"sample={sample}"
         if not sample_dir.exists():
             continue
-        # Scan just this sample. Lazy projection: only N_meth / coverage are
-        # ever read off disk (plus chrom + pos for the index lookup).
-        lf = pl.scan_parquet(f"{sample_dir}/chrom=*/part-*.parquet")
-        if layer == "beta":
-            lf = lf.select(["chrom", "pos", "N_meth", "coverage"]).filter(
-                pl.col("coverage") > 0
-            ).with_columns(
-                (pl.col("N_meth").cast(pl.Float32) / pl.col("coverage")).alias("value")
-            )
-        elif layer == "coverage":
-            lf = lf.select(["chrom", "pos", "coverage"]).rename({"coverage": "value"})
-        elif layer == "N_meth":
-            lf = lf.select(["chrom", "pos", "N_meth"]).rename({"N_meth": "value"})
-        elif layer == "N_unmeth":
-            lf = lf.select(["chrom", "pos", "N_meth", "coverage"]).with_columns(
-                (pl.col("coverage") - pl.col("N_meth")).alias("value")
-            )
-        else:  # pragma: no cover — guarded upstream
-            raise ValueError(f"unknown layer {layer!r}")
+        for chrom, (chrom_start, var_positions) in chrom_index.items():
+            chrom_part = sample_dir / f"chrom={chrom}"
+            if not chrom_part.exists():
+                continue
+            lf = pl.scan_parquet(f"{chrom_part}/part-*.parquet")
+            df = _value_lazyframe(lf, chrom, layer).collect()
+            if len(df) == 0:
+                continue
 
-        df = lf.select(["chrom", "pos", "value"]).collect()
-        if len(df) == 0:
-            continue
+            sample_positions = df["pos"].to_numpy().astype(np.int64, copy=False)
+            values = df["value"].to_numpy()
 
-        chroms = df["chrom"].to_list()
-        positions = df["pos"].to_list()
-        values = df["value"].to_numpy()
-
-        # Build column index for this sample. dict lookup is ~250 ns per
-        # entry; for 30 M sites that's ~8 s per sample, which is dwarfed
-        # by the Parquet scan itself.
-        col_idx = np.fromiter(
-            (lookup.get((c, int(p)), -1) for c, p in zip(chroms, positions)),
-            count=len(chroms), dtype=np.int64,
-        )
-        mask = col_idx >= 0
-        if not mask.any():
-            continue
-        out[s_idx, col_idx[mask]] = values[mask].astype(dtype, copy=False)
+            # Look up the column index of each sample CpG inside the
+            # chromosome's var slice via a single sorted-search call.
+            local_idx = np.searchsorted(var_positions, sample_positions)
+            # Guard against positions that fall off the end of the array
+            # (would happen on a *union* store where a sample contributes
+            # a CpG that no other sample has — searchsorted returns
+            # len(arr)). Bounds-check first, then equality-check.
+            in_range = local_idx < len(var_positions)
+            local_idx_safe = np.where(in_range, local_idx, 0)
+            hit = in_range & (var_positions[local_idx_safe] == sample_positions)
+            if not hit.any():
+                continue
+            global_idx = chrom_start + local_idx_safe[hit]
+            out[s_idx, global_idx] = values[hit].astype(dtype, copy=False)
     return out
 
 
@@ -209,15 +255,26 @@ def to_anndata(
     samples = md.obs.get_column("sample_id").to_list()
 
     logger.info("to_anndata: building site index from %s", md.store)
-    var, lookup = _site_index(md.store)
+    var, chrom_index = _site_index(md.store)
     n_sites = len(var)
+    dense_gib = len(samples) * n_sites * np_dtype.itemsize / (1024 ** 3)
     logger.info(
-        "to_anndata: %d sample(s) × %d site(s) — estimated dense size %.2f GiB",
-        len(samples), n_sites,
-        len(samples) * n_sites * np_dtype.itemsize / (1024 ** 3),
+        "to_anndata: %d sample(s) × %d site(s) — estimated dense size %.2f GiB per layer",
+        len(samples), n_sites, dense_gib,
     )
+    # Loud warning if the user is about to allocate something huge. 4 GiB
+    # crosses the threshold where even 32 GiB workstations start swapping
+    # once anndata's own copies are factored in.
+    if dense_gib > 4.0:
+        logger.warning(
+            "to_anndata: dense X is %.1f GiB. Consider filtering to a smaller "
+            "site set first (e.g. ep.pp.filter_coverage + ep.pp.unite with "
+            "type='intersect', or ep.pp.aggregate_regions to a BED of "
+            "promoters/peaks) before exporting.",
+            dense_gib,
+        )
 
-    X = _fill_layer(md.store, samples, n_sites, layer, lookup, np_dtype)
+    X = _fill_layer(md.store, samples, n_sites, layer, chrom_index, np_dtype)
 
     obs_pd = md.obs.to_pandas().set_index("sample_id")
 
@@ -234,7 +291,7 @@ def to_anndata(
                 continue
             logger.info("to_anndata: filling layer %r", extra)
             adata.layers[extra] = _fill_layer(
-                md.store, samples, n_sites, extra, lookup, np_dtype,
+                md.store, samples, n_sites, extra, chrom_index, np_dtype,
             )
 
     adata.uns["epykit_assembly"] = md.assembly
