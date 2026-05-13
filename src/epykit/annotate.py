@@ -313,10 +313,16 @@ def _annotate_chromosome_chunk(
         del joined_df
         gc.collect()
 
-        feat_col = "Feature_b" if "Feature_b" in best.columns else "Feature"
+        feat_col = "Feature_b"   if "Feature_b"   in best.columns else "Feature"
+        gid_col  = "gene_id_b"   if "gene_id_b"   in best.columns else "gene_id"
+        gnm_col  = "gene_name_b" if "gene_name_b" in best.columns else "gene_name"
         best_slim = (
-            best[["_row_idx", "gene_id", "gene_name", feat_col]]
-            .rename(columns={feat_col: "feature_type"})
+            best[["_row_idx", gid_col, gnm_col, feat_col]]
+            .rename(columns={
+                gid_col:  "gene_id",
+                gnm_col:  "gene_name",
+                feat_col: "feature_type",
+            })
         )
         del best
 
@@ -625,7 +631,9 @@ def annotate_cpg_islands(
     _log("Step 1/3: loading BED ...")
     try:
         t0 = time.time()
-        islands_df = bioframe.read_table(cpg_island_bed, schema="bed3").rename(
+        islands_df = bioframe.read_table(
+            cpg_island_bed, schema="bed3", usecols=[0, 1, 2]
+        ).rename(
             columns={"chrom": "Chromosome", "start": "Start", "end": "End"}
         )
         _log(f"  BED loaded in {time.time()-t0:.1f}s: {len(islands_df):,} islands")

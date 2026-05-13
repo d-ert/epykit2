@@ -72,7 +72,7 @@ print(f"DMR: {n_dmrs:,} tiles called")
 
 ep.tl.annotate(
     md,
-    gtf=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf"),
+    gtf=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf.gz"),
     cpg_islands=str(RAW / "hg38_cpg_islands.bed"),
 )
 print("Annotation done.")
@@ -101,7 +101,7 @@ print("\n--- New: TSS metaplot ---")
 try:
     ep.pl.tss_metaplot(
         md,
-        gtf_path=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf"),
+        gtf_path=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf.gz"),
         window_bp=2000,
         n_bins=100,
         group_by="group",
@@ -158,7 +158,7 @@ print("\n--- New: HTML report ---")
 md.report(
     str(OUT / "cd55_region_report.html"),
     title="CD55 vs Control — region-aggregated",
-    gtf_path=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf"),
+    gtf_path=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf.gz"),
     alpha=0.05,
     min_abs_diff=0.1,
 )
@@ -170,7 +170,7 @@ md_cpg = ep.MethylData.load(str(OUT / "cd55_per_cpg_snapshot"))
 md_cpg.report(
     str(OUT / "cd55_per_cpg_report.html"),
     title="CD55 vs Control — per CpG",
-    gtf_path=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf"),
+    gtf_path=str(RAW / "gencode.v49.chr_patch_hapl_scaff.annotation.gtf.gz"),
     alpha=0.05,
     min_abs_diff=0.1,
 )

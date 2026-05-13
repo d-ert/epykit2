@@ -3,7 +3,6 @@ from __future__ import annotations
 from ._utils import _get_ax, _save_fig
 from ..methyldata import MethylData
 import polars as pl
-import numpy as np
 
 
 def coverage_histogram(md: MethylData, bins: int = 100, ax=None, figsize=(6, 4), save: str | None = None):

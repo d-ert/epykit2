@@ -15,12 +15,13 @@ for C, ``-`` otherwise); without a reference it defaults to ``*``.
 
 from __future__ import annotations
 
-import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
+
+from . import _cache
 
 
 RAW_MANIFEST_NAME = ".epykit_raw_manifest.json"
@@ -48,46 +49,16 @@ class _SampleManifest:
     row_group_size: int
 
 
-def _file_signature(path: Path) -> dict[str, object]:
-    stat = path.stat()
-    return {
-        "path": str(path.resolve()),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
-
-
-def _load_json(path: Path) -> dict[str, object] | None:
-    if not path.exists():
-        return None
-    with path.open() as handle:
-        return json.load(handle)
-
-
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-
-def _sample_dir(output_dir: Path, sample_name: str) -> Path:
-    return output_dir / f"sample={sample_name}"
+_file_signature = _cache.file_signature
+_load_json = _cache.load_json
+_write_json = _cache.write_json
+_sample_dir = _cache.sample_dir
+_expected_chrom_dirs = _cache.expected_chrom_dirs
+_sample_is_complete = _cache.sample_is_complete
 
 
 def _manifest_path(sample_dir: Path) -> Path:
     return sample_dir / RAW_MANIFEST_NAME
-
-
-def _expected_chrom_dirs(sample_dir: Path) -> list[str]:
-    return sorted(item.name for item in sample_dir.glob("chrom=*") if item.is_dir())
-
-
-def _sample_is_complete(sample_dir: Path, chroms: list[str]) -> bool:
-    if not sample_dir.exists():
-        return False
-    if _expected_chrom_dirs(sample_dir) != sorted(chroms):
-        return False
-    return all(
-        (sample_dir / chrom / "part-0.parquet").exists() for chrom in chroms
-    )
 
 
 def _manifest_payload(manifest: _SampleManifest) -> dict[str, object]:

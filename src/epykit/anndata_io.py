@@ -71,54 +71,68 @@ def _site_index(store: str):
     """
     import numpy as np
 
+    # Cast pos to Int64 inside the scan so every downstream conversion is
+    # dtype-pinned from the source. An earlier implementation aggregated
+    # `pl.col("pos")` into a list column and then went through
+    # `iter_rows(named=True)` + `np.asarray(..., dtype=np.int64)` to slice
+    # per-chromosome arrays — that path round-tripped through polars list
+    # columns and could surface as a complex128 allocation under some
+    # polars/arrow versions, OOMing on 42M-site stores.
     var = (
         pl.scan_parquet(f"{store}/sample=*/chrom=*/part-*.parquet")
-        .select(["chrom", "pos"])
+        .select([pl.col("chrom"), pl.col("pos").cast(pl.Int64)])
         .unique()
         .sort(["chrom", "pos"])
         .collect()
     )
     chrom_index: dict[str, tuple[int, "np.ndarray"]] = {}
-    # Build per-chromosome contiguous slices via a single group_by — we
-    # don't materialise a dict of (chrom, pos) tuples.
-    offsets = (
-        var
-        .with_row_index("_idx")
-        .group_by("chrom", maintain_order=True)
-        .agg([
-            pl.col("_idx").min().alias("start"),
-            pl.col("pos").alias("positions"),
-        ])
-    )
-    for row in offsets.iter_rows(named=True):
-        chrom_index[row["chrom"]] = (
-            int(row["start"]),
-            np.asarray(row["positions"], dtype=np.int64),
-        )
+    running_start = 0
+    for chrom in var["chrom"].unique(maintain_order=True).to_list():
+        block_pos = var.filter(pl.col("chrom") == chrom)["pos"]
+        positions = block_pos.to_numpy(zero_copy_only=False)
+        if positions.dtype != np.int64:
+            raise AssertionError(
+                f"_site_index: expected int64 positions for {chrom!r}, "
+                f"got {positions.dtype}"
+            )
+        chrom_index[chrom] = (running_start, positions)
+        running_start += len(positions)
     return var, chrom_index
 
 
-def _value_lazyframe(lf: "pl.LazyFrame", chrom: str, layer: str) -> "pl.LazyFrame":
-    """Return a lazy frame with columns (pos, value) for one chromosome."""
+def _value_lazyframe(
+    lf: "pl.LazyFrame",
+    chrom: str,
+    layer: str,
+    *,
+    pl_value_dtype: "pl.DataType",
+) -> "pl.LazyFrame":
+    """Return a lazy frame with columns (pos: Int64, value: pl_value_dtype) for one chromosome.
+
+    The value dtype is pinned in polars so the downstream
+    ``df["value"].to_numpy()`` cannot pick an unexpected numpy dtype.
+    """
     lf = lf.filter(pl.col("chrom") == chrom)
+    pos = pl.col("pos").cast(pl.Int64)
     if layer == "beta":
         return (
             lf.select(["pos", "N_meth", "coverage"])
             .filter(pl.col("coverage") > 0)
             .with_columns(
-                (pl.col("N_meth").cast(pl.Float32) / pl.col("coverage")).alias("value")
+                (pl.col("N_meth").cast(pl_value_dtype) / pl.col("coverage").cast(pl_value_dtype))
+                .alias("value")
             )
-            .select(["pos", "value"])
+            .select([pos, pl.col("value").cast(pl_value_dtype)])
         )
     if layer == "coverage":
-        return lf.select(["pos", "coverage"]).rename({"coverage": "value"})
+        return lf.select([pos, pl.col("coverage").cast(pl_value_dtype).alias("value")])
     if layer == "N_meth":
-        return lf.select(["pos", "N_meth"]).rename({"N_meth": "value"})
+        return lf.select([pos, pl.col("N_meth").cast(pl_value_dtype).alias("value")])
     if layer == "N_unmeth":
         return (
             lf.select(["pos", "N_meth", "coverage"])
             .with_columns((pl.col("coverage") - pl.col("N_meth")).alias("value"))
-            .select(["pos", "value"])
+            .select([pos, pl.col("value").cast(pl_value_dtype)])
         )
     raise ValueError(f"unknown layer {layer!r}")  # pragma: no cover
 
@@ -141,7 +155,18 @@ def _fill_layer(
     """
     import numpy as np
 
-    out = np.full((len(samples), n_sites), np.nan, dtype=dtype)
+    np_dtype = np.dtype(dtype)
+    # Map numpy float dtype → polars float dtype so the value column is
+    # pinned end-to-end. Anything other than float32/float64 is rejected
+    # by to_anndata() above, so this mapping is exhaustive.
+    if np_dtype == np.float32:
+        pl_value_dtype = pl.Float32
+    elif np_dtype == np.float64:
+        pl_value_dtype = pl.Float64
+    else:
+        raise ValueError(f"unsupported dtype {np_dtype!r}; use float32 or float64")
+
+    out = np.full((len(samples), n_sites), np.nan, dtype=np_dtype)
     store_p = Path(store)
 
     for s_idx, sample in enumerate(samples):
@@ -153,12 +178,22 @@ def _fill_layer(
             if not chrom_part.exists():
                 continue
             lf = pl.scan_parquet(f"{chrom_part}/part-*.parquet")
-            df = _value_lazyframe(lf, chrom, layer).collect()
+            df = _value_lazyframe(lf, chrom, layer, pl_value_dtype=pl_value_dtype).collect()
             if len(df) == 0:
                 continue
 
-            sample_positions = df["pos"].to_numpy().astype(np.int64, copy=False)
-            values = df["value"].to_numpy()
+            sample_positions = df["pos"].to_numpy(zero_copy_only=False)
+            if sample_positions.dtype != np.int64:
+                raise AssertionError(
+                    f"_fill_layer: expected int64 sample_positions on {chrom!r}, "
+                    f"got {sample_positions.dtype}"
+                )
+            values = df["value"].to_numpy(zero_copy_only=False)
+            if values.dtype != np_dtype:
+                raise AssertionError(
+                    f"_fill_layer: expected {np_dtype} values on {chrom!r}, "
+                    f"got {values.dtype}"
+                )
 
             # Look up the column index of each sample CpG inside the
             # chromosome's var slice via a single sorted-search call.
@@ -173,7 +208,7 @@ def _fill_layer(
             if not hit.any():
                 continue
             global_idx = chrom_start + local_idx_safe[hit]
-            out[s_idx, global_idx] = values[hit].astype(dtype, copy=False)
+            out[s_idx, global_idx] = values[hit]
     return out
 
 
@@ -278,10 +313,12 @@ def to_anndata(
 
     obs_pd = md.obs.to_pandas().set_index("sample_id")
 
-    chrom_arr = var["chrom"].to_list()
-    pos_arr = var["pos"].to_list()
-    var_pd = pd.DataFrame({"chrom": chrom_arr, "pos": pos_arr})
-    var_pd.index = [f"{c}:{p}" for c, p in zip(chrom_arr, pos_arr)]
+    # Build var via Arrow → pandas in one shot (no Python-level 42M-element
+    # lists). The "{chrom}:{pos}" index is built vectorised on pandas
+    # Series rather than with a Python list comprehension, which on real
+    # WGBS removes several GB of transient Python object overhead.
+    var_pd = var.to_pandas()
+    var_pd.index = (var_pd["chrom"].astype(str) + ":" + var_pd["pos"].astype(str)).values
 
     adata = ad.AnnData(X=X, obs=obs_pd, var=var_pd)
 

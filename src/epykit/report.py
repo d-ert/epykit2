@@ -17,7 +17,7 @@ import datetime
 import json
 import logging
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import numpy as np
 import polars as pl

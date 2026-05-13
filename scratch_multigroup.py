@@ -60,7 +60,7 @@ SAMPLESHEET = "full_samplesheet.csv"
 STORE_DIR   = "epykit_test_full"
 ASSEMBLY    = "hg38"
 
-GTF         = "raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf"
+GTF         = "raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf.gz"
 CPG_ISLANDS = "raw_data/hg38_cpg_islands.bed"
 
 # Pairwise contrasts. epykit's pipeline is 2-group, so a 4-group design like
@@ -223,7 +223,7 @@ def run_contrast(treatment: str, control: str) -> None:
     # heatmap is its own call because it takes an extra arg
     try:
         ep.pl.methylation_heatmap(md, n_top=500, save=f"{name}_heatmap")
-        print(f"  [ok]   methylation_heatmap")
+        print("  [ok]   methylation_heatmap")
     except Exception as exc:
         print(f"  [FAIL] methylation_heatmap: {exc}")
 

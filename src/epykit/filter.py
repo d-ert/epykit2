@@ -13,13 +13,51 @@ Notable design points:
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import polars as pl
 
+from . import _cache
+
 logger = logging.getLogger(__name__)
+
+FILTER_MANIFEST_NAME = ".epykit_filter_manifest.json"
+NORMALIZE_MANIFEST_NAME = ".epykit_normalize_manifest.json"
+
+
+def _filter_params_payload(
+    min_coverage: int,
+    max_coverage_quantile: float,
+    blacklist_bed: Optional[str],
+) -> dict:
+    return {
+        "min_coverage": int(min_coverage),
+        "max_coverage_quantile": float(max_coverage_quantile),
+        "blacklist_bed_sig": (
+            _cache.file_signature(Path(blacklist_bed))
+            if blacklist_bed
+            else None
+        ),
+    }
+
+
+def _can_reuse_filtered(
+    in_sample_dir: Path, out_sample_dir: Path, params: dict
+) -> bool:
+    manifest = _cache.load_json(out_sample_dir / FILTER_MANIFEST_NAME)
+    if not manifest:
+        return False
+    if manifest.get("params") != params:
+        return False
+    if manifest.get("source") != _cache.upstream_sample_signature(in_sample_dir):
+        return False
+    chroms = manifest.get("chroms")
+    if not isinstance(chroms, list):
+        return False
+    return _cache.sample_is_complete(out_sample_dir, chroms)
 
 
 # Internal helpers
@@ -60,7 +98,7 @@ def _apply_blacklist(df: pl.DataFrame, blacklist_bed: str) -> pl.DataFrame:
             "Install it with: pip install bioframe"
         ) from exc
 
-    bl = bioframe.read_table(blacklist_bed, schema="bed3")
+    bl = bioframe.read_table(blacklist_bed, schema="bed3", usecols=[0, 1, 2])
 
     cpg = pd.DataFrame({
         "chrom": df["chrom"].to_list(),
@@ -216,16 +254,27 @@ def filter_sites(
     else:
         samples_to_filter = [d.name.removeprefix("sample=") for d in sorted(sample_dirs)]
 
+    params = _filter_params_payload(min_coverage, max_coverage_quantile, blacklist_bed)
+
     for samp in samples_to_filter:
-        logger.info("Filtering sample %s...", samp)
         sample_dir = methylstore_path / f"sample={samp}"
+        out_sample_dir = output_dir_path / f"sample={samp}"
+
+        if _can_reuse_filtered(sample_dir, out_sample_dir, params):
+            logger.info("Filtering sample %s: cached", samp)
+            continue
+
+        logger.info("Filtering sample %s...", samp)
+
+        # Wipe stale output before re-running so the manifest's chrom list
+        # matches what's on disk.
+        if out_sample_dir.exists():
+            shutil.rmtree(out_sample_dir)
+        out_sample_dir.mkdir(parents=True, exist_ok=True)
 
         # --- PERF-2: pass 1 — coverage column only, genome-wide quantile ---
         max_cov = _genome_wide_quantile(sample_dir, max_coverage_quantile)
         logger.info("  Max coverage quantile (%s): %s", max_coverage_quantile, max_cov)
-
-        out_sample_dir = output_dir_path / f"sample={samp}"
-        out_sample_dir.mkdir(parents=True, exist_ok=True)
 
         chrom_dirs = sorted(sample_dir.glob("chrom=*"))
         if not chrom_dirs:
@@ -270,6 +319,16 @@ def filter_sites(
             for f in out_sample_dir.rglob("part-*.parquet")
         )
         logger.info("  Written %d chromosome file(s) for %s", n_out, samp)
+
+        _cache.write_json(
+            out_sample_dir / FILTER_MANIFEST_NAME,
+            {
+                "sample_name": samp,
+                "source": _cache.upstream_sample_signature(sample_dir),
+                "params": params,
+                "chroms": _cache.expected_chrom_dirs(out_sample_dir),
+            },
+        )
 
     logger.info("Filtered Parquet store written to %s", output_dir_path)
 
@@ -327,6 +386,32 @@ def normalize_coverage_store(
     if not samples:
         raise ValueError(f"No sample=* directories found in {src}")
 
+    # --- Cohort cache check ----------------------------------------------
+    cohort_sig = {
+        samp: _cache.upstream_sample_signature(src / f"sample={samp}")
+        for samp in samples
+    }
+    cohort_params = {"method": method}
+    cohort_manifest_path = out / NORMALIZE_MANIFEST_NAME
+    cached = _cache.load_json(cohort_manifest_path)
+    if (
+        cached
+        and cached.get("params") == cohort_params
+        and cached.get("source") == cohort_sig
+        and set(cached.get("factors", {}).keys()) == set(samples)
+    ):
+        chroms_by_sample = cached.get("chroms_by_sample", {})
+        if all(
+            _cache.sample_is_complete(out / f"sample={samp}", chroms_by_sample.get(samp, []))
+            for samp in samples
+        ):
+            factors = {s: float(v) for s, v in cached["factors"].items()}
+            logger.info("Normalised store cached at %s (method=%s, target=%.2f)",
+                        out, method, float(cached.get("target", 0.0)))
+            for samp in samples:
+                logger.info("  %s: factor=%.4f (cached)", samp, factors[samp])
+            return factors
+
     # --- Pass 1: per-sample central coverage ------------------------------
     summaries: dict[str, float] = {}
     for samp in samples:
@@ -366,6 +451,13 @@ def normalize_coverage_store(
         )
 
     # --- Pass 2: scale and write ------------------------------------------
+    # Wipe any stale output so the cohort manifest's chrom listing matches
+    # what's actually on disk after this run.
+    for samp in samples:
+        out_samp = out / f"sample={samp}"
+        if out_samp.exists():
+            shutil.rmtree(out_samp)
+
     for samp in samples:
         s = factors[samp]
         sample_dir = src / f"sample={samp}"
@@ -404,6 +496,20 @@ def normalize_coverage_store(
                 str(out_chrom_dir / "part-0.parquet"),
                 compression="zstd",
             )
+
+    _cache.write_json(
+        cohort_manifest_path,
+        {
+            "params": cohort_params,
+            "source": cohort_sig,
+            "target": target,
+            "factors": factors,
+            "chroms_by_sample": {
+                samp: _cache.expected_chrom_dirs(out / f"sample={samp}")
+                for samp in samples
+            },
+        },
+    )
 
     logger.info("Normalised Parquet store written to %s", out)
     return factors

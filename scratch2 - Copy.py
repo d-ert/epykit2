@@ -1,5 +1,4 @@
 "Scratch2"
-from pathlib import Path
 
 import matplotlib
 
@@ -17,9 +16,11 @@ import epykit as ep
 import polars as pl
 
 md = ep.read_bismark(
-    "full_samplesheet.csv",
+    "samplesheet.csv",
+    treatment_group="cd55",
+    control_group="control",
     assembly="hg38",
-    store_dir="epykit_test_full",
+    store_dir="epykit_test_bioframe",
 )
 
 print(md)
@@ -39,7 +40,7 @@ pct = 100 * sig / total
 print(f"Total sites tested: {total:,}")
 print(f"Significant DMCs: {sig:,}")
 print(f"Percentage: {pct:.2f}%")
-print(f"\nEffect size summary:")
+print("\nEffect size summary:")
 print(md.dmc.filter(pl.col('qvalue') < 0.05).select('meth_diff').describe())
 
 # ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ print(md.uns["dmr"].filter(pl.col("qvalue") < 0.05))
 
 ep.tl.annotate(
     md,
-    gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf",
+    gtf="raw_data/gencode.v49.chr_patch_hapl_scaff.annotation.gtf.gz",
     cpg_islands="raw_data/hg38_cpg_islands.bed",
 )
 
@@ -108,7 +109,7 @@ del md
 gc.collect()
 
 # Reload the preprocessed/annotated data for plotting (much faster than full pipeline)
-md = ep.load("epykit_test_full/results/cd55_analysis")
+md = ep.load("epykit_test_bioframe/results/cd55_analysis")
 print("\nLoaded preprocessed data for plotting")
 
 # Plot differential methylation plots
