@@ -8,9 +8,9 @@ The per-chromosome join loop bounds peak memory by the largest single
 chromosome rather than the whole genome. GTFs are parsed once per process
 and cached in a bounded LRU (``_GTF_CACHE``, default 2 slots; override via
 ``EPYKIT_GTF_CACHE_SIZE`` or :func:`set_gtf_cache_size`) keyed on the
-canonical file path; the Feature column is cast to pandas Categorical
-before constructing PyRanges because pyranges' null_types() can't handle
-plain str dtype.
+canonical file path. Interval overlaps go through bioframe, which is pure
+Python (pandas + numpy) and avoids the C-extension install pain that comes
+with pyranges/ncls/sorted_nearest.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ import gzip
 import logging
 import os
 import re
-import sys
 import time
 import traceback
 from collections import OrderedDict
@@ -97,20 +96,24 @@ def _df_info(name: str, df) -> str:
         return f"{name}: (unknown shape)"
 
 
-def _sites_to_pyranges(sites: pl.DataFrame) -> "pr.PyRanges":
-    import pyranges as pr
+def _sites_to_df(sites: pl.DataFrame) -> "pd.DataFrame":
+    """Build a pandas DataFrame of single-base (or explicit-range) site intervals
+    using the Capitalized column convention (``Chromosome``/``Start``/``End``)
+    shared with the GTF-derived feature DataFrames downstream.
+    """
+    import pandas as pd
     if "start" in sites.columns and "end" in sites.columns:
-        return pr.PyRanges(
-            chromosomes=sites["chrom"].to_list(),
-            starts=sites["start"].to_list(),
-            ends=sites["end"].to_list(),
-        )
+        return pd.DataFrame({
+            "Chromosome": sites["chrom"].to_list(),
+            "Start":      sites["start"].to_list(),
+            "End":        sites["end"].to_list(),
+        })
     pos = sites["pos"].to_list()
-    return pr.PyRanges(
-        chromosomes=sites["chrom"].to_list(),
-        starts=pos,
-        ends=[p + 1 for p in pos],
-    )
+    return pd.DataFrame({
+        "Chromosome": sites["chrom"].to_list(),
+        "Start":      pos,
+        "End":        [p + 1 for p in pos],
+    })
 
 
 def _build_promoter_df(genes_pd, upstream_bp: int, downstream_bp: int) -> "pd.DataFrame":
@@ -194,7 +197,7 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
                 feature = parts[2]
                 if feature not in ('gene', 'exon'):
                     continue
-                # GTF 1-based closed → PyRanges 0-based half-open: subtract
+                # GTF 1-based closed → 0-based half-open: subtract
                 # 1 from start; end already correct.
                 start  = int(parts[3]) - 1
                 end    = int(parts[4])
@@ -246,8 +249,10 @@ def _annotate_chromosome_chunk(
     chrom_features_df: "pd.DataFrame",
 ) -> "pd.DataFrame":
     """Run overlap + best-pick for one chromosome. Returns pandas DataFrame."""
-    import pyranges as pr
+    import bioframe
     import pandas as pd
+
+    COLS = ("Chromosome", "Start", "End")
 
     chunk_n   = len(chrom_sites)
     orig_idxs = chrom_sites["_orig_idx"].to_numpy()
@@ -263,51 +268,42 @@ def _annotate_chromosome_chunk(
         _log(f"  {chrom}: no features -> all intergenic")
         return result
 
-    _log(f"  {chrom}: building sites PyRanges ({chunk_n:,} sites)")
+    _log(f"  {chrom}: building sites DataFrame ({chunk_n:,} sites)")
     t0 = time.time()
     try:
-        sites_pr_base = _sites_to_pyranges(chrom_sites)
-        sites_pd      = sites_pr_base.df.copy()
+        sites_pd = _sites_to_df(chrom_sites)
         sites_pd["_row_idx"] = np.arange(chunk_n, dtype=np.int32)
-        sites_pr2 = pr.PyRanges(sites_pd)
-        _log(f"  {chrom}: sites PyRanges built in {time.time()-t0:.1f}s")
+        _log(f"  {chrom}: sites DataFrame built in {time.time()-t0:.1f}s")
     except Exception:
-        _log(f"  {chrom}: ERROR building sites PyRanges:\n{traceback.format_exc()}")
+        _log(f"  {chrom}: ERROR building sites DataFrame:\n{traceback.format_exc()}")
         return result
 
-    _log(f"  {chrom}: building features PyRanges ({len(chrom_features_df):,} features)")
+    _log(f"  {chrom}: features DataFrame ({len(chrom_features_df):,} features)")
+    feat_df = chrom_features_df
+
+    _log(f"  {chrom}: running overlap ...")
     t0 = time.time()
     try:
-        # Cast Feature to Categorical so pyranges null_types() accepts it.
-        feat_df = chrom_features_df.copy()
-        for _col in feat_df.select_dtypes(include=["object"]).columns:
-            feat_df[_col] = feat_df[_col].astype("category")
-        features_pr = pr.PyRanges(feat_df)
-
-        _log(f"  {chrom}: features PyRanges built in {time.time()-t0:.1f}s")
+        joined = bioframe.overlap(
+            sites_pd, feat_df,
+            how="left",
+            cols1=COLS, cols2=COLS,
+            suffixes=("", "_b"),
+        )
+        join_rows = len(joined)
+        _log(f"  {chrom}: overlap done in {time.time()-t0:.1f}s  -> {join_rows:,} rows")
     except Exception:
-        _log(f"  {chrom}: ERROR building features PyRanges:\n{traceback.format_exc()}")
-        return result
-
-    _log(f"  {chrom}: running join ...")
-    t0 = time.time()
-    try:
-        joined    = sites_pr2.join(features_pr, how="left", suffix="_b", apply_strand_suffix=False)
-        join_rows = len(joined.df)
-        _log(f"  {chrom}: join done in {time.time()-t0:.1f}s  -> {join_rows:,} rows")
-        del features_pr
-    except Exception:
-        _log(f"  {chrom}: ERROR during join:\n{traceback.format_exc()}")
+        _log(f"  {chrom}: ERROR during overlap:\n{traceback.format_exc()}")
         return result
 
     if join_rows == 0:
         del joined
         gc.collect()
-        _log(f"  {chrom}: join returned 0 rows -> all intergenic")
+        _log(f"  {chrom}: overlap returned 0 rows -> all intergenic")
         return result
 
     try:
-        joined_df = joined.df.copy()
+        joined_df = joined
         del joined
         gc.collect()
 
@@ -356,9 +352,9 @@ def annotate_features(
     same file path skip the 60-90 s streaming step entirely.
     """
     try:
-        import pyranges as pr
+        import bioframe  # noqa: F401  (presence-check; used inside _annotate_chromosome_chunk)
     except ImportError as exc:
-        raise ImportError("pyranges is required. pip install pyranges") from exc
+        raise ImportError("bioframe is required. pip install bioframe") from exc
 
     import pandas as pd
 
@@ -414,7 +410,7 @@ def annotate_features(
         gc.collect()
         _log(f"  exons: {n_before:,} -> {len(exons_pd):,} (removed {n_before - len(exons_pd):,} duplicates)")
     else:
-        _log(f"  WARNING: expected exon columns not all present; skipping dedup.")
+        _log("  WARNING: expected exon columns not all present; skipping dedup.")
 
     # ------------------------------------------------------------------
     # Step 3: Build combined feature DataFrame
@@ -615,11 +611,13 @@ def annotate_cpg_islands(
         return sites
 
     try:
-        import pyranges as pr
+        import bioframe
     except ImportError as exc:
-        raise ImportError("pyranges is required. pip install pyranges") from exc
+        raise ImportError("bioframe is required. pip install bioframe") from exc
 
     import pandas as pd
+
+    COLS = ("Chromosome", "Start", "End")
 
     t_total = time.time()
     n = len(sites)
@@ -627,21 +625,20 @@ def annotate_cpg_islands(
     _log("Step 1/3: loading BED ...")
     try:
         t0 = time.time()
-        islands = pr.read_bed(cpg_island_bed)
-        _log(f"  BED loaded in {time.time()-t0:.1f}s: {len(islands.df):,} islands")
+        islands_df = bioframe.read_table(cpg_island_bed, schema="bed3").rename(
+            columns={"chrom": "Chromosome", "start": "Start", "end": "End"}
+        )
+        _log(f"  BED loaded in {time.time()-t0:.1f}s: {len(islands_df):,} islands")
     except Exception:
         _log(f"FATAL: error loading BED:\n{traceback.format_exc()}")
         raise
 
-    if len(islands.df) == 0:
+    if len(islands_df) == 0:
         _log("  WARNING: BED is empty -> all sites open_sea")
         return sites.with_columns(pl.lit("open_sea").alias("cpg_context"))
 
     SHORE_DIST = 2_000
     SHELF_DIST = 4_000
-
-    islands_df = islands.df.copy()
-    del islands
 
     def _flanks(df: pd.DataFrame, inner: int, outer: int, label: str) -> pd.DataFrame:
         up = df[["Chromosome", "Start", "End"]].copy()
@@ -659,14 +656,13 @@ def annotate_cpg_islands(
     islands_df["_ctx"] = "island"
     _log(f"  flanks built: {len(shore_df):,} shore intervals, {len(shelf_df):,} shelf intervals")
 
-    _log("Step 2/3: building sites PyRanges ...")
+    _log("Step 2/3: building sites DataFrame ...")
     try:
-        sites_pr_df = _sites_to_pyranges(sites).df.copy()
+        sites_pr_df = _sites_to_df(sites)
         sites_pr_df["_row_idx"] = np.arange(n, dtype=np.int32)
-        sites_pr = pr.PyRanges(sites_pr_df)
-        _log(f"  sites PyRanges: {n:,} rows")
+        _log(f"  sites DataFrame: {n:,} rows")
     except Exception:
-        _log(f"FATAL: error building sites PyRanges:\n{traceback.format_exc()}")
+        _log(f"FATAL: error building sites DataFrame:\n{traceback.format_exc()}")
         raise
 
     cpg_context = np.full(n, "open_sea", dtype=object)
@@ -679,13 +675,17 @@ def annotate_cpg_islands(
     ]:
         t0 = time.time()
         try:
-            ctx_pr  = pr.PyRanges(ctx_df)
-            overlap = sites_pr.overlap(ctx_pr)
-            n_hits  = len(overlap.df)
+            overlap = bioframe.overlap(
+                sites_pr_df, ctx_df,
+                how="inner",
+                cols1=COLS, cols2=COLS,
+                suffixes=("", "_b"),
+            )
+            n_hits  = len(overlap)
             _log(f"  {ctx_label}: {n_hits:,} hits in {time.time()-t0:.1f}s")
             if n_hits == 0:
                 continue
-            hit_idxs = overlap.df["_row_idx"].to_numpy(dtype=np.int32)
+            hit_idxs = overlap["_row_idx"].drop_duplicates().to_numpy(dtype=np.int32)
             cpg_context[hit_idxs] = ctx_label
         except Exception:
             _log(f"  ERROR during {ctx_label} overlap:\n{traceback.format_exc()}")

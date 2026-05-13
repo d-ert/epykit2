@@ -264,7 +264,7 @@ def aggregate_regions(
 
     The overlap is computed with a sorted-search on per-chromosome CpG /
     region arrays, so no additional dependencies beyond polars + numpy
-    are needed (pyranges, used elsewhere in epykit, is *not* required
+    are needed (bioframe, used elsewhere in epykit, is *not* required
     here).
     """
     bed = _read_bed(regions_bed, region_id_col=region_id_col)

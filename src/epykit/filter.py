@@ -1,7 +1,7 @@
 """QC and filtering for Parquet methylation stores.
 
 Notable design points:
-  - Blacklist filtering uses one pyranges interval overlap (not a per-region
+  - Blacklist filtering uses one bioframe interval overlap (not a per-region
     .filter() loop).
   - ``filter_sites`` reads each chromosome once: a lightweight coverage-only
     scan computes the genome-wide quantile, then per-chromosome reads do
@@ -45,36 +45,37 @@ def _genome_wide_quantile(
 def _apply_blacklist(df: pl.DataFrame, blacklist_bed: str) -> pl.DataFrame:
     """Remove CpG sites that overlap any region in the blacklist BED file.
 
-    Uses pyranges for vectorised interval overlap — one operation regardless
+    Uses bioframe for vectorised interval overlap — one operation regardless
     of how many regions are in the blacklist.
 
     PERF-1 fix: replaces the old per-region .filter() loop that built a chain
     of O(n_regions) nested lazy nodes.
     """
     try:
-        import pyranges as pr  # already a project dependency
+        import bioframe
+        import pandas as pd
     except ImportError as exc:
         raise ImportError(
-            "pyranges is required for blacklist filtering. "
-            "Install it with: pip install pyranges"
+            "bioframe is required for blacklist filtering. "
+            "Install it with: pip install bioframe"
         ) from exc
 
-    bl = pr.read_bed(blacklist_bed)
+    bl = bioframe.read_table(blacklist_bed, schema="bed3")
 
-    cpg_pr = pr.PyRanges(
-        chromosomes=df["chrom"].to_list(),
-        starts=df["pos"].to_list(),
-        ends=(df["pos"] + 1).to_list(),  # single-base intervals
-    )
+    cpg = pd.DataFrame({
+        "chrom": df["chrom"].to_list(),
+        "start": df["pos"].to_list(),
+        "end":   (df["pos"] + 1).to_list(),  # single-base intervals
+    })
 
-    hits = cpg_pr.overlap(bl)
+    hits = bioframe.overlap(cpg, bl, how="inner", suffixes=("", "_bl"))
 
     if len(hits) == 0:
         return df
 
     # Build a set of (chrom, pos) pairs to exclude
     exclude: set[tuple[str, int]] = set(
-        zip(hits.Chromosome.tolist(), hits.Start.tolist())
+        zip(hits["chrom"].tolist(), hits["start"].tolist())
     )
 
     chrom_list = df["chrom"].to_list()
@@ -176,7 +177,7 @@ def filter_sites(
     quantile threshold, followed by per-chromosome reads for filtering and
     writing.  The old approach required two full-table scans per sample.
 
-    PERF-1 fix: blacklist filtering uses a single pyranges interval overlap
+    PERF-1 fix: blacklist filtering uses a single bioframe interval overlap
     instead of a per-region lazy .filter() loop.
 
     Parameters
@@ -250,7 +251,7 @@ def filter_sites(
             if len(chrom_df) == 0:
                 continue
 
-            # --- PERF-1: blacklist via pyranges interval overlap ---
+            # --- PERF-1: blacklist via bioframe interval overlap ---
             if blacklist_bed:
                 chrom_df = _apply_blacklist(chrom_df, blacklist_bed)
 
