@@ -8,6 +8,7 @@ from .qc import coverage_histogram, methylation_heatmap
 from .differential import volcano, ma_plot, manhattan
 from .genomic import genomic_context_bar, cpg_island_pie
 from .clustering import pca
+from .metaplot import tss_metaplot
 
 __all__ = [
     "coverage_histogram",
@@ -18,4 +19,5 @@ __all__ = [
     "genomic_context_bar",
     "cpg_island_pie",
     "pca",
+    "tss_metaplot",
 ]

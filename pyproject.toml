@@ -30,12 +30,28 @@ dev = [
   "pytest>=8.4.2",
   "pytest-cov",
 ]
+report = [
+  "jinja2>=3.1",
+  "plotly>=5.20",
+]
+export = [
+  "pyBigWig>=0.3.22",
+]
+anndata = [
+  "anndata>=0.10",
+]
+all = [
+  "jinja2>=3.1",
+  "plotly>=5.20",
+  "pyBigWig>=0.3.22",
+  "anndata>=0.10",
+]
 
 [project.scripts]
 epykit = "epykit.cli:main"
 
 [tool.setuptools.package-data]
-epykit = ["py.typed"]
+epykit = ["py.typed", "templates/*.j2", "templates/*.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

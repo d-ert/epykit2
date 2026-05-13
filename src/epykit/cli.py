@@ -330,6 +330,54 @@ def _cmd_smooth(args: argparse.Namespace):
     print(f"Smoothed betas written to {smooth_path}")
 
 
+def _cmd_report(args: argparse.Namespace):
+    """Handler for 'report' subcommand."""
+    from .methyldata import MethylData
+    md = MethylData.load(args.md)
+    kwargs: dict = {"alpha": args.alpha, "min_abs_diff": args.min_abs_diff}
+    if args.title:
+        kwargs["title"] = args.title
+    if args.gtf:
+        kwargs["gtf_path"] = args.gtf
+    md.report(args.output, **kwargs)
+    print(f"Report written: {args.output}")
+
+
+def _cmd_aggregate_regions(args: argparse.Namespace):
+    """Handler for 'aggregate-regions' subcommand."""
+    from .methyldata import MethylData
+    from . import pp as pp_mod
+    md = MethylData.load(args.md)
+    pp_mod.aggregate_regions(
+        md, args.bed,
+        region_id_col=args.region_id_col,
+        output_store=args.output_store,
+        min_cpgs_per_region=args.min_cpgs_per_region,
+    )
+    md.save(args.md)
+    print(f"Region aggregation complete; methylstore = {md.store}")
+
+
+def _cmd_export(args: argparse.Namespace):
+    """Handler for 'export' subcommand."""
+    from .methyldata import MethylData
+    from .export import to_bedgraph, to_bigwig, dmcs_to_bed, dmrs_to_bed
+    md = MethylData.load(args.md)
+    fmt = args.export_cmd
+    if fmt == "bedgraph":
+        to_bedgraph(md, args.sample, args.output, value=args.value)
+    elif fmt == "bigwig":
+        to_bigwig(md, args.sample, args.output, value=args.value)
+    elif fmt == "dmcs-bed":
+        dmcs_to_bed(md, args.output, alpha=args.alpha,
+                    min_abs_diff=args.min_abs_diff, test=args.test)
+    elif fmt == "dmrs-bed":
+        dmrs_to_bed(md, args.output)
+    else:
+        raise SystemExit(f"unknown export format: {fmt}")
+    print(f"Wrote {args.output}")
+
+
 def _configure_logging(verbosity: int) -> None:
     """Configure logging only when running as a CLI.
 
@@ -561,6 +609,63 @@ def main():
     p_sm.add_argument("--bandwidth", type=int, default=1000,
                       help="Smoothing bandwidth in bp (default 1000)")
     p_sm.set_defaults(func=_cmd_smooth)
+
+    # report
+    p_rep = sub.add_parser(
+        "report",
+        help="Render an interactive HTML report from a saved MethylData",
+    )
+    p_rep.add_argument("--md", required=True,
+                       help="Path to a directory previously written with md.save(...)")
+    p_rep.add_argument("--output", required=True, help="Output HTML file")
+    p_rep.add_argument("--title", default=None)
+    p_rep.add_argument("--gtf", default=None,
+                       help="Optional GTF for a TSS metaplot section")
+    p_rep.add_argument("--alpha", type=float, default=0.05)
+    p_rep.add_argument("--min-abs-diff", dest="min_abs_diff",
+                       type=float, default=0.1)
+    p_rep.set_defaults(func=_cmd_report)
+
+    # aggregate-regions
+    p_agg = sub.add_parser(
+        "aggregate-regions",
+        help="Aggregate CpG counts to user-supplied BED regions (methylKit regionCounts)",
+    )
+    p_agg.add_argument("--md", required=True,
+                       help="Path to a directory previously written with md.save(...)")
+    p_agg.add_argument("--bed", required=True, help="BED file of regions to aggregate to")
+    p_agg.add_argument("--output-store", default=None,
+                       help="Override output Parquet store path")
+    p_agg.add_argument("--region-id-col", default=None,
+                       help="BED column name to use as region_id (default: 'name' or chrom:start-end)")
+    p_agg.add_argument("--min-cpgs-per-region", type=int, default=1)
+    p_agg.set_defaults(func=_cmd_aggregate_regions)
+
+    # export
+    p_exp = sub.add_parser("export", help="Export to BedGraph / BigWig / BED")
+    exp_sub = p_exp.add_subparsers(dest="export_cmd", required=True)
+    for name, help_text in (
+        ("bedgraph", "Per-sample β / coverage → BedGraph"),
+        ("bigwig", "Per-sample β / coverage → BigWig (pyBigWig)"),
+    ):
+        sp = exp_sub.add_parser(name, help=help_text)
+        sp.add_argument("--md", required=True)
+        sp.add_argument("--sample", required=True)
+        sp.add_argument("--output", required=True)
+        sp.add_argument("--value", default="beta",
+                        choices=["beta", "coverage", "N_meth"])
+        sp.set_defaults(func=_cmd_export)
+    sp_d = exp_sub.add_parser("dmcs-bed", help="DMCs → 6-column BED")
+    sp_d.add_argument("--md", required=True)
+    sp_d.add_argument("--output", required=True)
+    sp_d.add_argument("--alpha", type=float, default=0.05)
+    sp_d.add_argument("--min-abs-diff", dest="min_abs_diff", type=float, default=0.0)
+    sp_d.add_argument("--test", default=None)
+    sp_d.set_defaults(func=_cmd_export)
+    sp_r = exp_sub.add_parser("dmrs-bed", help="DMRs → 6-column BED")
+    sp_r.add_argument("--md", required=True)
+    sp_r.add_argument("--output", required=True)
+    sp_r.set_defaults(func=_cmd_export)
 
     args = ap.parse_args()
     _configure_logging(verbosity=args.verbose - args.quiet)

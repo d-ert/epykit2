@@ -175,8 +175,9 @@ def _write_cov_gz(path: Path, chroms: np.ndarray, positions: np.ndarray,
         "N_meth": N_meth.astype(np.int64),
         "N_unmeth": N_unmeth.astype(np.int64),
     })
-    with gzip.open(path, "wt") as fh:
-        df.to_csv(fh, sep="\t", header=False, index=False, float_format="%.4f")
+    with gzip.open(path, "wt", newline="") as fh:
+        df.to_csv(fh, sep="\t", header=False, index=False, float_format="%.4f",
+                  lineterminator="\n")
 
 
 def generate(cfg: SimConfig, out_dir: str | Path) -> dict:

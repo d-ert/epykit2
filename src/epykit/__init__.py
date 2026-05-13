@@ -61,6 +61,11 @@ from .qc import (
 )
 from ._glm import build_design
 
+# Export / interop (lazy heavy deps inside)
+from .export import to_bedgraph, to_bigwig, dmcs_to_bed, dmrs_to_bed
+from .anndata_io import to_anndata
+from .report import generate_report
+
 __all__ = [
     # version
     "__version__",
@@ -90,4 +95,11 @@ __all__ = [
     "coverage_uniformity",
     # GLM design
     "build_design",
+    # Exports / interop
+    "to_bedgraph",
+    "to_bigwig",
+    "dmcs_to_bed",
+    "dmrs_to_bed",
+    "to_anndata",
+    "generate_report",
 ]

@@ -14,9 +14,14 @@ Tests
   glm           — Binomial GLM via batched IRLS (see _glm.py). Required for
                   covariate-adjusted designs.
   logit_t       — Welch t on logit(beta) via Welford. Variance-stabilising
-                  fallback.
+                  fallback. Weak near β=0/1: anti-conservative under H0
+                  when one group's between-replicate variance collapses
+                  by binomial sampling chance. Use ``lr`` for trustworthy
+                  inference; reach for ``logit_t`` only when count-model
+                  assumptions are doubtful.
   beta_binomial — Welch t on raw betas. NOT a beta-binomial GLM despite the
-                  name; kept for backward compatibility.
+                  name; kept for backward compatibility. Same boundary-β
+                  caveat as ``logit_t``.
   cmh           — Cochran-Mantel-Haenszel with one 2×2 stratum per
                   (case_i, ctrl_j) pair.
   fisher        — Fisher exact on reads pooled across replicates. Ignores
@@ -889,19 +894,18 @@ def _beta_binom_mom_from_welford_logit(
 
     pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
 
-    # Degenerate cases. NaN only when **both** groups have zero between-
-    # replicate variance (M2 = 0 with n_valid >= 2): then SE = 0 and the
-    # Welch t is genuinely undefined (t_stat is already NaN via the
-    # ``se > 0`` guard above). The prior B3.2 fix NaN'd on *either*-zero
-    # variance, motivated by anti-conservative SE when one group collapses
-    # under H0 — but at boundary truth values (e.g. β_treatment clipped
-    # to 0.01 at hypo sites with strong effect) binomial sampling
-    # routinely produces all-identical y for one group while the other
-    # has genuine variance. NaN'ing those sites threw away ~half the
-    # true-positive signal in the standard fixture (Δβ=0.40, cov=20,
-    # replicate_sd=0.03) and collapsed power to 0. The single-zero case
-    # is anti-conservative under H0 but it surfaces real signal under H1;
-    # we accept the trade-off.
+    # Degenerate cases. NaN only when BOTH groups have zero between-
+    # replicate variance (M2 = 0 with n_valid >= 2): only then is the
+    # Welch t genuinely undefined (SE = 0). The prior, stricter version of
+    # this guard NaN'd on *either*-zero variance to suppress an H0 false-
+    # positive surge at boundary β; but that killed all power on the
+    # standard fixture, where ~half the truly-differential hypo sites
+    # have β_treatment clipped to ~0.01 and routinely collapse to
+    # M2_case = 0 by binomial sampling chance. Position: logit_t is the
+    # weak variance-stabilising fallback; we don't pretend it's
+    # well-calibrated near β = 0 / 1. For trustworthy inference use
+    # ``test="lr"`` (or ``"score"``), which gets variance from the
+    # binomial count model and isn't affected by replicate collapse.
     both_zero_var = (
         (n_valid_case >= 2) & (M2_case <= 0.0)
         & (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
@@ -957,9 +961,11 @@ def _beta_binom_mom_from_welford(
     pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
 
     # NaN only when BOTH groups have zero between-replicate variance
-    # (genuinely undefined Welch t). See the matching block in
-    # _beta_binom_mom_from_welford_logit for the rationale: NaN'ing on
-    # *either*-zero killed real-signal power at boundary β.
+    # (SE = 0, t genuinely undefined). See the matching block in
+    # _beta_binom_mom_from_welford_logit for the rationale: the
+    # *either*-zero version killed real signal at boundary β.
+    # beta_binomial is treated as a weak fallback — use ``test="lr"``
+    # for trustworthy inference.
     both_zero_var = (
         (n_valid_case >= 2) & (M2_case <= 0.0)
         & (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)

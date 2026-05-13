@@ -242,6 +242,45 @@ class MethylData:
         md._analysis_root = meta.get("_analysis_root")
         return md
 
+    # --- Exports / reports --------------------------------------------
+
+    def report(self, output: str, **kwargs) -> str:
+        """Render a self-contained interactive HTML report.
+
+        Thin wrapper for :func:`epykit.report.generate_report`. See its
+        docstring for ``title``, ``gtf_path``, ``alpha`` etc.
+        """
+        from .report import generate_report
+        return generate_report(self, output, **kwargs)
+
+    def to_bedgraph(self, sample: str, output: str, *, value: str = "beta") -> str:
+        from .export import to_bedgraph
+        return to_bedgraph(self, sample, output, value=value)
+
+    def to_bigwig(
+        self, sample: str, output: str, *, value: str = "beta",
+        chrom_sizes: Optional[dict] = None,
+    ) -> str:
+        from .export import to_bigwig
+        return to_bigwig(self, sample, output, value=value, chrom_sizes=chrom_sizes)
+
+    def dmcs_to_bed(
+        self, output: str, *, alpha: float = 0.05,
+        min_abs_diff: float = 0.0, test: Optional[str] = None,
+    ) -> str:
+        from .export import dmcs_to_bed
+        return dmcs_to_bed(self, output, alpha=alpha,
+                           min_abs_diff=min_abs_diff, test=test)
+
+    def dmrs_to_bed(self, output: str) -> str:
+        from .export import dmrs_to_bed
+        return dmrs_to_bed(self, output)
+
+    def to_anndata(self, **kwargs):
+        """Return an AnnData of this MethylData (requires `pp.unite` first)."""
+        from .anndata_io import to_anndata
+        return to_anndata(self, **kwargs)
+
     def __repr__(self) -> str:
         n_sites = self.uns.get("n_sites_filtered") or self.uns.get("n_sites_raw", "?")
         groups = "unknown"
