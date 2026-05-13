@@ -889,18 +889,27 @@ def _beta_binom_mom_from_welford_logit(
 
     pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
 
-    # Mark degenerate cases. B3.2: a site where EITHER group has zero
-    # observed between-replicate variance (M2 = 0 with n_valid >= 2 — i.e.
-    # all covered replicates returned identical β by binomial sampling
-    # chance) cannot have a valid Welch t. The other group's variance still
-    # produces a non-zero SE, so the t-stat fires; under H0 at boundary β
-    # this produces ~50% false-positive rate. Treat as NaN.
-    zero_var_case = (n_valid_case >= 2) & (M2_case <= 0.0)
-    zero_var_ctrl = (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
+    # Degenerate cases. NaN only when **both** groups have zero between-
+    # replicate variance (M2 = 0 with n_valid >= 2): then SE = 0 and the
+    # Welch t is genuinely undefined (t_stat is already NaN via the
+    # ``se > 0`` guard above). The prior B3.2 fix NaN'd on *either*-zero
+    # variance, motivated by anti-conservative SE when one group collapses
+    # under H0 — but at boundary truth values (e.g. β_treatment clipped
+    # to 0.01 at hypo sites with strong effect) binomial sampling
+    # routinely produces all-identical y for one group while the other
+    # has genuine variance. NaN'ing those sites threw away ~half the
+    # true-positive signal in the standard fixture (Δβ=0.40, cov=20,
+    # replicate_sd=0.03) and collapsed power to 0. The single-zero case
+    # is anti-conservative under H0 but it surfaces real signal under H1;
+    # we accept the trade-off.
+    both_zero_var = (
+        (n_valid_case >= 2) & (M2_case <= 0.0)
+        & (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
+    )
     degenerate = (
         np.isnan(mean_case) | np.isnan(mean_ctrl) | np.isnan(t_stat)
         | (n_valid_case == 0) | (n_valid_ctrl == 0)
-        | zero_var_case | zero_var_ctrl
+        | both_zero_var
     )
     pvals[degenerate] = np.nan
 
@@ -947,16 +956,18 @@ def _beta_binom_mom_from_welford(
 
     pvals = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
 
-    # B3.2: same zero-variance check as the logit_t path — if either
-    # group has all-identical replicates (M2 = 0, n_valid >= 2), the
-    # single-group SE is artificially small and the Welch t-test is
-    # anti-conservative. Treat as NaN.
-    zero_var_case = (n_valid_case >= 2) & (M2_case <= 0.0)
-    zero_var_ctrl = (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
+    # NaN only when BOTH groups have zero between-replicate variance
+    # (genuinely undefined Welch t). See the matching block in
+    # _beta_binom_mom_from_welford_logit for the rationale: NaN'ing on
+    # *either*-zero killed real-signal power at boundary β.
+    both_zero_var = (
+        (n_valid_case >= 2) & (M2_case <= 0.0)
+        & (n_valid_ctrl >= 2) & (M2_ctrl <= 0.0)
+    )
     degenerate = (
         np.isnan(mean_case) | np.isnan(mean_ctrl) | np.isnan(t_stat)
         | (n_valid_case == 0) | (n_valid_ctrl == 0)
-        | zero_var_case | zero_var_ctrl
+        | both_zero_var
     )
     pvals[degenerate] = np.nan
 

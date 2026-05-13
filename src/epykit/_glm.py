@@ -202,6 +202,13 @@ def irls_binomial_batch(
     deviance        (n_sites,)          -2 logL at the fitted mu (binomial)
     pearson_chi2    (n_sites,)          Sigma_j (y - n mu)^2 / (n mu (1-mu))
     n_eff           (n_sites,)          number of samples with cov > 0
+
+    Sites where the IRLS hit logistic-regression separation (any covered
+    sample's eta reached the +/-30 clip bound) are NaN'd in ``deviance``,
+    ``pearson_chi2``, ``beta`` and ``se_beta``. This is required for a
+    sane Pearson dispersion: without it the Pearson denominator
+    ``n · mu · (1 - mu)`` collapses to ``n · _PROP_CLIP`` at saturated
+    samples and per-site chi-sq blows up by ~6 OOM.
     """
     n_sites, n_samples = meth.shape
     p = X.shape[1]
@@ -254,8 +261,25 @@ def irls_binomial_batch(
             break
 
     # ---- Final diagnostics (deviance, Pearson chi-sq, SE) ------------------
-    eta = beta @ X.T
-    eta = np.clip(eta, -30.0, 30.0)
+    eta_unclipped = beta @ X.T
+
+    # Detect logistic-regression separation: a covered sample whose linear
+    # predictor reached the eta clip bound means the IRLS could not fit a
+    # finite mu there (one stratum is fully methylated / unmethylated). At
+    # those samples the Pearson denominator collapses to n · _PROP_CLIP and
+    # (y - n·mu)² / (n · _PROP_CLIP) blows up by ~6 orders of magnitude,
+    # poisoning the chrom-pooled dispersion estimator. Mark separated sites
+    # as degenerate so they (a) drop out of compute_dispersion_phi's
+    # `usable` mask and (b) carry NaN p-values downstream instead of
+    # spurious "significant" calls.
+    #
+    # methylKit handles the same failure mode via glm()'s convergence
+    # warnings; here we detect it directly from the saturated eta.
+    SATURATION_THRESHOLD = 29.999  # tiny FP margin below the +/-30 clip
+    separated_per_sample = (np.abs(eta_unclipped) >= SATURATION_THRESHOLD) & has_cov
+    site_separated = separated_per_sample.any(axis=1)
+
+    eta = np.clip(eta_unclipped, -30.0, 30.0)
     mu = 1.0 / (1.0 + np.exp(-eta))
     mu = np.clip(mu, _PROP_CLIP, 1.0 - _PROP_CLIP)
     var = mu * (1.0 - mu)
@@ -307,12 +331,25 @@ def irls_binomial_batch(
             except np.linalg.LinAlgError:
                 continue
 
-    # Sites that never accumulated weight are degenerate.
-    degenerate = n_eff < 2
+    # Sites with no usable data are degenerate. Sites where the GLM
+    # separated (any covered sample's eta hit the clip bound) are also
+    # marked degenerate: the fitted mu there is at the boundary, the
+    # Pearson denominator collapses to n·_PROP_CLIP, and per-site chi-sq
+    # blows up by ~6 OOM (driving chrom-pooled phi from O(1) to O(10^6)
+    # and producing nonsensical p-values).
+    degenerate = (n_eff < 2) | site_separated
     deviance = np.where(degenerate, np.nan, deviance)
     pearson_chi2 = np.where(degenerate, np.nan, pearson_chi2)
     beta = np.where(degenerate[:, None], np.nan, beta)
     se_beta = np.where(degenerate[:, None], np.nan, se_beta)
+
+    n_separated = int(site_separated.sum())
+    if n_separated > 0:
+        logger.debug(
+            "  GLM separation detected at %d / %d sites; NaN'd for "
+            "dispersion + p-value computation.",
+            n_separated, n_sites,
+        )
 
     return beta, se_beta, deviance, pearson_chi2, n_eff
 

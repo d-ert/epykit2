@@ -34,8 +34,6 @@ Findings (read the test docstrings for the per-claim reasoning):
 from __future__ import annotations
 
 import gzip
-import shutil
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -152,113 +150,28 @@ def test_b3_1_per_site_phi_floors_at_min_dispersion(synth_md_null):
 
 
 # B3.2 — logit-t variance at boundary β
-
-
-def _make_boundary_dataset(tmp_path: Path) -> str:
-    """Build a tiny Bismark store: 50 sites where treatment is ~0.5 and
-    control is ~0.005 (near the methylation floor). 4 reps per group.
-
-    All sites have moderate coverage (20×) so logit_t has plenty of data.
-    The signal is Δβ ≈ 0.495 — about as strong as it gets in WGBS.
-    A working logit_t should reject H0 at every site.
-    """
-    import pandas as pd
-
-    rng = np.random.default_rng(2026)
-    n_sites = 50
-    chrom = "chr1"
-    positions = (np.arange(n_sites) * 200 + 1000).astype(np.int64)
-    coverage = 20
-
-    out_dir = tmp_path / "boundary_data"
-    cov_dir = out_dir / "cov"
-    cov_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = []
-    for sample_idx in range(8):
-        is_treat = sample_idx < 4
-        group = "treatment" if is_treat else "control"
-        sid = f"{group}_{sample_idx % 4 + 1}"
-        beta_target = 0.50 if is_treat else 0.005
-        # Add tiny noise so it isn't pathologically singular.
-        betas = np.clip(beta_target + rng.normal(0, 0.005, n_sites), 0.001, 0.999)
-        N_meth = rng.binomial(coverage, betas).astype(np.int64)
-        N_unmeth = (coverage - N_meth).astype(np.int64)
-        df = pd.DataFrame({
-            "chrom": [chrom] * n_sites,
-            "start": positions,
-            "end": positions + 1,
-            "methyl_pct": 100.0 * N_meth / coverage,
-            "N_meth": N_meth,
-            "N_unmeth": N_unmeth,
-        })
-        cov_path = cov_dir / f"{sid}.bismark.cov.gz"
-        with gzip.open(cov_path, "wt") as fh:
-            df.to_csv(fh, sep="\t", header=False, index=False, float_format="%.4f")
-        rows.append({"sample_id": sid, "group": group, "path": str(cov_path)})
-
-    samplesheet = out_dir / "samplesheet.csv"
-    pd.DataFrame(rows).to_csv(samplesheet, index=False)
-    return str(samplesheet)
-
-
-def test_b3_2_logit_t_detects_signal_near_boundary_beta(tmp_path):
-    """B3.2 (post-fix): At extreme boundary β (≈ 0.005) the B3.2 fix
-    marks the majority of sites as NaN — these are sites where one group
-    has *all* identical replicates (M2 = 0) because binomial sampling at
-    β=0.005, cov=20 produces N_meth=0 in 90% of replicates, so 4-rep
-    all-zero outcomes are common (≈ 67% of sites).
-
-    The post-fix behaviour we want to verify:
-
-    1. A substantial NaN fraction (the fix is firing).
-    2. Among the *non-NaN* sites — those where both groups had at least
-       some observed between-replicate variance — the strong signal
-       (Δβ ≈ 0.5) is still detected at p < 0.05.
-
-    Detection at p < 0.01 is *not* asserted at this extreme β: residual
-    Jacobian inflation from the delta-method approach (B3.2's second
-    half) still inflates SE on sites with only 1 non-zero replicate.
-    A proper fix for that case is the next layer of the B3.2 problem —
-    see test ``...moderate_boundary`` below for a non-extreme regime.
-    """
-    import epykit as ep
-    samplesheet = _make_boundary_dataset(tmp_path)
-    md = ep.read_bismark(
-        samplesheet,
-        treatment_group="treatment",
-        control_group="control",
-        store_dir=str(tmp_path / "store"),
-    )
-    ep.pp.filter_coverage(md, lo_count=2, hi_perc=99.9)
-    ep.pp.unite(md, type="intersect")
-    ep.tl.dmc(md, test="logit_t")
-
-    df = md.get_dmc(test="logit_t")
-    assert df is not None and len(df) > 0
-    pvals_all = df["pvalue"].to_numpy()
-    n_total = len(pvals_all)
-    n_nan = int(np.isnan(pvals_all).sum())
-
-    # B3.2 fix should fire on a substantial fraction at extreme β.
-    nan_frac = n_nan / n_total
-    assert nan_frac >= 0.30, (
-        f"B3.2 fix appears not to be firing at extreme boundary β: only "
-        f"{nan_frac:.0%} sites marked NaN. Expected ≥ 30% (sites with "
-        f"all-identical replicates in at least one group)."
-    )
-
-    # Of the surviving sites, strong signal should be detected at p<0.05.
-    pvals_finite = pvals_all[~np.isnan(pvals_all)]
-    if len(pvals_finite) == 0:
-        pytest.skip("all sites NaN; cannot evaluate detection")
-    frac_strong = float((pvals_finite < 0.05).mean())
-    assert frac_strong >= 0.50, (
-        f"Of {len(pvals_finite)} non-NaN sites, only "
-        f"{(pvals_finite < 0.05).sum()} ({frac_strong:.0%}) detected at "
-        f"p<0.05 with Δβ=0.5 boundary signal. Residual Jacobian-inflation "
-        f"on near-boundary sites is the most likely cause."
-    )
+#
+# Position (locked in, see dmc.py:_beta_binom_mom_from_welford_logit):
+#   logit_t is the WEAK variance-stabilising fallback. We do not pretend
+#   it is well-calibrated near β = 0 / 1. Two tests that previously
+#   locked in an over-aggressive "NaN if either group has M2 = 0" guard
+#   were removed: one asserted ≥30% NaN at extreme β (necessarily true
+#   only with the strict guard), the other asserted ~5% H0 FP rate at
+#   β ≈ 0.005 (only the strict guard could deliver this).
+#
+#   The strict guard collapsed power to 0 on the standard accuracy
+#   fixture (Δβ=0.40, cov=20, n=4, replicate_sd=0.03) because ~half the
+#   truly-differential hypo sites have β_treatment clipped to ~0.01 and
+#   routinely produce all-identical y across replicates. The relaxed
+#   guard (NaN only when BOTH groups have M2 = 0) restores power at the
+#   cost of an anti-conservative SE under H0 boundary β. We accept that
+#   trade-off and document the recommendation: use ``test="lr"`` for
+#   trustworthy inference; ``logit_t`` only when count-model assumptions
+#   are doubtful and the user knows what they're trading.
+#
+# The moderate-boundary test below remains: at β ≈ 0.05 the Jacobian
+# inflation is mild and logit_t works fine, which is what we want to
+# protect against regressing.
 
 
 def test_b3_2_logit_t_detects_signal_at_moderate_boundary_beta(tmp_path):
@@ -335,70 +248,12 @@ def test_b3_2_logit_t_detects_signal_at_moderate_boundary_beta(tmp_path):
     )
 
 
-def test_b3_2_logit_t_se_reasonable_at_boundary(tmp_path):
-    """B3.2 corollary: explicit check that SE doesn't blow up at boundary.
-
-    Construct a site where both groups have small but identical β (≈ 0.005).
-    Under H0, the t-statistic should be near 0 and the SE should be
-    O(0.01–0.1), not O(1) or worse.
-    """
-    import epykit as ep
-    import pandas as pd
-
-    rng = np.random.default_rng(7777)
-    n_sites = 30
-    chrom = "chr1"
-    positions = (np.arange(n_sites) * 200 + 1000).astype(np.int64)
-    coverage = 20
-
-    out_dir = tmp_path / "boundary_h0"
-    cov_dir = out_dir / "cov"
-    cov_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = []
-    for sample_idx in range(8):
-        group = "treatment" if sample_idx < 4 else "control"
-        sid = f"{group}_{sample_idx % 4 + 1}"
-        betas = np.clip(0.005 + rng.normal(0, 0.003, n_sites), 0.001, 0.999)
-        N_meth = rng.binomial(coverage, betas).astype(np.int64)
-        df = pd.DataFrame({
-            "chrom": [chrom] * n_sites,
-            "start": positions,
-            "end": positions + 1,
-            "methyl_pct": 100.0 * N_meth / coverage,
-            "N_meth": N_meth,
-            "N_unmeth": (coverage - N_meth).astype(np.int64),
-        })
-        cov_path = cov_dir / f"{sid}.bismark.cov.gz"
-        with gzip.open(cov_path, "wt") as fh:
-            df.to_csv(fh, sep="\t", header=False, index=False, float_format="%.4f")
-        rows.append({"sample_id": sid, "group": group, "path": str(cov_path)})
-
-    samplesheet = out_dir / "samplesheet.csv"
-    pd.DataFrame(rows).to_csv(samplesheet, index=False)
-
-    md = ep.read_bismark(
-        str(samplesheet),
-        treatment_group="treatment",
-        control_group="control",
-        store_dir=str(tmp_path / "store_h0"),
-    )
-    ep.pp.filter_coverage(md, lo_count=2, hi_perc=99.9)
-    ep.pp.unite(md, type="intersect")
-    ep.tl.dmc(md, test="logit_t")
-
-    df = md.get_dmc(test="logit_t")
-    pvals = df["pvalue"].drop_nulls().to_numpy()
-    # Under H0 (same β in both groups), false-positive rate at p<0.05
-    # should be near 5%. If SE is wildly inflated, many sites will have
-    # p≈1 and the rate looks too low (over-conservative).
-    fp_rate = float((pvals < 0.05).mean())
-    assert 0.0 <= fp_rate <= 0.20, (
-        f"logit_t H0 false-positive rate at boundary β = {fp_rate:.2%}; "
-        f"expected ≈ 5%. A persistent 0% suggests SE is being inflated by "
-        f"the delta-method Jacobian at boundary β."
-    )
-
+# NOTE: ``test_b3_2_logit_t_se_reasonable_at_boundary`` (asserted ~5% H0
+# FP rate at β ≈ 0.005) was removed alongside the strict B3.2 guard.
+# Under the relaxed guard, logit_t at extreme boundary β is genuinely
+# anti-conservative; we don't pretend otherwise. See the module-level
+# B3.2 note above and the docstring of
+# ``_beta_binom_mom_from_welford_logit`` in dmc.py.
 
 
 # B3.3 — BH with NaN p-values
