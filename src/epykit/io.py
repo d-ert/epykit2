@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import csv
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import polars as pl
@@ -12,71 +10,6 @@ from .convert import ensure_converted_sample
 from .methyldata import MethylData
 
 logger = logging.getLogger(__name__)
-
-
-def _default_convert_workers() -> int:
-    """Default thread count for parallel sample conversion.
-
-    Sample conversions are independent and dominated by Polars CSV decode +
-    gzip + Parquet write, all of which release the GIL. A modest pool size
-    (half the logical cores, capped at 8) keeps disk contention manageable
-    on typical workstations and HPC nodes alike. Override with the env var
-    ``EPYKIT_CONVERT_WORKERS`` (set to ``1`` to disable parallelism).
-    """
-    override = os.environ.get("EPYKIT_CONVERT_WORKERS")
-    if override:
-        try:
-            return max(1, int(override))
-        except ValueError:
-            pass
-    cpu = os.cpu_count() or 1
-    return max(1, min(8, cpu // 2 or 1))
-
-
-def _convert_samples_parallel(
-    files: list[tuple[str, str]],
-    cache_store_dir: str,
-    context: str,
-    reference_fasta: str | None,
-) -> None:
-    """Run ``ensure_converted_sample`` for many samples concurrently.
-
-    Logs per-sample status as each future completes, preserving the
-    informational output of the previous serial loop. Falls back to a
-    serial loop when ``EPYKIT_CONVERT_WORKERS=1`` so the path is easy to
-    bisect when diagnosing issues.
-    """
-    workers = _default_convert_workers()
-    if workers == 1 or len(files) <= 1:
-        for path, sample_id in files:
-            converted = ensure_converted_sample(
-                path, sample_id, cache_store_dir,
-                context=context, reference_fasta=reference_fasta,
-            )
-            logger.info("  %s: %s", sample_id,
-                        "converted" if converted else "cached")
-        return
-
-    logger.info("Converting %d sample(s) with %d worker thread(s)",
-                len(files), workers)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_id = {
-            pool.submit(
-                ensure_converted_sample,
-                path, sample_id, cache_store_dir,
-                context=context, reference_fasta=reference_fasta,
-            ): sample_id
-            for path, sample_id in files
-        }
-        for fut in as_completed(future_to_id):
-            sample_id = future_to_id[fut]
-            try:
-                converted = fut.result()
-            except Exception:
-                logger.exception("  %s: conversion failed", sample_id)
-                raise
-            logger.info("  %s: %s", sample_id,
-                        "converted" if converted else "cached")
 
 
 def _count_store_rows(store_dir: str) -> int | None:
@@ -144,9 +77,16 @@ def read_bismark(
     cache_store_dir = str(analysis_root / ".cache" / "raw")
     
     Path(cache_store_dir).mkdir(parents=True, exist_ok=True)
-    _convert_samples_parallel(
-        files, cache_store_dir, context, reference_fasta,
-    )
+    for path, sample_id in files:
+        converted = ensure_converted_sample(
+            path,
+            sample_id,
+            cache_store_dir,
+            context=context,
+            reference_fasta=reference_fasta,
+        )
+        status = "converted" if converted else "cached"
+        logger.info("  %s: %s", sample_id, status)
 
     n_sites_raw = _count_store_rows(cache_store_dir)
     uns = {
@@ -240,7 +180,6 @@ def read_nfcore_methylseq(
         )
 
     obs_rows: list[dict] = []
-    convert_files: list[tuple[str, str]] = []
     # Organize stores under a .cache subdirectory for a cleaner output layout
     analysis_root = Path(store_dir)
     cache_store_dir = str(analysis_root / ".cache" / "raw")
@@ -271,17 +210,13 @@ def read_nfcore_methylseq(
         obs_rows.append(obs_row)
 
         logger.info("  %s (%s) <- %s", sample_id, group, cov_path)
-        convert_files.append((cov_path, sample_id))
+        ensure_converted_sample(cov_path, sample_id, cache_store_dir, context=context)
 
     if not obs_rows:
         raise ValueError(
             "No samples matched treatment/control groups from nf-core samplesheet. "
             f"treatment_group={treatment_group}, control_group={control_group}"
         )
-
-    _convert_samples_parallel(
-        convert_files, cache_store_dir, context, reference_fasta=None,
-    )
 
     n_sites_raw = _count_store_rows(cache_store_dir)
     uns = {

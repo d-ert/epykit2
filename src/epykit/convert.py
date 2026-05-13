@@ -275,7 +275,6 @@ def convert_sample(
     context: str = "CpG",
     reference_fasta: str | None = None,
     merge_strands: bool = True,
-    compression_level: int = 1,
 ) -> None:
     """Convert a Bismark .cov (optionally gzipped) file into a partitioned
     Parquet store.
@@ -302,11 +301,6 @@ def convert_sample(
         at the + strand position (BIO-2). This is appropriate for .cov files
         from bismark_methylation_extractor with both strands. Files from
         bismark2bedGraph are typically already strand-merged.
-    compression_level : int
-        zstd compression level for Parquet output (default 1). The methylstore
-        is rewritten by filter/normalize/intersect downstream, so a faster
-        write here saves wall-clock at trivial size cost. Override to ``3`` or
-        higher if you intend to ship the raw store as a deliverable.
 
     Output schema
     -------------
@@ -323,16 +317,13 @@ def convert_sample(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # PERF: drop ``methyl_percent`` at scan time -- we recompute coverage from
-    # N_meth + N_unmeth, so parsing the float column is wasted work (~15% of
-    # parse cost on typical samples).
     lf = pl.scan_csv(
         str(p),
         separator="\t",
         has_header=False,
         new_columns=_COV_COLUMNS,
         schema_overrides=_COV_SCHEMA,
-    ).drop("methyl_percent").with_columns(
+    ).with_columns(
         [
             (pl.col("N_meth") + pl.col("N_unmeth")).alias("coverage"),
             pl.lit(sample_name).alias("sample"),
@@ -361,21 +352,14 @@ def convert_sample(
     if merge_strands and reference_fasta is not None:
         df = _merge_cpg_pairs(df)
 
-    # PERF: one ``partition_by`` pass replaces N full-table filters (180+
-    # chroms on a hg38 .cov file). ``as_dict=True`` returns the mapping
-    # keyed by partition value, which we use directly for the hive-style
-    # ``chrom=<value>`` directory layout.
-    parts = df.partition_by("chrom", as_dict=True, include_key=True)
-    sample_root = out / f"sample={sample_name}"
-    for key, sub in parts.items():
-        # polars 0.20+: keys are tuples even for a single partition column.
-        chrom = key[0] if isinstance(key, tuple) else key
-        part_dir = sample_root / f"chrom={chrom}"
+    # Write one Parquet file per chromosome
+    for chrom in df["chrom"].unique().to_list():
+        sub = df.filter(pl.col("chrom") == chrom)
+        part_dir = out / f"sample={sample_name}" / f"chrom={chrom}"
         part_dir.mkdir(parents=True, exist_ok=True)
         sub.write_parquet(
             str(part_dir / "part-0.parquet"),
             compression="zstd",
-            compression_level=compression_level,
             row_group_size=row_group_size,
         )
 
@@ -387,7 +371,6 @@ def ensure_converted_sample(
     row_group_size: int = 1_000_000,
     context: str = "CpG",
     reference_fasta: str | None = None,
-    compression_level: int = 1,
 ) -> bool:
     """Convert a sample unless a valid on-disk conversion already exists.
 
@@ -414,7 +397,6 @@ def ensure_converted_sample(
             row_group_size=row_group_size,
             context=context,
             reference_fasta=reference_fasta,
-            compression_level=compression_level,
         )
         temp_sample_dir = _sample_dir(temp_root, sample_name)
         chroms = _expected_chrom_dirs(temp_sample_dir)

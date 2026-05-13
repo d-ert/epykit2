@@ -24,6 +24,13 @@ import matplotlib
 
 matplotlib.use("Agg", force=True)
 
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    filename="log_output_new_feats.txt",
+)
+
 import epykit as ep
 import polars as pl
 
@@ -32,6 +39,9 @@ HERE = Path(__file__).parent
 RAW = HERE / "raw_data"
 OUT = HERE / "scratch3_out"
 OUT.mkdir(exist_ok=True)
+
+import os
+os.environ.setdefault("EPYKIT_CONVERT_WORKERS", "1")  # avoid OOM on 4 GB Codespaces
 
 
 # Phase 1 - Standard pipeline (mirrors scratch2.py)
