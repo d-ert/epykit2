@@ -408,79 +408,105 @@ def _assign_cpgs_to_regions(
 
 def smooth(
     md: MethylData,
+    *,
+    method: str = "gaussian",
     bandwidth: int = 1000,
     grid_resolution_bp: int | None = None,
+    # BSmooth-only knobs
+    ns: int = 70,
+    h_bp: int = 1000,
+    degree: int = 2,
+    min_cpgs_for_smooth: int = 3,
 ) -> None:
-    """BSmooth-style smoothing (EXPERIMENTAL).
+    """Smooth per-sample beta values along the genomic axis.
 
-    Smooths per-sample beta values using a fast Gaussian kernel (bandwidth
-    in base pairs). Smoothing is applied per-chromosome and per-sample.
+    Two backends:
 
-    .. warning::
-        This function is experimental. The smoothed values are computed but
-        are NOT yet wired into downstream DMC/DMR calling. You can use this
-        to compute smoothed beta values for manual analysis, but standard
-        DMC/DMR calling will still use raw counts.
+    * ``method="gaussian"`` (default) — coverage-weighted Gaussian kernel
+      on a regularised grid. Fast (O(G) per chrom), documented as a
+      BSmooth approximation.
+    * ``method="bsmooth"`` — spec-faithful BSmooth (Hansen et al. 2012):
+      local weighted-polynomial regression with adaptive bandwidth
+      (``max(distance to ns-th CpG, h_bp)``), tricube × coverage weights,
+      degree-2 fit by default. Slower than Gaussian but matches the
+      Bioconductor ``bsseq``/DSS reference behaviour. Compiled via numba.
 
-        To use smoothed values in DMR calling, a future version will add
-        a ``use_smoothed=True`` parameter to ``ep.tl.dmr()``.
+    Smoothed values are written to ``md.uns["smooth_path"]`` and are
+    accessible from the Parquet store for downstream analyses. Standard
+    ``ep.tl.dmc`` / ``ep.tl.dmr`` continue to use raw counts.
 
     Parameters
     ----------
-    md : MethylData
-        MethylData object (must have been filtered with ep.pp.filter_coverage)
-    bandwidth : int
-        Gaussian smoothing bandwidth in base pairs (default 1000)
-    grid_resolution_bp : int, optional
-        Internal grid resolution (default: bandwidth // 20).
-        Finer resolution → higher accuracy but slower.
-
-    Raises
-    ------
-    ValueError
-        If called before ``ep.pp.filter_coverage`` .
-
-    Notes
-    -----
-    Smoothed values are written to ``md.uns["smooth_path"]`` for inspection.
-    Currently these are not used by ``ep.tl.dmr()``, but can be accessed
-    via the Parquet store for custom downstream analysis.
+    md
+        MethylData (must have been filtered with ``ep.pp.filter_coverage``).
+    method : {"gaussian", "bsmooth"}
+        Which smoother to use. Default ``"gaussian"`` preserves prior behaviour.
+    bandwidth, grid_resolution_bp
+        Gaussian-method options. Ignored when ``method="bsmooth"``.
+    ns, h_bp, degree, min_cpgs_for_smooth
+        BSmooth-method options. Ignored when ``method="gaussian"``.
+        ``ns`` and ``h_bp`` defaults match the Hansen et al. (2012) paper
+        (70 CpGs / 1 kb half-window). ``degree=2`` is the canonical
+        BSmooth fit; ``degree=1`` is a faster linear fallback.
     """
-    # smoothing on unfiltered data silently degrades results.
     if not md._filtered:
         raise ValueError(
             "Run ep.pp.filter_coverage(md) before ep.pp.smooth(md)."
         )
 
-    from .dmr import smooth_methylation_gaussian
+    method = method.lower()
+    if method not in ("gaussian", "bsmooth"):
+        raise ValueError(
+            f"Unknown smoothing method {method!r}. Use 'gaussian' or 'bsmooth'."
+        )
 
     samples = md.obs.get_column("sample_id").to_list()
-    
-    # Derive output smooth path
+
     if md._analysis_root:
         smooth_path = str(Path(md._analysis_root) / ".cache" / "smoothed")
     else:
         smooth_path = f"{md.store}_smoothed"
-    
-    logger.info(f"Running BSmooth smoothing to {smooth_path}...")
-    
-    smooth_methylation_gaussian(
-        methylstore_path=md.store,
-        samples=samples,
-        bandwidth=bandwidth,
-        grid_resolution_bp=grid_resolution_bp,
-        output_path=smooth_path,
-    )
-    
-    # _smoothed is a derived property — recording in uns is enough.
+
+    logger.info("Running %s smoothing to %s ...", method, smooth_path)
+
+    if method == "gaussian":
+        from .dmr import smooth_methylation_gaussian
+        smooth_methylation_gaussian(
+            methylstore_path=md.store,
+            samples=samples,
+            bandwidth=bandwidth,
+            grid_resolution_bp=grid_resolution_bp,
+            output_path=smooth_path,
+        )
+        params = {
+            "method": "gaussian",
+            "bandwidth": bandwidth,
+            "grid_resolution_bp": grid_resolution_bp,
+        }
+    else:  # bsmooth
+        from .dmr import smooth_methylation_bsmooth
+        smooth_methylation_bsmooth(
+            methylstore_path=md.store,
+            samples=samples,
+            ns=ns,
+            h_bp=h_bp,
+            degree=degree,
+            min_cpgs_for_smooth=min_cpgs_for_smooth,
+            output_path=smooth_path,
+        )
+        params = {
+            "method": "bsmooth",
+            "ns": ns,
+            "h_bp": h_bp,
+            "degree": degree,
+            "min_cpgs_for_smooth": min_cpgs_for_smooth,
+        }
+
     md.uns["smooth_path"] = smooth_path
-    md.uns["smooth_params"] = {
-        "bandwidth": bandwidth,
-        "grid_resolution_bp": grid_resolution_bp,
-    }
+    md.uns["smooth_params"] = params
     _append_store_history(md, "smoothed", smooth_path, None)
-    
+
     logger.info(
-        f"✓ Smoothing complete ({len(samples)} samples, {bandwidth} bp bandwidth). "
-        f"Results stored in {smooth_path}"
+        "Smoothing complete (%d samples, method=%s). Results in %s",
+        len(samples), method, smooth_path,
     )

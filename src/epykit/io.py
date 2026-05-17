@@ -212,6 +212,54 @@ def read_methyldackel(
     )
 
 
+def read_combined_strand_bed(
+    samplesheet: str,
+    treatment_group: str | None = None,
+    control_group: str | None = None,
+    assembly: str = "unknown",
+    store_dir: str = "methyl_store",
+    context: str = "CpG",
+    reference_fasta: str | None = None,
+    groups: list[str] | None = None,
+) -> MethylData:
+    """Read a samplesheet of 12-column strand-collapsed methylation BEDs.
+
+    File schema (one row per CpG, tab-separated, no header)::
+
+        chrom  start  end  fwd_M  fwd_T  fwd_pct  rev_M  rev_T  rev_pct  M  T  pct
+
+    Columns 4-6 are the forward-strand counts ``(N_meth, coverage, %)``;
+    7-9 are reverse-strand; 10-12 are the strand-collapsed total used
+    when the upstream pipeline merged the two Cs of each CpG dyad
+    onto a single position. epykit consumes the combined triplet:
+
+      * ``N_meth``     = col 10 (M)
+      * ``coverage``   = col 11 (T)
+      * ``N_unmeth``   = col 11 - col 10
+      * ``methylation_percent`` = col 12
+
+    This is the format emitted by a number of in-house WGBS pipelines
+    that merge CpG dyads before downstream analysis (e.g. the ``.bed.gz``
+    files distributed under GEO accession GSE263850).
+
+    Parameters are identical to :func:`read_bismark`; ``path`` entries
+    in the samplesheet point at ``.bed`` / ``.bed.gz`` files in the
+    12-column layout.
+    """
+    return _read_methylation_samplesheet(
+        samplesheet,
+        pipeline="combined_strand_bed",
+        source_format="combined_strand_bed",
+        treatment_group=treatment_group,
+        control_group=control_group,
+        groups=groups,
+        assembly=assembly,
+        store_dir=store_dir,
+        context=context,
+        reference_fasta=reference_fasta,
+    )
+
+
 def load(path: str) -> MethylData:
     """Load a previously saved MethylData analysis directory."""
     return MethylData.load(path)

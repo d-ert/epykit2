@@ -45,6 +45,33 @@ _COV_SCHEMA: dict[str, type[pl.DataType]] = {
 _FORMAT_SKIP_ROWS: dict[str, int] = {
     "bismark": 0,
     "methyldackel": 1,
+    # 12-col methylation BED (strand-collapsed CpG dyad summary)
+    # Layout: chrom, start, end, fwd_M, fwd_T, fwd_%, rev_M, rev_T, rev_%, M, T, %
+    "combined_strand_bed": 0,
+}
+
+
+# Wider schema for the 12-col combined-strand BED. We read the full 12
+# columns then project to the canonical 6-col Bismark-equivalent layout.
+_COMBINED_BED_COLUMNS = [
+    "chrom", "start", "end",
+    "fwd_M", "fwd_T", "fwd_pct",
+    "rev_M", "rev_T", "rev_pct",
+    "M", "T", "methyl_percent",
+]
+_COMBINED_BED_SCHEMA: dict[str, type[pl.DataType]] = {
+    "chrom":         pl.Utf8,
+    "start":         pl.Int32,
+    "end":           pl.Int32,
+    "fwd_M":         pl.Int32,
+    "fwd_T":         pl.Int32,
+    "fwd_pct":       pl.Float32,
+    "rev_M":         pl.Int32,
+    "rev_T":         pl.Int32,
+    "rev_pct":       pl.Float32,
+    "M":             pl.Int32,
+    "T":             pl.Int32,
+    "methyl_percent": pl.Float32,
 }
 
 
@@ -317,24 +344,48 @@ def convert_sample(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    lf = pl.scan_csv(
-        str(p),
-        separator="\t",
-        has_header=False,
-        skip_rows=_FORMAT_SKIP_ROWS[format],
-        new_columns=_COV_COLUMNS,
-        schema_overrides=_COV_SCHEMA,
-    ).with_columns(
-        [
-            (pl.col("N_meth") + pl.col("N_unmeth")).alias("coverage"),
-            pl.lit(sample_name).alias("sample"),
-            pl.col("start").alias("pos"),
-            pl.lit(context).alias("context"),
-        ]
-    ).select(
-        ["chrom", "pos", "context", "N_meth", "N_unmeth", "coverage", "sample",
-         "start"]   # keep start temporarily for strand inference
-    )
+    if format == "combined_strand_bed":
+        # 12-col methylation BED: use the combined-strand triplet (cols 10-12).
+        # Project to the canonical Bismark layout so downstream is unchanged.
+        lf = (
+            pl.scan_csv(
+                str(p),
+                separator="\t",
+                has_header=False,
+                skip_rows=_FORMAT_SKIP_ROWS[format],
+                new_columns=_COMBINED_BED_COLUMNS,
+                schema_overrides=_COMBINED_BED_SCHEMA,
+            )
+            .with_columns([
+                pl.col("M").alias("N_meth"),
+                (pl.col("T") - pl.col("M")).cast(pl.Int32).alias("N_unmeth"),
+                pl.col("T").alias("coverage"),
+                pl.lit(sample_name).alias("sample"),
+                pl.col("start").alias("pos"),
+                pl.lit(context).alias("context"),
+            ])
+            .select(["chrom", "pos", "context", "N_meth", "N_unmeth",
+                     "coverage", "sample", "start"])
+        )
+    else:
+        lf = pl.scan_csv(
+            str(p),
+            separator="\t",
+            has_header=False,
+            skip_rows=_FORMAT_SKIP_ROWS[format],
+            new_columns=_COV_COLUMNS,
+            schema_overrides=_COV_SCHEMA,
+        ).with_columns(
+            [
+                (pl.col("N_meth") + pl.col("N_unmeth")).alias("coverage"),
+                pl.lit(sample_name).alias("sample"),
+                pl.col("start").alias("pos"),
+                pl.lit(context).alias("context"),
+            ]
+        ).select(
+            ["chrom", "pos", "context", "N_meth", "N_unmeth", "coverage", "sample",
+             "start"]   # keep start temporarily for strand inference
+        )
 
     df = lf.collect()
 

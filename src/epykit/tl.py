@@ -287,8 +287,37 @@ def dmc(
     n_workers: int | None = None,
     glm_backend: str = "cpu",
     resumable: bool = False,
+    use_smoothed: bool = False,
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
+
+    Smoothed-input mode (``use_smoothed=True``)
+    -------------------------------------------
+    Requires that ``ep.pp.smooth(md)`` has been run first (either method,
+    ``"gaussian"`` or ``"bsmooth"``). The DMC test then runs on
+    pseudo-counts derived from the smoothed beta values:
+
+      ``N_meth' = round(beta_smooth * coverage)``,
+      ``N_unmeth' = coverage - N_meth'``
+
+    rather than the raw per-CpG counts. All 8 test backends work
+    unchanged. Results land in ``md.varm["dmc_<test>_smoothed"]`` so the
+    smoothed and raw runs don't collide in the same session.
+
+    .. warning::
+       This is **not** equivalent to DSS's ``DMLfit.multiFactor(smoothing=TRUE)``.
+       DSS uses BSmooth-smoothed estimates only in the per-CpG **dispersion**
+       step; the per-CpG GLM still fits raw counts. The pseudo-count
+       approach here is more aggressive — it replaces the count signal
+       entirely with the locally-averaged version, which can wash out
+       genuine per-CpG signal at default BSmooth parameters (ns=70,
+       h_bp=1000). For replicating DSS-style analyses, prefer
+       ``use_smoothed=False`` (the default) with ``test="lr"`` — the
+       quasi-binomial LR with McCullagh-Nelder dispersion is the closest
+       per-CpG match to DSS's count model in epykit. Reach for
+       ``use_smoothed=True`` only when you genuinely want a strongly
+       regularised local-mean test, with loosened smoother parameters
+       (e.g. ``ns=20``).
 
     Backend selection
     -----------------
@@ -468,32 +497,38 @@ def dmc(
                     }
                     return
 
-    result = process_chromosomes_dmc(
-        methylstore_path=md.store,
-        samples_treatment=md.treatment_ids,
-        samples_control=md.control_ids,
-        test=selected_test,
-        chromosomes=chromosomes,
-        unite=unite,
-        min_samples_treatment=min_samples_treatment,
-        min_samples_control=min_samples_control,
-        dispersion=dispersion,
-        reference=reference,
-        backend=backend,
-        n_workers=n_workers,
-        glm_backend=glm_backend,
-    )
-    result = apply_multiple_testing_correction(result, method="fdr_bh")
+    # Smoothed-input mode: materialise a temp methylstore of smoothed
+    # pseudo-counts and route the DMC engine at it. Cleans up automatically
+    # when the with-block exits.
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    if use_smoothed:
+        if "smooth_path" not in md.uns:
+            raise ValueError(
+                "use_smoothed=True requires ep.pp.smooth(md) first "
+                "(either method='gaussian' or 'bsmooth'). The smoothed "
+                "sidecar at md.uns['smooth_path'] is the input to the "
+                "pseudo-count transform that feeds the DMC test."
+            )
+        smooth_path = md.uns["smooth_path"]
+        _smoothed_tmp = _tempfile.TemporaryDirectory(prefix="epykit_dmc_smoothed_")
+        _dmc_store = _smoothed_tmp.name
+        from ._smoothed_store import build_smoothed_pseudo_count_store
+        build_smoothed_pseudo_count_store(
+            raw_store=_Path(md.store),
+            smooth_store=_Path(smooth_path),
+            samples=md.obs.get_column("sample_id").to_list(),
+            out_dir=_Path(_dmc_store),
+        )
+    else:
+        _smoothed_tmp = None
+        _dmc_store = md.store
 
-    if empirical_fdr and len(result) > 0:
-        result = empirical_fdr_for_dmc(
-            methylstore_path=md.store,
+    try:
+        result = process_chromosomes_dmc(
+            methylstore_path=_dmc_store,
             samples_treatment=md.treatment_ids,
             samples_control=md.control_ids,
-            observed_dmc=result,
-            n_perm=n_perm,
-            seed=perm_seed,
-            n_jobs=perm_n_jobs,
             test=selected_test,
             chromosomes=chromosomes,
             unite=unite,
@@ -501,12 +536,37 @@ def dmc(
             min_samples_control=min_samples_control,
             dispersion=dispersion,
             reference=reference,
+            backend=backend,
+            n_workers=n_workers,
+            glm_backend=glm_backend,
         )
+        result = apply_multiple_testing_correction(result, method="fdr_bh")
+
+        if empirical_fdr and len(result) > 0:
+            result = empirical_fdr_for_dmc(
+                methylstore_path=_dmc_store,
+                samples_treatment=md.treatment_ids,
+                samples_control=md.control_ids,
+                observed_dmc=result,
+                n_perm=n_perm,
+                seed=perm_seed,
+                n_jobs=perm_n_jobs,
+                test=selected_test,
+                chromosomes=chromosomes,
+                unite=unite,
+                min_samples_treatment=min_samples_treatment,
+                min_samples_control=min_samples_control,
+                dispersion=dispersion,
+                reference=reference,
+            )
+    finally:
+        if _smoothed_tmp is not None:
+            _smoothed_tmp.cleanup()
 
     # Canonicalise key name (test_used reflects the canonical name post-rename)
     from .dmc import _canonicalise_test_name
     canonical_used = _canonicalise_test_name(selected_test)
-    key = f"dmc_{canonical_used}"
+    key = f"dmc_{canonical_used}_smoothed" if use_smoothed else f"dmc_{canonical_used}"
     md.varm[key] = result
     md.uns["dmc"] = {
         "test_requested": test,
@@ -527,6 +587,10 @@ def dmc(
         # table the user just wrote, regardless of which other tests have
         # been run in the same session.
         "last_key": key,
+        "use_smoothed": use_smoothed,
+        "smooth_method": (
+            md.uns.get("smooth_params", {}).get("method") if use_smoothed else None
+        ),
     }
 
     # 0.4.0 checkpoint/resume: persist a sidecar parquet + manifest entry

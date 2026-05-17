@@ -844,6 +844,299 @@ def empirical_fdr_for_dmr(
     ])
 
 
+# BSmooth-style local-polynomial smoother (spec-faithful)
+
+# Compiled-on-first-call helper. Numba is a core epykit dep but is otherwise
+# unused; we import lazily so a numba-less debug install (uncommon) still
+# falls back to a pure-numpy path.
+_BSMOOTH_NJIT_FN = None
+
+
+def _bsmooth_make_njit():
+    """Build and cache the numba-compiled per-chrom BSmooth kernel."""
+    global _BSMOOTH_NJIT_FN
+    if _BSMOOTH_NJIT_FN is not None:
+        return _BSMOOTH_NJIT_FN
+    try:
+        from numba import njit
+    except ImportError:
+        njit = None
+
+    def _bsmooth_one_chrom(
+        positions: np.ndarray,    # (n,) float64, sorted ascending
+        n_meth:    np.ndarray,    # (n,) float64
+        coverage:  np.ndarray,    # (n,) float64
+        ns:        int,
+        h_min:     float,
+        degree:    int,
+        min_cpgs_for_smooth: int,
+    ) -> np.ndarray:
+        """Local-polynomial smoother — one chromosome, one sample.
+
+        Per site i:
+          * adaptive half-window h_i = max(distance to ns-th nearest CpG, h_min)
+          * weights w_j = tricube(|x_j - x_i| / h_i) * coverage_j
+          * weighted least squares of degree `degree` (1 or 2), centered at x_i
+          * smoothed value = polynomial intercept, clipped to [0, 1]
+
+        Sites with zero coverage anywhere in the window contribute zero weight.
+        Sites with fewer than ``min_cpgs_for_smooth`` valid neighbors fall back
+        to the raw beta.
+        """
+        n = positions.shape[0]
+        out = np.full(n, np.nan, dtype=np.float64)
+
+        # Raw beta (NaN where coverage == 0)
+        beta_raw = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            if coverage[i] > 0.0:
+                beta_raw[i] = n_meth[i] / coverage[i]
+            else:
+                beta_raw[i] = np.nan
+
+        for i in range(n):
+            x_i = positions[i]
+
+            # ---- 1. Find ns-th nearest CpG distance via two-pointer expand
+            a = i
+            b = i
+            while (b - a + 1) < ns and (a > 0 or b < n - 1):
+                d_left = x_i - positions[a - 1] if a > 0 else np.inf
+                d_right = positions[b + 1] - x_i if b < n - 1 else np.inf
+                if d_left <= d_right:
+                    a -= 1
+                else:
+                    b += 1
+
+            if (b - a + 1) >= ns:
+                ns_dist = positions[b] - x_i
+                if x_i - positions[a] > ns_dist:
+                    ns_dist = x_i - positions[a]
+            else:
+                ns_dist = 0.0  # very small chrom; fall through to h_min
+
+            h_i = h_min if ns_dist < h_min else ns_dist
+
+            # ---- 2. Widen [lo, hi] to all CpGs within h_i of x_i
+            lo = a
+            hi = b
+            while lo > 0 and (x_i - positions[lo - 1]) <= h_i:
+                lo -= 1
+            while hi < n - 1 and (positions[hi + 1] - x_i) <= h_i:
+                hi += 1
+
+            # ---- 3. Accumulate weighted moments
+            s0 = 0.0
+            s1 = 0.0
+            s2 = 0.0
+            s3 = 0.0
+            s4 = 0.0
+            t0 = 0.0   # X' W y
+            t1 = 0.0
+            t2 = 0.0
+            n_valid = 0
+            for j in range(lo, hi + 1):
+                if not np.isfinite(beta_raw[j]):
+                    continue
+                t = positions[j] - x_i
+                u = t / h_i
+                if u < 0.0:
+                    u = -u
+                if u >= 1.0:
+                    continue
+                tri = 1.0 - u * u * u
+                tri = tri * tri * tri
+                w = tri * coverage[j]
+                if w <= 0.0:
+                    continue
+                y = beta_raw[j]
+                t2_loc = t * t
+                s0 += w
+                s1 += w * t
+                s2 += w * t2_loc
+                s3 += w * t2_loc * t
+                s4 += w * t2_loc * t2_loc
+                t0 += w * y
+                t1 += w * t * y
+                t2 += w * t2_loc * y
+                n_valid += 1
+
+            if n_valid < min_cpgs_for_smooth or s0 <= 0.0:
+                out[i] = beta_raw[i]
+                continue
+
+            # ---- 4. Solve WLS for the intercept only (we don't need slope/curvature)
+            if degree == 2:
+                det = (
+                    s0 * (s2 * s4 - s3 * s3)
+                    - s1 * (s1 * s4 - s3 * s2)
+                    + s2 * (s1 * s3 - s2 * s2)
+                )
+                if det == 0.0 or not np.isfinite(det):
+                    out[i] = t0 / s0   # singular → weighted mean fallback
+                    continue
+                num = (
+                    t0 * (s2 * s4 - s3 * s3)
+                    - s1 * (t1 * s4 - s3 * t2)
+                    + s2 * (t1 * s3 - s2 * t2)
+                )
+                intercept = num / det
+            else:  # degree == 1
+                det = s0 * s2 - s1 * s1
+                if det == 0.0 or not np.isfinite(det):
+                    out[i] = t0 / s0
+                    continue
+                intercept = (t0 * s2 - s1 * t1) / det
+
+            if intercept < 0.0:
+                intercept = 0.0
+            elif intercept > 1.0:
+                intercept = 1.0
+            out[i] = intercept
+
+        return out
+
+    if njit is not None:
+        _BSMOOTH_NJIT_FN = njit(cache=True)(_bsmooth_one_chrom)
+    else:
+        _BSMOOTH_NJIT_FN = _bsmooth_one_chrom
+    return _BSMOOTH_NJIT_FN
+
+
+def smooth_methylation_bsmooth(
+    methylstore_path: str,
+    samples: list[str],
+    *,
+    ns: int = 70,
+    h_bp: int = 1000,
+    degree: int = 2,
+    min_cpgs_for_smooth: int = 3,
+    output_path: str | None = None,
+) -> pl.DataFrame | None:
+    """BSmooth-style local-polynomial smoother (Hansen et al. 2012).
+
+    For each CpG, fits a local weighted-polynomial regression on the
+    neighboring CpGs:
+
+      * **Adaptive bandwidth**: ``h_i = max(distance to ns-th nearest CpG, h_bp)``.
+        Sparse regions widen to capture ``ns`` CpGs; dense regions are
+        capped below by ``h_bp`` so the kernel never collapses to
+        immediate neighbors.
+      * **Tricube distance weights × coverage**:
+        ``w_j = (1 - (|x_j - x_i| / h_i)^3)^3 * N_j``.
+      * **Polynomial degree** (``1`` or ``2``; default ``2`` matches BSmooth).
+        Quadratic captures local curvature; linear is a faster fallback.
+      * Smoothed value = polynomial intercept at the focal CpG, clipped
+        to ``[0, 1]``.
+
+    See :func:`smooth_methylation_gaussian` for the faster Gaussian-
+    kernel approximation that previously occupied this slot.
+
+    Performance: the per-site fit is compiled via ``numba.njit`` (numba
+    is already an epykit core dep). First call incurs a one-time
+    compilation latency (~1 s); subsequent calls run at native speed.
+
+    Parameters
+    ----------
+    methylstore_path
+        Path to the partitioned methylstore.
+    samples
+        Sample ids to smooth.
+    ns
+        Target number of CpGs per local window (BSmooth default 70).
+    h_bp
+        Minimum half-window in base pairs (BSmooth default 1000).
+    degree
+        Local-polynomial degree, ``1`` or ``2``. Default ``2``.
+    min_cpgs_for_smooth
+        Fall back to raw beta if fewer than this many valid neighbors
+        contribute weight (default 3).
+    output_path
+        When set, write a sidecar parquet store at this root and return
+        ``None``; otherwise concatenate everything and return a frame.
+
+    Returns
+    -------
+    pl.DataFrame or None
+        Long-form frame (chrom, pos, sample, beta_raw, beta_smooth) when
+        ``output_path`` is ``None``, otherwise ``None`` after sidecar write.
+    """
+    if degree not in (1, 2):
+        raise ValueError(f"degree must be 1 or 2; got {degree}")
+    if ns < 2:
+        raise ValueError(f"ns must be >= 2; got {ns}")
+    if h_bp <= 0:
+        raise ValueError(f"h_bp must be > 0; got {h_bp}")
+
+    smoother = _bsmooth_make_njit()
+
+    store = Path(methylstore_path)
+    records: list[pl.DataFrame] = []
+    out_root = Path(output_path) if output_path else None
+    if out_root:
+        out_root.mkdir(parents=True, exist_ok=True)
+
+    for sample in samples:
+        sample_dir = store / f"sample={sample}"
+        if not sample_dir.exists():
+            logger.warning("Sample '%s' not found in %s; skipping", sample, store)
+            continue
+
+        for chrom_dir in sorted(sample_dir.glob("chrom=*")):
+            chrom = chrom_dir.name.removeprefix("chrom=")
+            parts = list(chrom_dir.glob("part-*.parquet"))
+            if not parts:
+                continue
+
+            df = pl.concat([
+                pl.read_parquet(str(p), columns=["pos", "N_meth", "coverage"])
+                for p in parts
+            ]).sort("pos")
+            n = df.height
+            if n == 0:
+                continue
+
+            pos = df["pos"].to_numpy().astype(np.float64)
+            meth = df["N_meth"].to_numpy().astype(np.float64)
+            cov = df["coverage"].to_numpy().astype(np.float64)
+
+            beta_raw = np.where(cov > 0, meth / np.maximum(cov, 1.0), np.nan)
+            if n < min_cpgs_for_smooth:
+                logger.debug(
+                    "  %s / %s: only %d sites; skipping bsmooth", sample, chrom, n,
+                )
+                beta_smooth = beta_raw.copy()
+            else:
+                beta_smooth = smoother(
+                    pos, meth, cov,
+                    int(ns), float(h_bp), int(degree), int(min_cpgs_for_smooth),
+                )
+
+            chunk = pl.DataFrame({
+                "chrom":       pl.Series([chrom] * n, dtype=pl.Utf8),
+                "pos":         df["pos"],
+                "sample":      pl.Series([sample] * n, dtype=pl.Utf8),
+                "beta_raw":    pl.Series(beta_raw.astype(np.float32)),
+                "beta_smooth": pl.Series(beta_smooth.astype(np.float32)),
+            })
+
+            if out_root is not None:
+                part_dir = out_root / f"sample={sample}" / f"chrom={chrom}"
+                part_dir.mkdir(parents=True, exist_ok=True)
+                chunk.write_parquet(
+                    str(part_dir / "part-0.parquet"), compression="zstd",
+                )
+            else:
+                records.append(chunk)
+
+    if out_root is not None:
+        return None
+
+    if not records:
+        return pl.DataFrame(schema=_SMOOTH_EMPTY_SCHEMA)
+    return pl.concat(records)
+
+
 # Public API — fast Gaussian smoothing (replaces statsmodels LOESS)
 
 def smooth_methylation_gaussian(

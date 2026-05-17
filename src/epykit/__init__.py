@@ -35,8 +35,15 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 from .methyldata import MethylData
-from .io import read_bismark, read_methyldackel, read_nfcore_methylseq, load
+from .io import (
+    read_bismark,
+    read_methyldackel,
+    read_combined_strand_bed,
+    read_nfcore_methylseq,
+    load,
+)
 from . import pp, tl, pl, query
+from ._config import set_tmp_dir, get_tmp_dir
 
 from .convert import convert_sample
 from .dmc import (
@@ -49,6 +56,7 @@ from .dmc import (
 from .dmr import (
     call_dmr_sliding_window,
     smooth_methylation_gaussian,
+    smooth_methylation_bsmooth,
 )
 from .annotate import (
     annotate_features,
@@ -85,9 +93,12 @@ __all__ = [
     # data object
     "MethylData",
     # I/O
-    "read_bismark", "read_methyldackel", "read_nfcore_methylseq", "load",
+    "read_bismark", "read_methyldackel", "read_combined_strand_bed",
+    "read_nfcore_methylseq", "load",
     # namespaces (scanpy-style)
     "pp", "tl", "pl", "query",
+    # runtime config
+    "set_tmp_dir", "get_tmp_dir",
     # ingestion
     "convert_sample",
     # DMC engines (advanced users; tl.dmc is the recommended entry)
@@ -99,6 +110,7 @@ __all__ = [
     # DMR engines
     "call_dmr_sliding_window",
     "smooth_methylation_gaussian",
+    "smooth_methylation_bsmooth",
     # DVC / DVR engines
     "process_chromosomes_dvc",
     "call_dvr_density",
