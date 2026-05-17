@@ -283,8 +283,38 @@ def dmc(
     perm_n_jobs: int = 1,
     *,
     min_samples_case: int | None = None,  # deprecated alias
+    backend: str = "sequential",
+    n_workers: int | None = None,
+    glm_backend: str = "cpu",
+    resumable: bool = False,
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
+
+    Backend selection
+    -----------------
+    ``backend="sequential"`` (default) walks chromosomes one at a time on
+    the calling process — bit-identical to the pre-0.4 behaviour.
+    ``backend="dask"`` and ``backend="ray"`` submit one task per
+    chromosome to a worker pool; both require the corresponding optional
+    extra (``pip install 'epykit[distributed]'`` for Dask, ``epykit[ray]``
+    for Ray). ``n_workers`` controls the pool size; ``None`` lets the
+    backend pick a default.
+
+    ``glm_backend="cpu"`` (default) runs the batched IRLS used by
+    ``test="glm"`` / formula contrasts on the CPU via numpy. Setting
+    ``glm_backend="gpu"`` routes the IRLS through CuPy (requires
+    ``pip install 'epykit[gpu]'``) — only affects the GLM hot path; the
+    closed-form ``lr`` / ``score`` tests stay CPU-only.
+
+    ``resumable=True`` (default False) participates in the 0.4.0
+    pipeline manifest: when an earlier ``tl.dmc`` call with the same
+    inputs + params is recorded in ``<store>/.epykit_manifest.json``,
+    the prior result is loaded from its sidecar parquet and the
+    computation is skipped. Inputs include the methylstore fingerprint,
+    treatment / control sample lists, ``test``, ``formula``,
+    ``contrast``, ``covariates``, ``min_samples_*``, ``dispersion``,
+    ``reference``. Set False (the default) to preserve pre-0.4
+    behaviour — no manifest read, no skip, no sidecar write.
 
     Parameters
     ----------
@@ -378,6 +408,66 @@ def dmc(
     unite_info = md.uns.get("unite")
     unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
 
+    # 0.4.0 checkpoint/resume: when resumable=True, fingerprint the input
+    # + params and look up a prior matching run in the pipeline manifest.
+    resume_root = None
+    resume_sig = None
+    resume_stage_name = None
+    if resumable:
+        from .dmc import _canonicalise_test_name as _canon
+        from ._cache import input_signature, manifest_find, manifest_append
+        from pathlib import Path
+        canonical_for_key = _canon(selected_test)
+        resume_stage_name = f"dmc_{canonical_for_key}"
+        resume_root = md._analysis_root or md.store
+        resume_sig = input_signature(
+            md.store,
+            sorted(md.treatment_ids),
+            sorted(md.control_ids),
+            {
+                "test": selected_test,
+                "chromosomes": chromosomes,
+                "unite": unite,
+                "min_samples_treatment": min_samples_treatment,
+                "min_samples_control": min_samples_control,
+                "dispersion": dispersion,
+                "reference": reference,
+                "empirical_fdr": empirical_fdr,
+                "n_perm": n_perm if empirical_fdr else None,
+                "perm_seed": perm_seed if empirical_fdr else None,
+            },
+        )
+        if resume_root:
+            prior = manifest_find(resume_root, resume_stage_name)
+            if prior is not None and prior.get("input_sig") == resume_sig:
+                sidecar = Path(prior["output_path"])
+                if not sidecar.is_absolute():
+                    sidecar = Path(resume_root) / sidecar
+                if sidecar.exists():
+                    import logging as _lg
+                    _lg.getLogger(__name__).info(
+                        "[resume] %s: loading cached result from %s",
+                        resume_stage_name, sidecar,
+                    )
+                    md.varm[resume_stage_name] = pl.read_parquet(str(sidecar))
+                    md.uns["dmc"] = {
+                        "test_requested": test,
+                        "test_used": canonical_for_key,
+                        "n_sites": len(md.varm[resume_stage_name]),
+                        "unite": unite,
+                        "min_samples_treatment": min_samples_treatment,
+                        "min_samples_control": min_samples_control,
+                        "min_samples_case": min_samples_treatment,
+                        "dispersion": dispersion,
+                        "reference": reference,
+                        "empirical_fdr": empirical_fdr,
+                        "n_perm": n_perm if empirical_fdr else None,
+                        "perm_seed": perm_seed if empirical_fdr else None,
+                        "last_key": resume_stage_name,
+                        "resumed": True,
+                    }
+                    return
+
     result = process_chromosomes_dmc(
         methylstore_path=md.store,
         samples_treatment=md.treatment_ids,
@@ -389,6 +479,9 @@ def dmc(
         min_samples_control=min_samples_control,
         dispersion=dispersion,
         reference=reference,
+        backend=backend,
+        n_workers=n_workers,
+        glm_backend=glm_backend,
     )
     result = apply_multiple_testing_correction(result, method="fdr_bh")
 
@@ -435,6 +528,40 @@ def dmc(
         # been run in the same session.
         "last_key": key,
     }
+
+    # 0.4.0 checkpoint/resume: persist a sidecar parquet + manifest entry
+    # so a subsequent resumable=True call with the same fingerprint can
+    # skip the computation entirely. Best-effort: a failed write logs but
+    # does not propagate (the in-memory result is still valid).
+    if resumable and resume_root and resume_sig and resume_stage_name:
+        try:
+            from ._cache import manifest_append
+            from pathlib import Path
+            sidecar_dir = Path(resume_root) / ".epykit_results"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar = sidecar_dir / f"{resume_stage_name}.parquet"
+            result.write_parquet(str(sidecar))
+            manifest_append(
+                resume_root, resume_stage_name,
+                params={
+                    "test": canonical_used,
+                    "unite": unite,
+                    "min_samples_treatment": min_samples_treatment,
+                    "min_samples_control": min_samples_control,
+                    "dispersion": dispersion,
+                    "reference": reference,
+                    "empirical_fdr": empirical_fdr,
+                },
+                input_sig=resume_sig,
+                output_path=str(sidecar),
+                extra={"n_sites": len(result)},
+            )
+        except OSError as exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "[resume] failed to persist %s sidecar: %s",
+                resume_stage_name, exc,
+            )
 
 
 def _run_dmc_contrast(
@@ -597,8 +724,19 @@ def dmr(
     perm_n_jobs: int = 1,
     *,
     min_samples_case: int | None = None,  # deprecated alias
+    backend: str = "sequential",
+    n_workers: int | None = None,
 ) -> None:
     """Run DMR calling and store result in ``md.uns['dmr']``.
+
+    Backend selection (``method="tile"`` only)
+    ------------------------------------------
+    ``backend="sequential"`` (default) walks chromosomes one at a time.
+    ``backend="dask"`` / ``"ray"`` parallelise the per-chromosome DMC
+    pass run on the tiled methylstore; requires ``[distributed]`` or
+    ``[ray]``. ``n_workers`` controls pool size. The
+    ``method="sliding_window"`` path operates on the in-memory DMC table
+    and is unaffected by this setting.
 
     Two methods are supported:
 
@@ -700,6 +838,8 @@ def dmr(
             design_full=design_full,
             design_reduced=design_reduced,
             coef_idx=coef_idx,
+            backend=backend,
+            n_workers=n_workers,
         )
 
         # Optional q-value post-filter (the tile path already filtered at
@@ -803,8 +943,30 @@ def dmr(
         }
         return
 
+    if method == "hmm":
+        from .dmr_hmm import call_dmr_hmm
+        dmc_df = md.dmc
+        if dmc_df is None:
+            raise ValueError(
+                "method='hmm' needs a DMC table on md. Run ep.tl.dmc(md) first."
+            )
+        dmr_df = call_dmr_hmm(
+            dmc_df,
+            min_cpgs=min_cpgs,
+            min_abs_meth_diff=min_abs_meth_diff,
+            alpha=alpha,
+        )
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "hmm",
+            "min_cpgs": min_cpgs,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "alpha": alpha,
+        }
+        return
+
     raise ValueError(
-        f"Unknown DMR method '{method}'. Expected 'tile' or 'sliding_window'."
+        f"Unknown DMR method '{method}'. Expected 'tile', 'sliding_window', or 'hmm'."
     )
 
 
@@ -814,6 +976,9 @@ def dvc(
     chromosomes: list[str] | None = None,
     alpha: float = 0.05,
     mean_filter_alpha: float = 0.05,
+    *,
+    backend: str = "sequential",
+    n_workers: int | None = None,
 ) -> None:
     """Differential-Variability CpG calling (iEVORA-style).
 
@@ -852,6 +1017,8 @@ def dvc(
         unite=unite,
         mean_filter_alpha=mean_filter_alpha,
         alpha=alpha,
+        backend=backend,
+        n_workers=n_workers,
     )
     md.varm["dvc"] = result
     md.uns["dvc"] = {
@@ -1048,3 +1215,103 @@ def annotate(
     if clear_gtf_cache and gtf:
         _GTF_CACHE.clear()
         gc.collect()
+
+
+def asm(
+    md: MethylData,
+    *,
+    bam,
+    vcf,
+    min_reads_per_haplotype: int = 10,
+    min_phased_snvs: int = 1,
+    chromosomes: list[str] | None = None,
+    caller: str = "bismark",
+) -> None:
+    """Allele-specific methylation (ASM) caller — 0.5.0.
+
+    See :func:`epykit.asm.call_asm` for the algorithm. Per-CpG ASM tests
+    are stored at ``md.varm["asm"]`` with the same column names as the
+    ``dmc_*`` family (``pvalue``, ``qvalue``, ``meth_diff``) so volcano
+    / Manhattan plots work without modification.
+
+    Parameters
+    ----------
+    bam : mapping
+        ``{sample_id → bam_path}``. BAMs must be coordinate-sorted and
+        indexed; per-base methylation calls come from Bismark ``XM``
+        tags or MethylDackel ``MM/ML`` tags.
+    vcf : str | Path
+        Per-individual VCF (bgzipped + tabix preferred). Heterozygous
+        biallelic SNVs are used as phasing anchors.
+    """
+    from .asm import asm as _asm
+    _asm(md, bam=bam, vcf=vcf,
+         min_reads_per_haplotype=min_reads_per_haplotype,
+         min_phased_snvs=min_phased_snvs,
+         chromosomes=chromosomes,
+         caller=caller)
+
+
+def entropy(
+    md: MethylData,
+    *,
+    bam,
+    window_cpgs: int = 4,
+    min_reads: int = 10,
+    chromosomes: list[str] | None = None,
+    caller: str = "bismark",
+) -> None:
+    """Methylation entropy caller — 0.5.0.
+
+    See :func:`epykit.entropy.call_entropy` for the algorithm. Per-CpG-
+    window Shannon entropy is stored at ``md.varm["entropy"]``.
+    """
+    from .entropy import entropy as _entropy
+    _entropy(md, bam=bam, window_cpgs=window_cpgs, min_reads=min_reads,
+             chromosomes=chromosomes, caller=caller)
+
+
+def pmd(
+    md: MethylData,
+    *,
+    samples: list[str] | None = None,
+    bandwidth_bp: float = 10_000,
+    beta_threshold: float = 0.55,
+    min_pmd_bp: int = 100_000,
+    chromosomes: list[str] | None = None,
+    backend: str = "sequential",
+    n_workers: int | None = None,
+) -> None:
+    """Partially methylated domain (PMD) caller — 0.6.0.
+
+    See :func:`epykit.pmd.call_pmd_one_sample` for the algorithm.
+    Per-sample, megabase-scale 2-state HMM segmentation; results land
+    in ``md.uns["pmd"]``.
+    """
+    from .pmd import pmd as _pmd
+    _pmd(md, samples=samples, bandwidth_bp=bandwidth_bp,
+         beta_threshold=beta_threshold, min_pmd_bp=min_pmd_bp,
+         chromosomes=chromosomes, backend=backend, n_workers=n_workers)
+
+
+def hmr(
+    md: MethylData,
+    *,
+    samples: list[str] | None = None,
+    hmr_threshold: float = 0.30,
+    lmr_max_density: float = 0.020,
+    min_cpgs: int = 4,
+    chromosomes: list[str] | None = None,
+    backend: str = "sequential",
+    n_workers: int | None = None,
+) -> None:
+    """HMR / LMR caller (MethylSeekR-style) — 0.6.0.
+
+    See :func:`epykit.hmr.call_hmr_one_sample` for the algorithm.
+    Two-state HMM per sample over raw per-CpG β; results land in
+    ``md.uns["hmr"]`` and ``md.uns["lmr"]``.
+    """
+    from .hmr import hmr as _hmr
+    _hmr(md, samples=samples, hmr_threshold=hmr_threshold,
+         lmr_max_density=lmr_max_density, min_cpgs=min_cpgs,
+         chromosomes=chromosomes, backend=backend, n_workers=n_workers)

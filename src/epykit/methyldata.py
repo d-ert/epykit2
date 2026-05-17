@@ -89,6 +89,70 @@ class MethylData:
     def n_samples(self) -> int:
         return len(self.obs)
 
+    @property
+    def completed_stages(self) -> list[str]:
+        """Names of stages recorded in the top-level pipeline manifest.
+
+        Reads ``<_analysis_root>/.epykit_manifest.json`` (the 0.4.0
+        checkpoint/resume manifest). Always reflects what is on disk —
+        unlike :py:attr:`state`, which is derived from ``uns`` and can
+        diverge after a manual ``md.uns.pop()``.
+
+        Returns an empty list when the analysis root has no manifest
+        (e.g. an in-memory MethylData built by ``read_bismark`` without
+        the ``store_dir`` argument).
+        """
+        from ._cache import manifest_read
+        root = self._analysis_root or self.store
+        if not root:
+            return []
+        try:
+            return [s.get("name", "") for s in manifest_read(root).get("stages", [])]
+        except (OSError, ValueError):
+            return []
+
+    def resume_from(self, stage: str) -> bool:
+        """Re-hydrate ``uns`` / ``varm`` state for a completed stage.
+
+        Looks up ``stage`` in the pipeline manifest. If present, restores
+        any sidecar parquet results referenced by the manifest entry's
+        ``output_path`` into the matching ``varm`` / ``uns`` slot and
+        returns True. Returns False (without modifying anything) when
+        no such stage was recorded.
+
+        This is the read side of the 0.4.0 checkpoint/resume API; the
+        write side is each ``pp.*`` / ``tl.*`` function appending to the
+        manifest when invoked with ``resumable=True``.
+        """
+        from ._cache import manifest_find
+        from pathlib import Path
+        root = self._analysis_root or self.store
+        if not root:
+            return False
+        entry = manifest_find(root, stage)
+        if entry is None:
+            return False
+        out_path = entry.get("output_path")
+        if not out_path:
+            return False
+        op = Path(out_path)
+        if not op.is_absolute():
+            op = Path(root) / op
+        # varm/<key>.parquet → re-load into varm
+        if op.exists() and op.suffix == ".parquet" and stage.startswith(("dmc_", "dvc", "asm", "entropy")):
+            self.varm[stage] = pl.read_parquet(str(op))
+            return True
+        # uns/<key>.parquet → re-load into uns
+        if op.exists() and op.suffix == ".parquet" and stage.startswith(("dmr_", "dvr", "pmd", "hmr", "lmr", "smooth")):
+            self.uns[stage] = pl.read_parquet(str(op))
+            return True
+        # Stage references a directory (filtered/normalized stores etc.) —
+        # just point md.store at it.
+        if op.is_dir():
+            self.store = str(op)
+            return True
+        return False
+
     def get_dmc(
         self,
         test: Optional[str] = None,

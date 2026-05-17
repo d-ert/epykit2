@@ -176,6 +176,8 @@ def process_chromosomes_dvc(
     unite: bool = True,
     mean_filter_alpha: float = 0.05,
     alpha: float = 0.05,
+    backend: str = "sequential",
+    n_workers: Optional[int] = None,
 ) -> pl.DataFrame:
     """Run DVC analysis across all chromosomes.
 
@@ -196,28 +198,32 @@ def process_chromosomes_dvc(
         chromosomes = _detect_chromosomes(store)
         logger.info("DVC: auto-detected %d chromosomes", len(chromosomes))
 
+    from ._compute import run_chrom_pipeline
+
+    def _dvc_chrom_handler(chrom: str) -> Optional[pl.DataFrame]:
+        canonical_df = (
+            _intersect_chrom(store, chrom, all_samples)
+            if unite else _union_chrom(store, chrom, all_samples)
+        )
+        if len(canonical_df) == 0:
+            return None
+        return _process_one_chromosome_dvc(
+            store, chrom, canonical_df,
+            samples_treatment, samples_control,
+            test=test, mean_filter_alpha=mean_filter_alpha, alpha=alpha,
+        )
+
     with tempfile.TemporaryDirectory(prefix="epykit_dvc_") as tmpdir:
         tmp = Path(tmpdir)
         written: list[Path] = []
-        for i, chrom in enumerate(chromosomes):
-            logger.info("[DVC %d/%d] %s", i + 1, len(chromosomes), chrom)
-            canonical_df = (
-                _intersect_chrom(store, chrom, all_samples)
-                if unite else _union_chrom(store, chrom, all_samples)
-            )
-            if len(canonical_df) == 0:
-                continue
-            chrom_result = _process_one_chromosome_dvc(
-                store, chrom, canonical_df,
-                samples_treatment, samples_control,
-                test=test, mean_filter_alpha=mean_filter_alpha, alpha=alpha,
-            )
-            if len(chrom_result) == 0:
-                continue
+        for chrom, chrom_result in run_chrom_pipeline(
+            chromosomes, _dvc_chrom_handler,
+            backend=backend, n_workers=n_workers, label="DVC",
+        ):
             tmp_file = tmp / f"{chrom}.parquet"
             chrom_result.write_parquet(str(tmp_file))
             written.append(tmp_file)
-            del canonical_df, chrom_result
+            del chrom_result
             gc.collect()
 
         if not written:

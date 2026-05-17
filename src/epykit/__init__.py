@@ -36,7 +36,7 @@ except PackageNotFoundError:
 
 from .methyldata import MethylData
 from .io import read_bismark, read_methyldackel, read_nfcore_methylseq, load
-from . import pp, tl, pl
+from . import pp, tl, pl, query
 
 from .convert import convert_sample
 from .dmc import (
@@ -87,7 +87,7 @@ __all__ = [
     # I/O
     "read_bismark", "read_methyldackel", "read_nfcore_methylseq", "load",
     # namespaces (scanpy-style)
-    "pp", "tl", "pl",
+    "pp", "tl", "pl", "query",
     # ingestion
     "convert_sample",
     # DMC engines (advanced users; tl.dmc is the recommended entry)

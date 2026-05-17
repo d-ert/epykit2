@@ -199,6 +199,34 @@ def build_design(
 
 # Batched IRLS for the binomial GLM
 
+def irls_dispatch(
+    meth: np.ndarray,
+    cov: np.ndarray,
+    X: np.ndarray,
+    *,
+    backend: str = "cpu",
+    **kwargs,
+):
+    """Dispatch IRLS to the CPU (default) or GPU backend.
+
+    ``backend="cpu"`` calls :func:`irls_binomial_batch` directly — the
+    historical, default path. ``backend="gpu"`` imports
+    :mod:`epykit._glm_gpu` lazily and routes through CuPy. Both return
+    the same shapes and dtypes; downstream code is GPU-agnostic.
+
+    Anything other than ``"cpu"`` / ``"gpu"`` raises ``ValueError``.
+    """
+    backend = (backend or "cpu").lower()
+    if backend == "cpu":
+        return irls_binomial_batch(meth, cov, X, **kwargs)
+    if backend == "gpu":
+        from ._glm_gpu import irls_binomial_batch_gpu
+        return irls_binomial_batch_gpu(meth, cov, X, **kwargs)
+    raise ValueError(
+        f"Unknown glm_backend {backend!r}. Use 'cpu' (default) or 'gpu'."
+    )
+
+
 def irls_binomial_batch(
     meth: np.ndarray,
     cov: np.ndarray,

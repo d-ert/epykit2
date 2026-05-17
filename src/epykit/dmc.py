@@ -1053,6 +1053,7 @@ def _process_one_chromosome(
     contrast_label: Optional[str] = None,
     samples_all_ordered: Optional[list[str]] = None,
     group_labels_per_sample: Optional[list[str]] = None,
+    glm_backend: str = "cpu",
 ) -> pl.DataFrame:
     """Run DMC for one chromosome, loading one sample at a time.
 
@@ -1289,11 +1290,11 @@ def _process_one_chromosome(
         X_bb_red  = np.ones((n_samples, 1))
 
         from . import _glm
-        beta_f, se_f, dev_f, pearson_f, n_eff_bb = _glm.irls_binomial_batch(
-            meth_stack, cov_stack, X_bb_full,
+        beta_f, se_f, dev_f, pearson_f, n_eff_bb = _glm.irls_dispatch(
+            meth_stack, cov_stack, X_bb_full, backend=glm_backend,
         )
-        _bbeta_r, _bse_r, dev_r, _bpearson_r, _bn_eff_r = _glm.irls_binomial_batch(
-            meth_stack, cov_stack, X_bb_red,
+        _bbeta_r, _bse_r, dev_r, _bpearson_r, _bn_eff_r = _glm.irls_dispatch(
+            meth_stack, cov_stack, X_bb_red, backend=glm_backend,
         )
 
         df_resid_per_site = (n_eff_bb.astype(np.float64) - 2.0)
@@ -1361,11 +1362,11 @@ def _process_one_chromosome(
 
         from . import _glm
 
-        beta_full, se_full, dev_full, pearson_full, n_eff = _glm.irls_binomial_batch(
-            meth_stack, cov_stack, design_full,
+        beta_full, se_full, dev_full, pearson_full, n_eff = _glm.irls_dispatch(
+            meth_stack, cov_stack, design_full, backend=glm_backend,
         )
-        _beta_red, _se_red, dev_red, _pearson_red, _ne_red = _glm.irls_binomial_batch(
-            meth_stack, cov_stack, design_reduced,
+        _beta_red, _se_red, dev_red, _pearson_red, _ne_red = _glm.irls_dispatch(
+            meth_stack, cov_stack, design_reduced, backend=glm_backend,
         )
 
         # df_resid_i = n_eff_i - p_full   (per-site, since coverage gates samples)
@@ -1460,8 +1461,9 @@ def _process_one_chromosome(
 
         from . import _glm
         beta_full, se_full, dev_full, pearson_full, n_eff, cov_beta = (
-            _glm.irls_binomial_batch(
+            _glm.irls_dispatch(
                 meth_stack, cov_stack, design_full, return_cov=True,
+                backend=glm_backend,
             )
         )
 
@@ -1695,6 +1697,9 @@ def process_chromosomes_dmc(
     *,
     samples_case: Optional[list[str]] = None,       # deprecated alias
     min_samples_case: Optional[int] = None,         # deprecated alias
+    backend: str = "sequential",
+    n_workers: Optional[int] = None,
+    glm_backend: str = "cpu",
 ) -> pl.DataFrame:
     """Process differential methylation for all chromosomes.
 
@@ -1819,51 +1824,47 @@ def process_chromosomes_dmc(
         min_samples_case, min_samples_control,
     )
 
+    from ._compute import run_chrom_pipeline
+
+    def _dmc_chrom_handler(chrom: str) -> Optional[pl.DataFrame]:
+        canonical_df = (
+            _intersect_chrom(store, chrom, all_samples)
+            if unite
+            else _union_chrom(store, chrom, all_samples)
+        )
+        if len(canonical_df) == 0:
+            logger.warning("  No sites for %s; skipping", chrom)
+            return None
+        logger.info("  %s sites to test (%s)", f"{len(canonical_df):,}", chrom)
+        return _process_one_chromosome(
+            store, chrom, canonical_df,
+            samples_case, samples_control, test,
+            min_samples_case=min_samples_case,
+            min_samples_control=min_samples_control,
+            dispersion=dispersion,
+            reference=reference,
+            design_full=design_full,
+            design_reduced=design_reduced,
+            coef_idx=coef_idx,
+            contrast_matrix=contrast_matrix,
+            contrast_label=contrast_label,
+            samples_all_ordered=samples_all_ordered,
+            group_labels_per_sample=group_labels_per_sample,
+            glm_backend=glm_backend,
+        )
+
     with tempfile.TemporaryDirectory(prefix="epykit_dmc_") as tmpdir:
         tmp     = Path(tmpdir)
         written: list[Path] = []
 
-        for i, chrom in enumerate(chromosomes):
-            logger.info("[%d/%d] %s", i + 1, len(chromosomes), chrom)
-
-            canonical_df = (
-                _intersect_chrom(store, chrom, all_samples)
-                if unite
-                else _union_chrom(store, chrom, all_samples)
-            )
-
-            if len(canonical_df) == 0:
-                logger.warning("  No sites for %s; skipping", chrom)
-                continue
-
-            logger.info("  %s sites to test", f"{len(canonical_df):,}")
-
-            chrom_result = _process_one_chromosome(
-                store, chrom, canonical_df,
-                samples_case, samples_control, test,
-                min_samples_case=min_samples_case,
-                min_samples_control=min_samples_control,
-                dispersion=dispersion,
-                reference=reference,
-                design_full=design_full,
-                design_reduced=design_reduced,
-                coef_idx=coef_idx,
-                contrast_matrix=contrast_matrix,
-                contrast_label=contrast_label,
-                samples_all_ordered=samples_all_ordered,
-                group_labels_per_sample=group_labels_per_sample,
-            )
-            del canonical_df
-
-            if len(chrom_result) == 0:
-                logger.warning("  No results for %s", chrom)
-                continue
-
+        for chrom, chrom_result in run_chrom_pipeline(
+            chromosomes, _dmc_chrom_handler,
+            backend=backend, n_workers=n_workers, label="DMC",
+        ):
             tmp_file = tmp / f"{chrom}.parquet"
             chrom_result.write_parquet(str(tmp_file))
             written.append(tmp_file)
-            logger.info("  %s sites → staged to disk", f"{len(chrom_result):,}")
-
+            logger.info("  %s sites → staged to disk (%s)", f"{len(chrom_result):,}", chrom)
             del chrom_result
             gc.collect()
 

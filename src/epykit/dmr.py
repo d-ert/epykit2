@@ -503,6 +503,8 @@ def call_dmr_tile_based(
     *,
     samples_case: list[str] | None = None,         # deprecated alias
     min_samples_case: int | None = None,           # deprecated alias
+    backend: str = "sequential",
+    n_workers: int | None = None,
 ) -> pl.DataFrame:
     """Call DMRs by aggregating read counts within fixed-size tiles.
 
@@ -650,6 +652,8 @@ def call_dmr_tile_based(
             design_full=design_full,
             design_reduced=design_reduced,
             coef_idx=coef_idx,
+            backend=backend,
+            n_workers=n_workers,
         )
 
     if len(tile_dmc) == 0:
