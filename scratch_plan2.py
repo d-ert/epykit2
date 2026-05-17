@@ -213,16 +213,16 @@ What's new:
   the means don't. Standard mean-based DMC analysis misses these entirely.
   iEVORA signature filter: q_variance<alpha AND p_mean>mean_filter_alpha.
 """)
-
-    ep.tl.dvc(md, test="bartlett")
-    df = md.varm["dvc"]
-    print(f"\nDVC table ({len(df):,} sites):")
-    print(f"  n_dvc (variance-but-not-mean changes) = "
-          f"{int(df.get_column('is_dvc').sum())}")
-    print("\nTop 5 by q_variance:")
-    show(df.sort("q_variance").head(5), 5)
-
-
+#
+#    ep.tl.dvc(md, test="bartlett")
+#    df = md.varm["dvc"]
+#    print(f"\nDVC table ({len(df):,} sites):")
+#    print(f"  n_dvc (variance-but-not-mean changes) = "
+#          f"{int(df.get_column('is_dvc').sum())}")
+#    print("\nTop 5 by q_variance:")
+#    show(df.sort("q_variance").head(5), 5)
+#
+#
 # ---------------------------------------------------------------------------
 # §5 Clinical / cohort QC pack
 # ---------------------------------------------------------------------------
@@ -341,15 +341,6 @@ What's new:
     except Exception as exc:
         print(f"  [FAIL] to_mudata: {exc}")
 
-    # methylKit tabix: always writes text + gzip; tabix index needs pysam.
-    try:
-        out_dir = md.to_methylkit_tabix(str(OUT_DIR / "methylkit_export"))
-        files = sorted(Path(out_dir).glob("*.methylraw.txt.gz"))
-        print(f"  [ok]   to_methylkit_tabix -> {len(files)} files in {out_dir}")
-        for f in files[:3]:
-            print(f"          {f.name}  ({f.stat().st_size:,} bytes)")
-    except Exception as exc:
-        print(f"  [FAIL] to_methylkit_tabix: {exc}")
 
     # MultiQC custom-content JSON
     try:
