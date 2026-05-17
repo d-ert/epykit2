@@ -39,12 +39,25 @@ export = [
 ]
 anndata = [
   "anndata>=0.10",
+  "mudata>=0.2",
+]
+# Plan 2 §6: visualization extras
+viz = [
+  "umap-learn>=0.5",
+  "scipy>=1.11",
+]
+# Plan 2 §7: methylKit tabix export (Linux/macOS only; pysam has no Windows wheel)
+methylkit = [
+  "pysam>=0.22",
 ]
 all = [
   "jinja2>=3.1",
   "plotly>=5.20",
   "pyBigWig>=0.3.22",
   "anndata>=0.10",
+  "mudata>=0.2",
+  "umap-learn>=0.5",
+  "scipy>=1.11",
 ]
 
 [project.scripts]

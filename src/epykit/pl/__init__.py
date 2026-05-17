@@ -9,6 +9,10 @@ from .differential import volcano, ma_plot, manhattan
 from .genomic import genomic_context_bar, cpg_island_pie
 from .clustering import pca
 from .metaplot import tss_metaplot
+from .embedding import umap
+from .correlation import sample_correlation
+from .dashboard import qc_dashboard
+from .dmr_boxplot import dmr_boxplot
 
 __all__ = [
     "coverage_histogram",
@@ -20,4 +24,8 @@ __all__ = [
     "cpg_island_pie",
     "pca",
     "tss_metaplot",
+    "umap",
+    "sample_correlation",
+    "qc_dashboard",
+    "dmr_boxplot",
 ]

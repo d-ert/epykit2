@@ -74,9 +74,27 @@ class SimConfig:
     replicate_sd: float = 0.03
     seed: int = 42
 
+    # --- Plan 2 extensions for multi-group / continuous-covariate tests ----
+    # When n_groups >= 3, samples are drawn from group_labels[:n_groups] in
+    # equal-size blocks. The first half of scattered DMCs become "multi-
+    # group" DMCs whose effect ramps with the group index (multiplied by
+    # `dmc_effect_multigroup_step`). The other half remain binary "treat-
+    # ment vs others" DMCs.
+    n_groups: int = 2
+    group_labels: tuple[str, ...] = ("control", "treatment", "extra1", "extra2")
+    dmc_effect_multigroup_step: float = 0.20
+    # When set, adds an `age` column to the samplesheet drawn U(age_low,
+    # age_high) and injects a linear age × β effect at `n_age_dmcs`
+    # sites with slope `age_effect_per_year` (per-year Δβ).
+    continuous_covariate: bool = False
+    age_low: float = 20.0
+    age_high: float = 80.0
+    n_age_dmcs: int = 200
+    age_effect_per_year: float = 0.005  # 0.5pp Δβ per year of age, 60yr span = 0.30
+
     @property
     def total_samples(self) -> int:
-        return self.n_per_group * 2
+        return self.n_per_group * self.n_groups
 
     @property
     def n_total_sites(self) -> int:
@@ -198,16 +216,81 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
     positions = _positions(cfg, rng)
     n = cfg.n_total_sites
 
+    # ---- Plan 2: optional multi-group / continuous-covariate truths ------
+    multigroup_sites = np.zeros(n, dtype=bool)
+    age_sites = np.zeros(n, dtype=bool)
+    age_slope = np.zeros(n, dtype=np.float64)
+    if cfg.n_groups >= 3:
+        # Carve a fresh band of sites (outside DMRs and scattered DMCs) for
+        # multi-group effects: the per-site effect grows linearly with the
+        # group index, so a joint F-test on group should detect them and a
+        # binary test (group_0 vs everyone else) should miss most of them.
+        pool = np.where((dmr_id == -1) & (effects == 0))[0]
+        n_mg = min(200, len(pool))
+        if n_mg > 0:
+            chosen = rng.choice(pool, size=n_mg, replace=False)
+            multigroup_sites[chosen] = True
+
+    if cfg.continuous_covariate:
+        # Place age-effect sites on the remaining null positions.
+        pool = np.where(
+            (dmr_id == -1) & (effects == 0) & (~multigroup_sites)
+        )[0]
+        n_age = min(cfg.n_age_dmcs, len(pool))
+        if n_age > 0:
+            chosen = rng.choice(pool, size=n_age, replace=False)
+            age_sites[chosen] = True
+            # Half positive, half negative slope.
+            slopes = np.concatenate([
+                np.full(n_age // 2, cfg.age_effect_per_year),
+                np.full(n_age - n_age // 2, -cfg.age_effect_per_year),
+            ])
+            rng.shuffle(slopes)
+            age_slope[chosen] = slopes
+
+    # Resolve per-sample group assignment + optional continuous covariate.
+    group_labels = list(cfg.group_labels[:cfg.n_groups])
+    # When n_groups=2 the legacy layout is "treatment first, control second";
+    # we keep that ordering by reversing the group_labels list. Beyond that
+    # we just take the first n_groups labels.
+    if cfg.n_groups == 2:
+        ordered_labels = ["treatment", "control"]
+    else:
+        ordered_labels = group_labels[:cfg.n_groups]
+
     # Generate per-sample read counts.
     sample_records: list[dict] = []
     for sample_idx in range(cfg.total_samples):
-        is_treatment = sample_idx < cfg.n_per_group
-        group = "treatment" if is_treatment else "control"
+        # Determine which group this sample belongs to (block layout).
+        group_idx = sample_idx // cfg.n_per_group
+        group = ordered_labels[group_idx]
         sid = f"{group}_{(sample_idx % cfg.n_per_group) + 1}"
+        age = (
+            float(rng.uniform(cfg.age_low, cfg.age_high))
+            if cfg.continuous_covariate else None
+        )
 
-        # True per-site β for this sample.
-        per_site_effect = effects if is_treatment else np.zeros_like(effects)
-        # Independent replicate noise around the group mean.
+        # True per-site β for this sample. Decompose into:
+        #   - binary effect (existing): only "treatment" group gets it
+        #   - multi-group effect: scales with group_idx (centered)
+        #   - age effect: linear with age at age_sites
+        if group == "treatment":
+            per_site_effect = effects.copy()
+        else:
+            per_site_effect = np.zeros_like(effects)
+        if cfg.n_groups >= 3 and multigroup_sites.any():
+            # Center group index around (n_groups - 1) / 2 so the
+            # baseline-shifted F-test sees the full range.
+            centered = (group_idx - (cfg.n_groups - 1) / 2.0)
+            per_site_effect = per_site_effect + (
+                multigroup_sites.astype(np.float64)
+                * centered
+                * cfg.dmc_effect_multigroup_step
+            )
+        if cfg.continuous_covariate and age_sites.any():
+            per_site_effect = per_site_effect + age_slope * (age or 0.0)
+
+        # Independent replicate noise around the per-sample mean.
         rep_noise = rng.normal(0.0, cfg.replicate_sd, size=n)
         beta = np.clip(cfg.baseline_meth + per_site_effect + rep_noise, 0.01, 0.99)
 
@@ -217,11 +300,14 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
 
         cov_path = cov_dir / f"{sid}.bismark.cov.gz"
         _write_cov_gz(cov_path, chroms_arr, positions, meth, unmeth)
-        sample_records.append({
+        rec = {
             "sample_id": sid,
             "group": group,
             "path": str(cov_path),
-        })
+        }
+        if cfg.continuous_covariate:
+            rec["age"] = age
+        sample_records.append(rec)
 
     # Samplesheet.
     samplesheet_path = out_dir / "samplesheet.csv"
@@ -246,6 +332,9 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
         "true_meth_diff": true_meth_diff_postclip.tolist(),
         "dmr_id": dmr_id.tolist(),
         "in_dmr": (dmr_id >= 0).tolist(),
+        "is_multigroup_dmc": multigroup_sites.tolist(),
+        "is_age_dmc": age_sites.tolist(),
+        "age_slope": age_slope.tolist(),
     })
     truth_path = out_dir / "truth.parquet"
     truth_df.write_parquet(truth_path)
@@ -261,9 +350,15 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
         "n_total_sites": n,
         "n_dmcs_true": int((effects != 0).sum()),
         "n_dmrs": cfg.n_dmrs,
+        "n_multigroup_dmcs": int(multigroup_sites.sum()),
+        "n_age_dmcs": int(age_sites.sum()),
         "chromosomes": list(cfg.chromosomes),
         "sample_ids": [r["sample_id"] for r in sample_records],
         "treatment_ids": [r["sample_id"] for r in sample_records if r["group"] == "treatment"],
         "control_ids": [r["sample_id"] for r in sample_records if r["group"] == "control"],
+        "group_ids": {
+            label: [r["sample_id"] for r in sample_records if r["group"] == label]
+            for label in ordered_labels
+        },
         "config": cfg,
     }

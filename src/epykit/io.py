@@ -26,16 +26,27 @@ def _count_store_rows(store_dir: str) -> int | None:
 
 def read_bismark(
     samplesheet: str,
-    treatment_group: str,
-    control_group: str,
+    treatment_group: str | None = None,
+    control_group: str | None = None,
     assembly: str = "unknown",
     store_dir: str = "methyl_store",
     context: str = "CpG",
     reference_fasta: str | None = None,
+    groups: list[str] | None = None,
 ) -> MethylData:
     """Read a samplesheet and create a MethylData analysis object.
 
     Expected samplesheet columns: sample_id, group, path
+
+    Two operating modes:
+
+    * Binary (legacy, default): pass ``treatment_group`` and
+      ``control_group``. Only those two groups are kept; ``obs.treatment``
+      is set to 1 for treatment-group samples and 0 for control.
+    * Multi-group (Plan 2): pass ``groups=[g1, g2, ...]`` to load any
+      subset of groups. ``obs.treatment`` is added only if
+      ``treatment_group`` is also supplied; otherwise the column is
+      omitted and downstream code falls back to formula-based contrasts.
     """
     with open(samplesheet) as handle:
         rows = list(csv.DictReader(handle))
@@ -47,19 +58,29 @@ def read_bismark(
     if missing_cols:
         raise ValueError(f"samplesheet missing required columns: {sorted(missing_cols)}")
 
+    if groups is not None:
+        allowed = set(groups)
+    elif treatment_group is not None and control_group is not None:
+        allowed = {treatment_group, control_group}
+    else:
+        raise ValueError(
+            "Either pass (treatment_group, control_group) for binary mode "
+            "or groups=[...] for multi-group mode."
+        )
+
     obs_rows: list[dict] = []
     files: list[tuple[str, str]] = []
     for row in rows:
         group = row["group"]
-        if group not in (treatment_group, control_group):
+        if group not in allowed:
             continue
-        treatment = 1 if group == treatment_group else 0
         obs_row = {
             "sample_id": row["sample_id"],
             "group": group,
-            "treatment": treatment,
             "path": row["path"],
         }
+        if treatment_group is not None:
+            obs_row["treatment"] = 1 if group == treatment_group else 0
         for key, value in row.items():
             if key not in {"sample_id", "group", "path"}:
                 obs_row[key] = value
@@ -68,8 +89,8 @@ def read_bismark(
 
     if not obs_rows:
         raise ValueError(
-            "No samples matched treatment/control groups from samplesheet. "
-            f"treatment_group={treatment_group}, control_group={control_group}"
+            "No samples matched the requested groups from samplesheet. "
+            f"groups={sorted(allowed)}"
         )
 
     # Organize stores under a .cache subdirectory for a cleaner output layout

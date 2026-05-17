@@ -64,7 +64,18 @@ from ._glm import build_design
 # Export / interop (lazy heavy deps inside)
 from .export import to_bedgraph, to_bigwig, dmcs_to_bed, dmrs_to_bed
 from .anndata_io import to_anndata
+from .mudata_io import to_mudata
+from .methylkit_io import to_methylkit_tabix
+from .multiqc_export import report_multiqc
+from .nfcore_qc import read_nfcore_methylseq_qc
 from .report import generate_report
+from .dvc import process_chromosomes_dvc
+from .qc import (
+    sex_check,
+    contamination_estimate,
+    sample_correlation as sample_correlation_qc,
+    power as power_calc,
+)
 
 __all__ = [
     # version
@@ -86,6 +97,8 @@ __all__ = [
     # DMR engines
     "call_dmr_sliding_window",
     "smooth_methylation_gaussian",
+    # DVC engine (Plan 2 §4)
+    "process_chromosomes_dvc",
     # annotation
     "annotate_features",
     "annotate_cpg_islands",
@@ -93,6 +106,10 @@ __all__ = [
     "bisulfite_conversion_rate",
     "global_methylation_report",
     "coverage_uniformity",
+    "sex_check",
+    "contamination_estimate",
+    "sample_correlation_qc",
+    "power_calc",
     # GLM design
     "build_design",
     # Exports / interop
@@ -101,5 +118,9 @@ __all__ = [
     "dmcs_to_bed",
     "dmrs_to_bed",
     "to_anndata",
+    "to_mudata",
+    "to_methylkit_tabix",
+    "report_multiqc",
+    "read_nfcore_methylseq_qc",
     "generate_report",
 ]

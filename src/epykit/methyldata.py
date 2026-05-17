@@ -281,6 +281,57 @@ class MethylData:
         from .anndata_io import to_anndata
         return to_anndata(self, **kwargs)
 
+    def to_mudata(self, **kwargs):
+        """Return a MuData with methylation as the ``'meth'`` modality."""
+        from .mudata_io import to_mudata
+        return to_mudata(self, **kwargs)
+
+    def to_methylkit_tabix(self, output_dir: str, samples=None):
+        """Export per-sample methylKit tabix-friendly tables."""
+        from .methylkit_io import to_methylkit_tabix
+        return to_methylkit_tabix(self, output_dir, samples=samples)
+
+    def region_beta(
+        self,
+        chrom: str,
+        start: int,
+        end: int,
+    ) -> pl.DataFrame:
+        """Per-sample mean β within ``chrom:start-end``.
+
+        Returns columns: sample, mean_beta, n_cpgs, mean_coverage.
+        """
+        rows: list[dict] = []
+        samples = self.obs.get_column("sample_id").to_list()
+        store_root = Path(self.store)
+        for s in samples:
+            part = store_root / f"sample={s}" / f"chrom={chrom}" / "part-0.parquet"
+            if not part.exists():
+                rows.append({
+                    "sample": s, "mean_beta": float("nan"),
+                    "n_cpgs": 0, "mean_coverage": float("nan"),
+                })
+                continue
+            df = (
+                pl.read_parquet(str(part), columns=["pos", "N_meth", "coverage"])
+                .filter((pl.col("pos") >= start) & (pl.col("pos") <= end))
+            )
+            if len(df) == 0:
+                rows.append({
+                    "sample": s, "mean_beta": float("nan"),
+                    "n_cpgs": 0, "mean_coverage": float("nan"),
+                })
+                continue
+            cov_sum = int(df.get_column("coverage").sum())
+            meth_sum = int(df.get_column("N_meth").sum())
+            rows.append({
+                "sample": s,
+                "mean_beta": float(meth_sum / max(cov_sum, 1)),
+                "n_cpgs": int(len(df)),
+                "mean_coverage": float(cov_sum / max(len(df), 1)),
+            })
+        return pl.DataFrame(rows)
+
     def __repr__(self) -> str:
         n_sites = self.uns.get("n_sites_filtered") or self.uns.get("n_sites_raw", "?")
         groups = "unknown"

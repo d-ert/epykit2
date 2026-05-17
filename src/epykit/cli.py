@@ -23,6 +23,7 @@ CLI surface:
 
 import argparse
 import logging
+import sys
 import warnings
 from pathlib import Path
 from .convert import convert_sample
@@ -160,6 +161,45 @@ def _cli_n1_and_footgun_checks(args, unit: str = "sites") -> None:
 def _cmd_dmc(args: argparse.Namespace):
     """Handler for 'dmc' subcommand."""
     _resolve_min_samples_case(args)
+
+    # Plan 2 §1: formula/contrast path uses ALL samples from the
+    # samplesheet rather than binary case/control. We build a tiny
+    # MethylData on the fly so tl.dmc can resolve the contrast against
+    # md.obs.
+    if args.formula is not None or args.contrast is not None:
+        from . import read_bismark, tl as _tl
+        covariates = (
+            [c.strip() for c in args.covariates.split(",")]
+            if args.covariates else None
+        )
+        # All groups from the samplesheet
+        import csv
+        with open(args.samplesheet) as fh:
+            groups = sorted({row["group"] for row in csv.DictReader(fh)})
+        md = read_bismark(
+            args.samplesheet,
+            treatment_group=args.treatment_group,
+            control_group=args.control_group,
+            groups=groups,
+            store_dir=str(args.methylstore),
+        )
+        _tl.dmc(
+            md,
+            test=args.test,
+            formula=args.formula,
+            contrast=args.contrast,
+            covariates=covariates,
+            min_samples_treatment=args.min_samples_treatment,
+            min_samples_control=args.min_samples_control,
+        )
+        key = md.uns.get("dmc", {}).get("last_key", "dmc_glm_contrast")
+        results = md.varm.get(key)
+        if results is None:
+            raise RuntimeError("dmc contrast path produced no results")
+        results.write_parquet(args.output)
+        print(f"DMC (contrast) results written to {args.output}")
+        return
+
     treatment_samples, control_samples = _read_samplesheet_groups(
         args.samplesheet, args.treatment_group, args.control_group
     )
@@ -231,6 +271,24 @@ def _cmd_dmr(args: argparse.Namespace):
             min_samples_treatment=args.min_samples_treatment,
             min_samples_control=args.min_samples_control,
         )
+        if getattr(args, "empirical_fdr", False) and len(dmr_results) > 0:
+            from .dmr import empirical_fdr_for_dmr
+            dmr_results = empirical_fdr_for_dmr(
+                methylstore_path=args.methylstore,
+                samples_treatment=treatment_samples,
+                samples_control=control_samples,
+                observed_dmr=dmr_results,
+                n_perm=args.n_perm,
+                seed=args.perm_seed,
+                tile_size_bp=args.tile_size_bp,
+                test=args.test,
+                min_cpgs_per_tile=args.min_cpgs_per_tile,
+                alpha=args.alpha,
+                min_abs_meth_diff=args.min_abs_meth_diff,
+                unite=args.unite,
+                min_samples_treatment=args.min_samples_treatment,
+                min_samples_control=args.min_samples_control,
+            )
     else:
         # --- Legacy sliding-window path: takes a DMC parquet ---
         if not args.dmc_results:
@@ -408,6 +466,20 @@ def _configure_logging(verbosity: int) -> None:
 
 
 def main():
+    # Help strings and log messages embed unicode (β, →, μ, ...). On
+    # Windows the default console codec is cp1252 and argparse's
+    # `--help` print crashes with UnicodeEncodeError before any
+    # subcommand runs. Reconfigure both streams to UTF-8 with
+    # replacement so we never crash on a glyph the terminal can't draw.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                # Detached / non-text stream; nothing to do.
+                pass
+
     ap  = argparse.ArgumentParser(
         prog="epykit", description="Methylation Parquet store tools"
     )
@@ -457,7 +529,11 @@ def main():
     p_dmc.add_argument("--output",           required=True)
     p_dmc.add_argument(
         "--test",
-        choices=["lr", "score", "glm", "logit_t", "beta_binomial", "cmh", "fisher"],
+        choices=[
+            "lr", "score", "glm", "logit_t", "welch_t",
+            "beta_binomial",  # deprecated alias for welch_t
+            "bb_lr", "cmh", "fisher",
+        ],
         default="lr",
         help=(
             "Statistical test (default: lr). "
@@ -468,17 +544,37 @@ def main():
             "score — Quasi-binomial score test on the same dispersion-corrected "
             "accumulators as lr; marginally more powerful but mildly "
             "anti-conservative at the boundaries. "
-            "glm — Binomial GLM with covariates (requires a design via the "
-            "Python API: ep.tl.dmr(..., design='~ treatment + sex + batch')). "
-            "logit_t — Welch t on logit(beta), variance-stabilising "
-            "fallback. Weak near β=0/1 (anti-conservative under H0 when "
-            "between-replicate variance collapses); prefer 'lr'. "
-            "beta_binomial — Welch t on raw betas (NOT a true beta-binomial "
-            "GLM; superseded by lr/score). Same boundary-β caveat as logit_t. "
+            "glm — Binomial GLM with covariates (requires a design via "
+            "--formula). "
+            "logit_t — Welch t on logit(beta), variance-stabilising fallback. "
+            "welch_t — Welch t on raw betas (formerly 'beta_binomial'). "
+            "beta_binomial — Deprecated alias for welch_t. "
+            "bb_lr — True quasi-binomial LRT on a binary-treatment GLM with "
+            "per-site dispersion. "
             "cmh — Cochran-Mantel-Haenszel on per-pair strata. "
             "fisher — Fisher exact on reads pooled across replicates "
             "(anti-conservative, kept for backward compatibility; warns)."
         ),
+    )
+    p_dmc.add_argument(
+        "--formula", default=None,
+        help=(
+            "Plan 2 §1: patsy formula on md.obs columns (e.g. '~ group'). "
+            "Triggers the GLM-contrast path; pair with --contrast."
+        ),
+    )
+    p_dmc.add_argument(
+        "--contrast", default=None,
+        help=(
+            "Plan 2 §1: contrast specification. Either a single column "
+            "name (continuous covariate primary effect), a factor name "
+            "for a joint F-test (e.g. 'group'), or a patsy linear "
+            "combination ('group[T.KO] - group[T.WT]')."
+        ),
+    )
+    p_dmc.add_argument(
+        "--covariates", default=None,
+        help="Comma-separated list of nuisance covariate columns on md.obs.",
     )
     p_dmc.add_argument(
         "--no-unite", action="store_false", dest="unite", default=True,
@@ -525,10 +621,27 @@ def main():
     p_dmr.add_argument("--min-cpgs-per-tile",  type=int,   default=5,
                        help="(tile only) Minimum CpGs per tile per sample.")
     p_dmr.add_argument(
-        "--test", choices=["lr", "score", "glm", "logit_t", "beta_binomial", "cmh", "fisher"],
+        "--test",
+        choices=[
+            "lr", "score", "glm", "logit_t", "welch_t",
+            "beta_binomial",  # deprecated alias for welch_t
+            "bb_lr", "cmh", "fisher",
+        ],
         default="lr",
         help="(tile only) Statistical test applied to tile-level counts. "
              "Default 'lr' matches methylKit overdispersion='MN' test='Chisq'.",
+    )
+    p_dmr.add_argument(
+        "--empirical-fdr", action="store_true", default=False,
+        help="(tile only) Plan 2 §3: permutation-based empirical FDR.",
+    )
+    p_dmr.add_argument(
+        "--n-perm", type=int, default=100,
+        help="(tile only) Number of permutations when --empirical-fdr is set.",
+    )
+    p_dmr.add_argument(
+        "--perm-seed", type=int, default=42,
+        help="(tile only) Seed for permutation RNG.",
     )
     p_dmr.add_argument(
         "--no-unite", action="store_false", dest="unite", default=True,

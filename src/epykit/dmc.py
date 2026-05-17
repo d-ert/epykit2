@@ -55,7 +55,29 @@ _EMPTY_SCHEMA = {
     "pvalue":            pl.Float64,
     "log2_odds_ratio":   pl.Float64,
     "meth_diff":         pl.Float32,
+    "meth_diff_ci_lo":   pl.Float32,
+    "meth_diff_ci_hi":   pl.Float32,
 }
+
+# One-shot deprecation flag for test="beta_binomial" → "welch_t" rename.
+_WELCH_T_RENAME_WARNED = False
+
+
+def _canonicalise_test_name(test: str) -> str:
+    """Map deprecated test names to their canonical form (S-plan-2)."""
+    global _WELCH_T_RENAME_WARNED
+    if test == "beta_binomial":
+        if not _WELCH_T_RENAME_WARNED:
+            _WELCH_T_RENAME_WARNED = True
+            warnings.warn(
+                "test='beta_binomial' is a misnomer (it runs Welch t on raw "
+                "betas, not a beta-binomial GLM) and is deprecated in favour "
+                "of test='welch_t'. For a true beta-binomial LRT use "
+                "test='bb_lr'.",
+                DeprecationWarning, stacklevel=3,
+            )
+        return "welch_t"
+    return test
 
 _TEST_RECOMMENDATIONS = {
     range(1, 3):   "fisher (single-rep only; effect size dominates)",
@@ -1158,6 +1180,10 @@ def _process_one_chromosome(
     design_full: Optional[np.ndarray] = None,
     design_reduced: Optional[np.ndarray] = None,
     coef_idx: Optional[int] = None,
+    contrast_matrix: Optional[np.ndarray] = None,
+    contrast_label: Optional[str] = None,
+    samples_all_ordered: Optional[list[str]] = None,
+    group_labels_per_sample: Optional[list[str]] = None,
 ) -> pl.DataFrame:
     """Run DMC for one chromosome, loading one sample at a time.
 
@@ -1192,6 +1218,7 @@ def _process_one_chromosome(
         `logit_t`). Welford accumulators give per-site variance without
         materialising the count matrix.
     """
+    test = _canonicalise_test_name(test)
     n_sites = len(canonical_df)
     if n_sites == 0:
         return pl.DataFrame(schema=_EMPTY_SCHEMA)
@@ -1203,6 +1230,18 @@ def _process_one_chromosome(
     # the chosen test (e.g. fisher) does not use the variance.
     mean_case, M2_case, n_valid_case = _welford_init(n_sites)
     mean_ctrl, M2_ctrl, n_valid_ctrl = _welford_init(n_sites)
+
+    # Optional extras populated by individual branches. Surfaced into the
+    # output schema at the bottom of this function when present.
+    extras: dict[str, np.ndarray] = {}
+    # When contrast_matrix produces a joint test (k>1) we emit a different
+    # schema (per-level mean_beta_* + f_stat/df1/df2); detected by checking
+    # `multigroup_mode` at the end.
+    multigroup_mode = False
+    level_mean_beta: dict[str, np.ndarray] = {}
+    f_stat_out: Optional[np.ndarray] = None
+    df1_out: Optional[int] = None
+    df2_out: Optional[np.ndarray] = None
 
     # --- Statistical test ---
     if test == "fisher":
@@ -1327,7 +1366,7 @@ def _process_one_chromosome(
         del sn_case, sm_case, sm2n_case, nv_case
         del sn_ctrl, sm_ctrl, sm2n_ctrl, nv_ctrl
 
-    elif test in ("beta_binomial", "logit_t"):
+    elif test in ("welch_t", "logit_t"):
         # Load all samples for Welford accumulators
         for sample in samples_case:
             meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
@@ -1350,6 +1389,70 @@ def _process_one_chromosome(
                 mean_case, M2_case, n_valid_case,
                 mean_ctrl, M2_ctrl, n_valid_ctrl,
             )
+
+    elif test == "bb_lr":
+        # True beta-binomial LRT via a quasi-binomial GLM on a binary
+        # treatment indicator, with site-level dispersion estimated from
+        # the per-replicate Pearson residuals. Distinct from "lr" (which
+        # works on per-group pooled counts and a single phi from
+        # _score_finalize): bb_lr fits the full GLM at every site so the
+        # quasi-binomial dispersion correctly reflects between-replicate
+        # over-dispersion at THIS site, which is the spirit of a beta-
+        # binomial model.
+        all_samples = samples_case + samples_control
+        n_samples = len(all_samples)
+        meth_stack = np.zeros((n_sites, n_samples), dtype=np.int32)
+        cov_stack  = np.zeros((n_sites, n_samples), dtype=np.int32)
+        for j, sample in enumerate(all_samples):
+            meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+            meth_stack[:, j] = meth
+            cov_stack[:, j]  = cov
+            if j < len(samples_case):
+                _welford_update(mean_case, M2_case, n_valid_case, meth, cov)
+            else:
+                _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
+            del meth, cov
+
+        # Build a tiny intercept + treatment design.
+        treat = np.zeros(n_samples, dtype=np.float64)
+        treat[:len(samples_case)] = 1.0
+        X_bb_full = np.column_stack([np.ones(n_samples), treat])
+        X_bb_red  = np.ones((n_samples, 1))
+
+        from . import _glm
+        beta_f, se_f, dev_f, pearson_f, n_eff_bb = _glm.irls_binomial_batch(
+            meth_stack, cov_stack, X_bb_full,
+        )
+        _bbeta_r, _bse_r, dev_r, _bpearson_r, _bn_eff_r = _glm.irls_binomial_batch(
+            meth_stack, cov_stack, X_bb_red,
+        )
+
+        df_resid_per_site = (n_eff_bb.astype(np.float64) - 2.0)
+        df_resid_safe = np.maximum(df_resid_per_site, 1.0)
+        phi_eff, _phi_hat = _glm.compute_dispersion_phi(
+            pearson_per_site=pearson_f,
+            df_per_site=df_resid_per_site,
+            dispersion=dispersion,
+            chrom_name=chrom,
+        )
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            lr_raw = dev_r - dev_f
+            lr_raw = np.where(lr_raw < 0, 0.0, lr_raw)
+            chi2_stat = np.where(phi_eff > 0, lr_raw / phi_eff, np.nan)
+        pvals = _glm.reference_pvalues(
+            chi2_stat, phi_eff, df_resid_safe, reference=reference,
+        )
+
+        coef_treatment = beta_f[:, 1].astype(np.float64)
+        coef_se        = se_f[:, 1].astype(np.float64) * np.sqrt(np.maximum(phi_eff, 1.0))
+        log2_ors = (coef_treatment / np.log(2.0))
+        degenerate_bb = np.isnan(chi2_stat) | np.isnan(pvals) | (n_eff_bb < 2)
+        pvals = np.where(degenerate_bb, np.nan, pvals)
+        log2_ors = np.where(degenerate_bb, np.nan, log2_ors)
+        extras["coef_treatment"] = coef_treatment
+        extras["coef_se"]        = coef_se
+        del meth_stack, cov_stack, beta_f, se_f, dev_f, dev_r, pearson_f, n_eff_bb
 
     elif test == "glm":
         # Covariate-aware binomial GLM with deviance LR test.
@@ -1433,18 +1536,128 @@ def _process_one_chromosome(
         log2_ors = np.where(degenerate, np.nan, log2_ors)
 
         # Stash for the schema additions below.
-        _glm_extras = {
-            "coef_treatment": coef_treatment,
-            "coef_se":        coef_se,
-        }
+        extras["coef_treatment"] = coef_treatment
+        extras["coef_se"]        = coef_se
         del meth_stack, cov_stack, beta_full, se_full, dev_full, dev_red
         del pearson_full, n_eff
+
+    elif test == "glm_contrast":
+        # Multi-group / continuous-covariate primary-effect path.
+        # The caller supplies (a) a shared design matrix `design_full`,
+        # (b) a `contrast_matrix` C of shape (k, p), and (c) an ordered
+        # list `samples_all_ordered` whose row order matches design_full.
+        if (
+            design_full is None
+            or contrast_matrix is None
+            or samples_all_ordered is None
+        ):
+            raise ValueError(
+                "test='glm_contrast' requires design_full, contrast_matrix, "
+                "and samples_all_ordered."
+            )
+        n_samples = len(samples_all_ordered)
+        if design_full.shape[0] != n_samples:
+            raise ValueError(
+                f"design_full has {design_full.shape[0]} rows but "
+                f"{n_samples} samples were supplied via samples_all_ordered."
+            )
+
+        meth_stack = np.zeros((n_sites, n_samples), dtype=np.int32)
+        cov_stack  = np.zeros((n_sites, n_samples), dtype=np.int32)
+        # Welford per-level accumulators. We keep mean_case/mean_ctrl as
+        # "all samples that map to label 'case'" vs "all samples that
+        # don't" — chosen so the binary-case columns of the schema still
+        # carry interpretable values. If group_labels_per_sample is given,
+        # we additionally keep one Welford accumulator per level for the
+        # multi-group output schema.
+        level_mean: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        if group_labels_per_sample is not None:
+            for lvl in set(group_labels_per_sample):
+                level_mean[lvl] = _welford_init(n_sites)
+
+        for j, sample in enumerate(samples_all_ordered):
+            meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
+            meth_stack[:, j] = meth
+            cov_stack[:, j]  = cov
+            # Backwards-compat columns: split on whether sample is in samples_case.
+            if sample in samples_case:
+                _welford_update(mean_case, M2_case, n_valid_case, meth, cov)
+            elif sample in samples_control:
+                _welford_update(mean_ctrl, M2_ctrl, n_valid_ctrl, meth, cov)
+            if group_labels_per_sample is not None:
+                lvl = group_labels_per_sample[j]
+                _welford_update(*level_mean[lvl], meth, cov)
+            del meth, cov
+
+        from . import _glm
+        beta_full, se_full, dev_full, pearson_full, n_eff, cov_beta = (
+            _glm.irls_binomial_batch(
+                meth_stack, cov_stack, design_full, return_cov=True,
+            )
+        )
+
+        p_full = design_full.shape[1]
+        df_resid_per_site = (n_eff.astype(np.float64) - float(p_full))
+        phi_eff, _phi_hat = _glm.compute_dispersion_phi(
+            pearson_per_site=pearson_full,
+            df_per_site=df_resid_per_site,
+            dispersion=dispersion,
+            chrom_name=chrom,
+        )
+        df_resid_safe = np.maximum(df_resid_per_site, 1.0)
+
+        stat, pvals, k_rank = _glm.wald_test(
+            beta_full, cov_beta, contrast_matrix,
+            phi_eff=phi_eff, df_resid=df_resid_safe, reference=reference,
+        )
+        k_rank = int(k_rank)
+
+        degenerate = (
+            np.isnan(stat) | np.isnan(pvals) | (n_eff < p_full + 1)
+        )
+        pvals = np.where(degenerate, np.nan, pvals)
+
+        if k_rank == 1:
+            # Single-coef contrast: surface coef + coef_se on the contrast
+            # axis (Cβ and sqrt(C cov_β Cᵀ)).
+            Cb = (beta_full @ contrast_matrix.T)[:, 0]
+            with np.errstate(invalid="ignore"):
+                var_Cb = np.einsum(
+                    "kp,ipq,lq->ikl",
+                    contrast_matrix, cov_beta * phi_eff[:, None, None],
+                    contrast_matrix,
+                )[:, 0, 0]
+                cse = np.sqrt(np.where(var_Cb > 0, var_Cb, np.nan))
+            log2_ors = (Cb / np.log(2.0))
+            log2_ors = np.where(degenerate, np.nan, log2_ors)
+            extras["coef_treatment"] = Cb
+            extras["coef_se"]        = cse
+            # Single-coef path still emits the standard binary schema.
+        else:
+            # Joint contrast: emit multi-group schema. We do NOT populate
+            # the binary mean_beta_case/control columns meaningfully —
+            # they're filled with NaN downstream. F-stat and per-level
+            # mean betas are stored for the unified output block.
+            multigroup_mode = True
+            f_stat_out = (stat / k_rank).astype(np.float64)
+            f_stat_out = np.where(degenerate, np.nan, f_stat_out)
+            df1_out = k_rank
+            df2_out = df_resid_safe.astype(np.float64)
+            for lvl, (mu_l, _M2_l, nv_l) in level_mean.items():
+                arr = mu_l.astype(np.float32)
+                arr[nv_l == 0] = np.nan
+                level_mean_beta[lvl] = arr
+            log2_ors = np.full(n_sites, np.nan, dtype=np.float64)
+            extras.clear()  # coef_* not meaningful for joint test
+
+        del meth_stack, cov_stack, beta_full, se_full, dev_full
+        del pearson_full, n_eff, cov_beta
 
     else:
         raise NotImplementedError(
             f"Test '{test}' not implemented. "
             "Choose 'lr', 'score', 'fisher', 'cmh', 'logit_t', "
-            "'beta_binomial', or 'glm'."
+            "'welch_t', 'bb_lr', or 'glm'."
         )
 
     # --- BIO-3: equal-weight per-replicate mean beta ---
@@ -1454,6 +1667,24 @@ def _process_one_chromosome(
     mean_beta_case[n_valid_case == 0] = np.nan
     mean_beta_ctrl[n_valid_ctrl == 0] = np.nan
     meth_diff = (mean_beta_case - mean_beta_ctrl).astype(np.float32)
+
+    # Wald CI on Δβ from Welford accumulators (Section 2 of Plan 2). For the
+    # multi-group joint test (k>1) the scalar Δβ is undefined, so we leave
+    # CI columns as NaN and let the multi-group schema speak through
+    # f_stat / df1 / df2 / mean_beta_<level>.
+    from . import _glm as _glm_for_ci
+    if not multigroup_mode:
+        vm_case = _welford_var_mean(M2_case, n_valid_case)
+        vm_ctrl = _welford_var_mean(M2_ctrl, n_valid_ctrl)
+        ci_lo, ci_hi = _glm_for_ci.welch_meth_diff_ci(
+            mean_case.astype(np.float64), vm_case,
+            mean_ctrl.astype(np.float64), vm_ctrl,
+        )
+        ci_lo = ci_lo.astype(np.float32)
+        ci_hi = ci_hi.astype(np.float32)
+    else:
+        ci_lo = np.full(n_sites, np.nan, dtype=np.float32)
+        ci_hi = np.full(n_sites, np.nan, dtype=np.float32)
 
     # BIO-7: per-site min-samples guard. Sites where fewer than
     # `min_samples_*` replicates contributed valid (coverage > 0) data
@@ -1478,6 +1709,8 @@ def _process_one_chromosome(
             meth_diff = np.where(keep_mask, meth_diff, np.float32(np.nan))
             mean_beta_case = np.where(keep_mask, mean_beta_case, np.float32(np.nan))
             mean_beta_ctrl = np.where(keep_mask, mean_beta_ctrl, np.float32(np.nan))
+            ci_lo = np.where(keep_mask, ci_lo, np.float32(np.nan))
+            ci_hi = np.where(keep_mask, ci_hi, np.float32(np.nan))
 
     del mean_case, M2_case, n_valid_case, mean_ctrl, M2_ctrl, n_valid_ctrl
 
@@ -1494,10 +1727,27 @@ def _process_one_chromosome(
         "pvalue":            pl.Series(pvals),
         "log2_odds_ratio":   pl.Series(log2_ors),
         "meth_diff":         pl.Series(meth_diff),
+        "meth_diff_ci_lo":   pl.Series(ci_lo),
+        "meth_diff_ci_hi":   pl.Series(ci_hi),
     }
-    if test == "glm":
-        out_cols["coef_treatment"] = pl.Series(_glm_extras["coef_treatment"])
-        out_cols["coef_se"]        = pl.Series(_glm_extras["coef_se"])
+    if "coef_treatment" in extras and "coef_se" in extras:
+        out_cols["coef_treatment"] = pl.Series(extras["coef_treatment"])
+        out_cols["coef_se"]        = pl.Series(extras["coef_se"])
+    if multigroup_mode and f_stat_out is not None and df2_out is not None:
+        out_cols["f_stat"] = pl.Series(f_stat_out)
+        out_cols["df1"]    = pl.Series(np.full(n_sites, int(df1_out), dtype=np.int32))
+        out_cols["df2"]    = pl.Series(df2_out)
+        # Per-level mean beta columns (stable sort for deterministic schema).
+        for lvl in sorted(level_mean_beta.keys()):
+            out_cols[f"mean_beta_{lvl}"] = pl.Series(level_mean_beta[lvl])
+        # meth_diff_max = max |mean_beta_i - mean_beta_j| across all level pairs
+        if level_mean_beta:
+            stacked = np.stack(
+                [level_mean_beta[lvl] for lvl in sorted(level_mean_beta)],
+                axis=1,
+            )
+            max_diff = np.nanmax(stacked, axis=1) - np.nanmin(stacked, axis=1)
+            out_cols["meth_diff_max"] = pl.Series(max_diff.astype(np.float32))
     return pl.DataFrame(out_cols).sort("pos")
 
 
@@ -1525,10 +1775,12 @@ def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
             "   Statistical power is very low. Many true positives will be missed.\n"
             "   Recommendation: Use n≥3 for reliable differential methylation calling."
         )
-    elif min_n < 6 and test == "beta_binomial":
+    elif min_n < 6 and test in ("welch_t", "beta_binomial"):
         logger.warning(
-            "⚠️  Beta-binomial test with n<6 may have poor variance estimates.\n"
-            "   Consider using test='score' (recommended) or test='logit_t'."
+            "⚠️  Welch t (test='welch_t', formerly 'beta_binomial') with "
+            "n<6 may have poor variance estimates.\n"
+            "   Consider using test='lr' (recommended) or test='bb_lr' "
+            "(true quasi-binomial LRT)."
         )
 
     if test == "fisher" and min_n >= 2:
@@ -1567,6 +1819,10 @@ def process_chromosomes_dmc(
     design_full: Optional[np.ndarray] = None,
     design_reduced: Optional[np.ndarray] = None,
     coef_idx: Optional[int] = None,
+    contrast_matrix: Optional[np.ndarray] = None,
+    contrast_label: Optional[str] = None,
+    samples_all_ordered: Optional[list[str]] = None,
+    group_labels_per_sample: Optional[list[str]] = None,
     *,
     samples_case: Optional[list[str]] = None,       # deprecated alias
     min_samples_case: Optional[int] = None,         # deprecated alias
@@ -1650,11 +1906,26 @@ def process_chromosomes_dmc(
     samples_case = samples_treatment
     min_samples_case = min_samples_treatment
 
+    # S-plan-2: canonicalise legacy test names before any branching so that
+    # downstream code only ever sees the new names.
+    test = _canonicalise_test_name(test)
+
     store       = Path(methylstore_path)
-    all_samples = samples_case + samples_control
+    # For glm_contrast the case/control split is not meaningful — the
+    # caller passes a samples_all_ordered list that the engine uses for
+    # design-row alignment. Use that as the chromosome-intersection basis.
+    if test == "glm_contrast":
+        if samples_all_ordered is None:
+            raise ValueError(
+                "test='glm_contrast' requires samples_all_ordered."
+            )
+        all_samples = list(samples_all_ordered)
+    else:
+        all_samples = samples_case + samples_control
 
     min_group = min(len(samples_case), len(samples_control))
-    _validate_sample_size_and_warn(len(samples_case), len(samples_control), test)
+    if test != "glm_contrast":
+        _validate_sample_size_and_warn(len(samples_case), len(samples_control), test)
 
     for rng, rec in _TEST_RECOMMENDATIONS.items():
         if min_group in rng:
@@ -1703,6 +1974,10 @@ def process_chromosomes_dmc(
                 design_full=design_full,
                 design_reduced=design_reduced,
                 coef_idx=coef_idx,
+                contrast_matrix=contrast_matrix,
+                contrast_label=contrast_label,
+                samples_all_ordered=samples_all_ordered,
+                group_labels_per_sample=group_labels_per_sample,
             )
             del canonical_df
 

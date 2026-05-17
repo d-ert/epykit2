@@ -709,6 +709,137 @@ def call_dmr_tile_based(
     return dmr_df
 
 
+# Permutation-based empirical FDR
+
+def empirical_fdr_for_dmr(
+    methylstore_path: str,
+    samples_treatment: list[str],
+    samples_control: list[str],
+    observed_dmr: pl.DataFrame,
+    *,
+    n_perm: int = 100,
+    seed: int = 42,
+    n_jobs: int = 1,
+    **dmr_kwargs,
+) -> pl.DataFrame:
+    """Empirical (permutation) FDR for tile-based DMRs.
+
+    Re-runs ``call_dmr_tile_based`` ``n_perm`` times with treatment / control
+    labels shuffled. For each observed DMR, the empirical p-value is
+    estimated from the fraction of null DMRs (across all permutations) with
+    raw p-value <= observed. The result is BH-adjusted to
+    ``empirical_qvalue``.
+
+    Parameters
+    ----------
+    methylstore_path, samples_treatment, samples_control
+        Same arguments passed to :func:`call_dmr_tile_based`.
+    observed_dmr
+        The DMR DataFrame returned by the observed (unpermuted) run.
+        Empirical columns are appended to a copy of this frame.
+    n_perm
+        Number of permutations.
+    seed
+        Seed for the per-permutation label shuffler.
+    n_jobs
+        joblib parallel worker count. -1 uses all cores. Falls back to
+        serial execution when joblib is not installed.
+    **dmr_kwargs
+        Forwarded to ``call_dmr_tile_based`` for each permutation; should
+        match the observed run's settings (tile_size_bp, test, alpha,
+        min_abs_meth_diff, dispersion, reference, etc.).
+
+    Returns
+    -------
+    pl.DataFrame
+        ``observed_dmr`` with added columns ``empirical_pvalue`` and
+        ``empirical_qvalue``. The full null pool (per-DMR raw pvalues from
+        every permutation) is cached on ``observed_dmr.attrs`` only if the
+        caller upstream wires it — this function just returns the
+        annotated table.
+    """
+    if len(observed_dmr) == 0:
+        return observed_dmr.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias("empirical_pvalue"),
+            pl.lit(None, dtype=pl.Float64).alias("empirical_qvalue"),
+        ])
+
+    n_treat = len(samples_treatment)
+    pool = list(samples_treatment) + list(samples_control)
+    rng = np.random.default_rng(seed)
+
+    def _run_one_perm(perm_idx: int) -> np.ndarray:
+        # Local RNG so parallel workers stay deterministic.
+        local_rng = np.random.default_rng(seed + perm_idx + 1)
+        shuffled = pool.copy()
+        local_rng.shuffle(shuffled)
+        perm_treat = shuffled[:n_treat]
+        perm_ctrl = shuffled[n_treat:]
+        # Force test='lr' or whatever observed used; do not run annotation.
+        kwargs = dict(dmr_kwargs)
+        kwargs.pop("samples_case", None)
+        kwargs.pop("min_samples_case", None)
+        try:
+            null_df = call_dmr_tile_based(
+                methylstore_path=methylstore_path,
+                samples_treatment=perm_treat,
+                samples_control=perm_ctrl,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning("permutation %d failed: %s", perm_idx, exc)
+            return np.array([], dtype=np.float64)
+        if "pvalue" not in null_df.columns or len(null_df) == 0:
+            return np.array([], dtype=np.float64)
+        return null_df.get_column("pvalue").drop_nulls().to_numpy()
+
+    null_pvals_list: list[np.ndarray]
+    if n_jobs == 1:
+        null_pvals_list = [_run_one_perm(i) for i in range(n_perm)]
+    else:
+        try:
+            from joblib import Parallel, delayed
+            null_pvals_list = Parallel(n_jobs=n_jobs)(
+                delayed(_run_one_perm)(i) for i in range(n_perm)
+            )
+        except ImportError:
+            logger.warning("joblib not installed; falling back to serial execution.")
+            null_pvals_list = [_run_one_perm(i) for i in range(n_perm)]
+
+    if all(len(arr) == 0 for arr in null_pvals_list):
+        logger.warning(
+            "All %d permutations produced zero null DMRs. Empirical "
+            "p-values default to 1 / (1 + n_perm).",
+            n_perm,
+        )
+    null_pool = (
+        np.concatenate(null_pvals_list) if any(len(a) for a in null_pvals_list)
+        else np.array([1.0])
+    )
+    null_sorted = np.sort(null_pool)
+    obs_p = observed_dmr.get_column("pvalue").to_numpy()
+    # For each observed p, count null DMRs with raw pvalue <= obs_p.
+    # Plus-one in num/den is the standard "add 1" correction so empirical
+    # p never hits 0 with finite permutations.
+    counts = np.searchsorted(null_sorted, obs_p, side="right")
+    total_null = max(len(null_sorted), 1)
+    emp_p = (counts + 1.0) / (total_null + 1.0)
+    emp_p = np.clip(emp_p, 0.0, 1.0)
+
+    # BH-adjust to empirical q-value
+    from statsmodels.stats.multitest import multipletests
+    finite = np.isfinite(emp_p)
+    emp_q = np.full_like(emp_p, np.nan, dtype=np.float64)
+    if finite.any():
+        _, q_finite, _, _ = multipletests(emp_p[finite], method="fdr_bh")
+        emp_q[finite] = q_finite
+
+    return observed_dmr.with_columns([
+        pl.Series("empirical_pvalue", emp_p),
+        pl.Series("empirical_qvalue", emp_q),
+    ])
+
+
 # Public API — fast Gaussian smoothing (replaces statsmodels LOESS)
 
 def smooth_methylation_gaussian(

@@ -13,7 +13,7 @@ import polars as pl
 
 from .annotate import annotate_cpg_islands, annotate_features, _GTF_CACHE
 from .dmc import apply_multiple_testing_correction, process_chromosomes_dmc
-from .dmr import call_dmr_sliding_window, call_dmr_tile_based
+from .dmr import call_dmr_sliding_window, call_dmr_tile_based, empirical_fdr_for_dmr
 from .methyldata import MethylData
 from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
 
@@ -158,8 +158,21 @@ def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
     return "lr"
 
 
-def qc(md: MethylData, chh_context_store: str | None = None) -> None:
-    """Populate md.obs with per-sample QC metrics and cache QC tables in md.uns."""
+def qc(
+    md: MethylData,
+    chh_context_store: str | None = None,
+    *,
+    run_sex_check: bool = False,
+    run_contamination: bool = False,
+    run_sample_correlation: bool = False,
+    correlation_method: str = "spearman",
+    expected_sex_col: str | None = None,
+) -> None:
+    """Populate md.obs with per-sample QC metrics and cache QC tables in md.uns.
+
+    Plan 2 §5 additions are opt-in via the ``run_*`` flags so the default
+    ``tl.qc(md)`` keeps the existing fast subset.
+    """
     samples = md.obs.get_column("sample_id").to_list()
 
     global_report = global_methylation_report(md.store, samples)
@@ -200,6 +213,47 @@ def qc(md: MethylData, chh_context_store: str | None = None) -> None:
             conv.append({"sample_id": sample, "bisulfite_conversion_rate": rate})
         obs = obs.join(pl.DataFrame(conv), on="sample_id", how="left")
 
+    # --- Plan 2 §5: clinical QC additions ----------------------------------
+    if run_sex_check:
+        from .qc import sex_check as _sex_check
+        expected = None
+        if expected_sex_col and expected_sex_col in obs.columns:
+            expected = {
+                row["sample_id"]: row[expected_sex_col]
+                for row in obs.iter_rows(named=True)
+                if row.get(expected_sex_col) is not None
+            }
+        sex_df = _sex_check(md.store, samples, expected_sex=expected)
+        md.uns["qc_sex_check"] = sex_df
+        obs = obs.join(
+            sex_df.select(["sample_id", "inferred_sex", "mismatch"]).rename(
+                {"mismatch": "sex_mismatch"}
+            ),
+            on="sample_id", how="left",
+        )
+
+    if run_contamination:
+        from .qc import contamination_estimate as _contam
+        scores = [
+            {"sample_id": s, "contamination_score": float(_contam(md.store, s))}
+            for s in samples
+        ]
+        obs = obs.join(pl.DataFrame(scores), on="sample_id", how="left")
+
+    if run_sample_correlation:
+        from .qc import sample_correlation as _samp_corr
+        corr_df = _samp_corr(md.store, samples, method=correlation_method)
+        md.uns["qc_sample_correlation"] = corr_df
+        if len(corr_df) > 0:
+            # Per-sample min off-diagonal correlation (low → likely swap).
+            off_diag = corr_df.filter(pl.col("sample_a") != pl.col("sample_b"))
+            min_corr = (
+                off_diag.group_by("sample_a")
+                .agg(pl.min("correlation").alias("min_pairwise_corr"))
+                .rename({"sample_a": "sample_id"})
+            )
+            obs = obs.join(min_corr, on="sample_id", how="left")
+
     md.obs = obs
     md.uns["qc_global_methylation"] = global_report
     md.uns["qc_coverage_uniformity"] = cov_report
@@ -214,6 +268,11 @@ def dmc(
     dispersion: str = "site",
     reference: str = "methylkit",
     allow_n1: bool = False,
+    # Section 1 of Plan 2: multi-group / continuous-covariate contrasts
+    formula: str | None = None,
+    contrast=None,
+    covariates: list[str] | None = None,
+    treatment_col: str = "treatment",
     *,
     min_samples_case: int | None = None,  # deprecated alias (S9)
 ) -> None:
@@ -226,8 +285,36 @@ def dmc(
         treatment/control sample lists.
     test : str
         One of ``"auto"``, ``"lr"``, ``"score"``, ``"logit_t"``,
-        ``"beta_binomial"``, ``"cmh"``, ``"fisher"``. ``"auto"`` resolves to
-        ``"fisher"`` at n<2 and ``"lr"`` (methylKit parity) at n>=2.
+        ``"welch_t"`` (formerly ``"beta_binomial"`` — deprecated alias),
+        ``"bb_lr"`` (true quasi-binomial LRT), ``"cmh"``, ``"fisher"``,
+        ``"glm"``. ``"auto"`` resolves to ``"fisher"`` at n<2 and ``"lr"``
+        (methylKit parity) at n>=2.
+
+        When ``formula`` and/or ``contrast`` are supplied, the test is
+        forced to a GLM-based path regardless of ``test=``.
+    formula : str, optional
+        patsy formula on ``md.obs`` columns, e.g. ``"~ group"`` for a
+        multi-group test or ``"~ age + sex"`` for a continuous-covariate
+        primary effect. When supplied with ``contrast``, the engine fits
+        the GLM once per site and runs a Wald / joint-F test against the
+        contrast.
+    contrast : str or np.ndarray, optional
+        Contrast specification. Accepts:
+        - a column name in the resolved design (``"age"`` for a continuous
+          covariate primary effect; produces a single-coef Wald-z² test
+          with meth-scale CIs);
+        - a factor name (``"group"``); every dummy of that factor is
+          included → joint F-test (multi-group);
+        - a patsy linear-combination string
+          (``"group[T.KO] - group[T.WT]"``); produces a single-row contrast;
+        - a raw ``(k, p)`` matrix.
+    covariates : list[str], optional
+        Convenience list of column names to include as nuisance terms.
+        Combined with ``formula`` and the resolved ``treatment_col``.
+    treatment_col : str, default ``"treatment"``
+        Name of the binary 0/1 column in ``md.obs`` used by the legacy
+        binary path. Ignored when ``contrast`` is supplied and resolves
+        without it.
     dispersion : {"site", "chrom", "shrink"}
         McCullagh-Nelder dispersion strategy used by the ``"lr"`` and
         ``"score"`` tests. Default ``"site"`` matches methylKit
@@ -247,6 +334,19 @@ def dmc(
     min_samples_treatment = _resolve_min_samples_aliases(
         min_samples_treatment, min_samples_case, default=0,
     )
+
+    # --- New contrast / multi-group path -------------------------------------
+    if formula is not None or contrast is not None:
+        _run_dmc_contrast(
+            md, test=test, formula=formula, contrast=contrast,
+            covariates=covariates, treatment_col=treatment_col,
+            chromosomes=chromosomes,
+            min_samples_treatment=min_samples_treatment,
+            min_samples_control=min_samples_control,
+            dispersion=dispersion, reference=reference,
+        )
+        return
+
     # Unconditional n=1 guard: applies whether test is "auto" or explicit.
     # _auto_test_simple raises ValueError when allow_n1=False; trigger that
     # check up front so explicit test="lr"/"fisher" with n<2 also gets
@@ -274,11 +374,14 @@ def dmc(
     )
     result = apply_multiple_testing_correction(result, method="fdr_bh")
 
-    key = f"dmc_{selected_test}"
+    # Canonicalise key name (test_used reflects the canonical name post-rename)
+    from .dmc import _canonicalise_test_name
+    canonical_used = _canonicalise_test_name(selected_test)
+    key = f"dmc_{canonical_used}"
     md.varm[key] = result
     md.uns["dmc"] = {
         "test_requested": test,
-        "test_used": selected_test,
+        "test_used": canonical_used,
         "n_sites": len(result),
         "unite": unite,
         "min_samples_treatment": min_samples_treatment,
@@ -291,6 +394,132 @@ def dmc(
         # S5: explicit pointer so MethylData.get_dmc() / .dmc resolve to the
         # table the user just wrote, regardless of which other tests have
         # been run in the same session.
+        "last_key": key,
+    }
+
+
+def _run_dmc_contrast(
+    md: MethylData,
+    *,
+    test: str,
+    formula: str | None,
+    contrast,
+    covariates: list[str] | None,
+    treatment_col: str,
+    chromosomes: list[str] | None,
+    min_samples_treatment: int,
+    min_samples_control: int,
+    dispersion: str,
+    reference: str,
+) -> None:
+    """Internal: multi-group / continuous-covariate primary-effect DMC.
+
+    Always uses test='glm_contrast' internally. Uses ALL samples in
+    md.obs order (not the binary case/control split), so the design
+    matrix matches md.obs row-for-row.
+    """
+    import numpy as np
+    from .dmc import process_chromosomes_dmc
+    from ._glm import build_design, resolve_contrast
+
+    if not md.obs.height:
+        raise ValueError("md.obs is empty; cannot build a design matrix.")
+    samples_all = md.obs.get_column("sample_id").to_list()
+
+    # Build design — without requiring a treatment column if we have a
+    # formula that doesn't reference one. The user's `treatment_col`
+    # default ("treatment") is *only* required when the existing binary
+    # path would have used it; here we let the formula speak.
+    need_treatment = (treatment_col in md.obs.columns) and (
+        formula is None or treatment_col in formula
+    )
+    design_full, _design_reduced, coef_idx, term_names, formula_used, design_info = (
+        build_design(
+            md.obs,
+            samples_ordered=samples_all,
+            formula=formula,
+            covariates=covariates,
+            treatment_col=treatment_col,
+            require_treatment_col=need_treatment,
+            return_design_info=True,
+        )
+    )
+
+    # Resolve the contrast against the design.
+    if contrast is None:
+        # Default: a single-coef contrast on `treatment_col` (this happens
+        # when the user supplies a `formula=` for covariate adjustment but
+        # no explicit contrast).
+        contrast = treatment_col
+    C, contrast_label = resolve_contrast(contrast, term_names, design_info=design_info)
+
+    # Build per-sample level labels for the multi-group output schema:
+    # take the FIRST term that is a factor of `contrast` (when contrast is
+    # a factor name), otherwise no per-level breakdown.
+    group_labels: list[str] | None = None
+    if isinstance(contrast, str) and contrast in md.obs.columns:
+        # Either a continuous column (single coef) or a categorical column
+        # (joint test). For both, emit per-level labels for downstream
+        # mean_beta_<level> columns when the column is categorical.
+        col = md.obs.get_column(contrast)
+        if col.dtype == pl.Utf8 or col.dtype == pl.Categorical:
+            group_labels = col.cast(pl.Utf8).to_list()
+
+    # Determine which samples are "case" vs "control" for the
+    # backwards-compatible binary columns. If treatment_col is on obs and
+    # carries a numeric 0/1 signal, use it; otherwise leave both empty so
+    # mean_beta_case/control remain NaN (uninterpretable for multi-group).
+    samples_case_local: list[str] = []
+    samples_control_local: list[str] = []
+    if treatment_col in md.obs.columns:
+        try:
+            mask_treat = (
+                md.obs.get_column(treatment_col).cast(pl.Float64, strict=False) == 1
+            ).to_list()
+            samples_case_local = [s for s, m in zip(samples_all, mask_treat) if m]
+            samples_control_local = [s for s, m in zip(samples_all, mask_treat) if not m]
+        except Exception:
+            pass
+
+    unite_info = md.uns.get("unite")
+    unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
+
+    result = process_chromosomes_dmc(
+        methylstore_path=md.store,
+        samples_treatment=samples_case_local,
+        samples_control=samples_control_local,
+        test="glm_contrast",
+        chromosomes=chromosomes,
+        unite=unite,
+        min_samples_treatment=min_samples_treatment,
+        min_samples_control=min_samples_control,
+        dispersion=dispersion,
+        reference=reference,
+        design_full=design_full,
+        contrast_matrix=C,
+        contrast_label=contrast_label,
+        samples_all_ordered=samples_all,
+        group_labels_per_sample=group_labels,
+    )
+    result = apply_multiple_testing_correction(result, method="fdr_bh")
+
+    key = "dmc_glm_contrast"
+    md.varm[key] = result
+    md.uns["dmc"] = {
+        "test_requested": test,
+        "test_used": "glm_contrast",
+        "n_sites": len(result),
+        "unite": unite,
+        "formula": formula_used,
+        "contrast": contrast_label,
+        "design_terms": term_names,
+        "covariates": list(covariates) if covariates else None,
+        "treatment_col": treatment_col,
+        "min_samples_treatment": min_samples_treatment,
+        "min_samples_control": min_samples_control,
+        "min_samples_case": min_samples_treatment,
+        "dispersion": dispersion,
+        "reference": reference,
         "last_key": key,
     }
 
@@ -322,6 +551,11 @@ def dmr(
     min_mean_qvalue: float | None = 0.05,
     # Replicate-count guard --------------------------------------------------
     allow_n1: bool = False,
+    # Plan 2 §3: permutation-based empirical FDR (tile method only) --------
+    empirical_fdr: bool = False,
+    n_perm: int = 100,
+    perm_seed: int = 42,
+    perm_n_jobs: int = 1,
     *,
     min_samples_case: int | None = None,  # deprecated alias (S9)
 ) -> None:
@@ -434,6 +668,38 @@ def dmr(
         if len(dmr_df) > 0 and min_mean_qvalue is not None and "qvalue" in dmr_df.columns:
             dmr_df = dmr_df.filter(pl.col("qvalue") < min_mean_qvalue)
 
+        # Plan 2 §3: permutation FDR. Refuses to run when a covariate design
+        # is in play (shuffling treatment labels invalidates the assumed
+        # covariate structure).
+        if empirical_fdr:
+            if design is not None or (covariates is not None and len(covariates) > 0):
+                raise ValueError(
+                    "empirical_fdr=True is not supported with covariate "
+                    "designs (label-shuffling invalidates stratification). "
+                    "Use a stratified-permutation scheme manually if needed."
+                )
+            if len(dmr_df) > 0:
+                dmr_df = empirical_fdr_for_dmr(
+                    methylstore_path=md.store,
+                    samples_treatment=md.treatment_ids,
+                    samples_control=md.control_ids,
+                    observed_dmr=dmr_df,
+                    n_perm=n_perm,
+                    seed=perm_seed,
+                    n_jobs=perm_n_jobs,
+                    tile_size_bp=tile_size_bp,
+                    test=selected_test,
+                    chromosomes=chromosomes,
+                    min_cpgs_per_tile=min_cpgs_per_tile,
+                    alpha=alpha,
+                    min_abs_meth_diff=min_abs_meth_diff,
+                    unite=unite,
+                    min_samples_treatment=min_samples_treatment,
+                    min_samples_control=min_samples_control,
+                    dispersion=dispersion,
+                    reference=reference,
+                )
+
         md.uns["dmr"] = dmr_df
         md.uns["dmr_params"] = {
             "method": "tile",
@@ -455,6 +721,9 @@ def dmr(
             "treatment_col": treatment_col,
             "formula_used": formula_used,
             "design_terms": term_names if term_names else None,
+            "empirical_fdr": empirical_fdr,
+            "n_perm": n_perm if empirical_fdr else None,
+            "perm_seed": perm_seed if empirical_fdr else None,
         }
         return
 
@@ -498,6 +767,62 @@ def dmr(
     raise ValueError(
         f"Unknown DMR method '{method}'. Expected 'tile' or 'sliding_window'."
     )
+
+
+def dvc(
+    md: MethylData,
+    test: str = "bartlett",
+    chromosomes: list[str] | None = None,
+    alpha: float = 0.05,
+    mean_filter_alpha: float = 0.05,
+) -> None:
+    """Differential-Variability CpG calling (Plan 2 §4, iEVORA-style).
+
+    Identifies CpGs whose between-replicate variance differs significantly
+    between the treatment and control groups *while* the means do not —
+    the signature of an outlier-driven shift in variability that purely
+    mean-based DMC analysis misses (cancer / aging methylomes).
+
+    Result is stored at ``md.varm["dvc"]`` with columns:
+        chrom, pos, strand, n_treatment, n_control,
+        var_treatment, var_control, var_log_ratio,
+        p_variance, q_variance, p_mean, q_mean, is_dvc
+
+    Parameters
+    ----------
+    test : {"bartlett", "levene", "brown_forsythe"}
+        Variance-equality test. ``"bartlett"`` is the default closed-form
+        choice under the Welford streaming budget. The other two delegate
+        to the same Bartlett path under streaming (see
+        :func:`epykit.dvc._levene_per_site` for the design rationale).
+    alpha : float
+        q-value cutoff on the variance test for the ``is_dvc`` flag.
+    mean_filter_alpha : float
+        Sites are flagged DVC only when ``p_mean > mean_filter_alpha`` —
+        i.e. variance changes that aren't accompanied by mean changes.
+    """
+    from .dvc import process_chromosomes_dvc
+    unite_info = md.uns.get("unite")
+    unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
+    result = process_chromosomes_dvc(
+        methylstore_path=md.store,
+        samples_treatment=md.treatment_ids,
+        samples_control=md.control_ids,
+        test=test,
+        chromosomes=chromosomes,
+        unite=unite,
+        mean_filter_alpha=mean_filter_alpha,
+        alpha=alpha,
+    )
+    md.varm["dvc"] = result
+    md.uns["dvc"] = {
+        "test": test,
+        "alpha": alpha,
+        "mean_filter_alpha": mean_filter_alpha,
+        "n_sites": len(result),
+        "n_dvc": int(result.get_column("is_dvc").sum()) if len(result) else 0,
+        "unite": unite,
+    }
 
 
 def annotate(

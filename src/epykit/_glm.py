@@ -46,6 +46,8 @@ def build_design(
     formula: Optional[str] = None,
     covariates: Optional[Sequence[str]] = None,
     treatment_col: str = "treatment",
+    require_treatment_col: bool = True,
+    return_design_info: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, int, list[str], str]:
     """Build full + reduced model matrices from ``md.obs``.
 
@@ -69,6 +71,18 @@ def build_design(
         Name of the binary 0/1 treatment column in ``obs``. The reduced
         design drops exactly this column from the full design; that single
         coefficient is the contrast tested by the deviance LR test.
+    require_treatment_col
+        When True (default, backwards-compatible) the function enforces
+        that ``treatment_col`` is present and produces a reduced design
+        with that column dropped. When False (used by the multi-group /
+        contrast path in :func:`tl.dmc`), the reduced design is set to
+        ``None`` and ``coef_idx`` becomes ``-1`` — the caller is expected
+        to use :func:`wald_test` against a contrast matrix instead of a
+        full-vs-reduced deviance test.
+    return_design_info
+        When True, the function returns a 6-tuple with the patsy
+        ``DesignInfo`` object appended. Allows callers to resolve
+        contrast strings via :func:`resolve_contrast`.
 
     Returns
     -------
@@ -78,7 +92,7 @@ def build_design(
     term_names    column names from patsy (length p)
     formula_used  the formula actually fitted, after merging covariates
     """
-    if treatment_col not in obs.columns:
+    if require_treatment_col and treatment_col not in obs.columns:
         raise ValueError(
             f"Treatment column '{treatment_col}' not found in md.obs. "
             f"Available: {obs.columns}"
@@ -101,8 +115,14 @@ def build_design(
             if c not in terms:
                 terms.append(c)
 
-    if treatment_col not in terms:
+    if require_treatment_col and treatment_col not in terms:
         terms.insert(0, treatment_col)
+
+    if not terms:
+        raise ValueError(
+            "Empty formula. Pass a non-empty `formula=` or `covariates=` "
+            "(or use the default binary path with a treatment column on md.obs)."
+        )
 
     formula_used = "~ " + " + ".join(terms)
 
@@ -142,15 +162,8 @@ def build_design(
 
     X_design = patsy.dmatrix(formula_used, data=obs_pd, return_type="matrix")
     X_full = np.asarray(X_design, dtype=np.float64)
-    term_names: list[str] = list(X_design.design_info.column_names)
-
-    if treatment_col not in term_names:
-        raise ValueError(
-            f"Treatment column '{treatment_col}' did not appear as a column "
-            f"in the resulting design matrix (got {term_names}). It must be "
-            "numeric (0/1) so patsy keeps its name verbatim."
-        )
-    coef_idx = term_names.index(treatment_col)
+    design_info = X_design.design_info
+    term_names: list[str] = list(design_info.column_names)
 
     n_samples, p_full = X_full.shape
     if p_full >= n_samples:
@@ -159,15 +172,28 @@ def build_design(
             f"only n_samples={n_samples}. Mirrors methylKit's "
             "calculateDiffMeth check ('Too many covariates/too few replicates')."
         )
-    if p_full < 2:
-        raise ValueError(
-            "Design must contain at least the intercept and the treatment "
-            "column (p >= 2). Did you pass '~0 + ...'?"
-        )
 
-    # ---- Reduced design: drop the treatment column -------------------------
-    X_reduced = np.delete(X_full, coef_idx, axis=1)
+    if require_treatment_col:
+        if treatment_col not in term_names:
+            raise ValueError(
+                f"Treatment column '{treatment_col}' did not appear as a column "
+                f"in the resulting design matrix (got {term_names}). It must be "
+                "numeric (0/1) so patsy keeps its name verbatim."
+            )
+        coef_idx = term_names.index(treatment_col)
+        if p_full < 2:
+            raise ValueError(
+                "Design must contain at least the intercept and the treatment "
+                "column (p >= 2). Did you pass '~0 + ...'?"
+            )
+        # ---- Reduced design: drop the treatment column ----------------------
+        X_reduced = np.delete(X_full, coef_idx, axis=1)
+    else:
+        coef_idx = -1
+        X_reduced = None  # type: ignore[assignment]
 
+    if return_design_info:
+        return X_full, X_reduced, coef_idx, term_names, formula_used, design_info
     return X_full, X_reduced, coef_idx, term_names, formula_used
 
 
@@ -179,7 +205,10 @@ def irls_binomial_batch(
     X: np.ndarray,
     max_iter: int = 25,
     tol: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_cov: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
     """Batched IRLS for binomial GLMs sharing a design matrix.
 
     Fits one independent GLM per row (= per site / tile) where the response
@@ -194,6 +223,11 @@ def irls_binomial_batch(
     max_iter, tol
         IRLS convergence controls. ``tol`` applies to the max-norm of
         ``beta - beta_prev``.
+    return_cov
+        When True, append the per-site covariance matrix
+        ``cov_beta`` (shape ``(n_sites, p, p)``) to the return tuple as a
+        sixth element. Used by :func:`wald_test` for joint / multi-row
+        contrasts. Existing five-element callers stay unchanged.
 
     Returns
     -------
@@ -202,6 +236,7 @@ def irls_binomial_batch(
     deviance        (n_sites,)          -2 logL at the fitted mu (binomial)
     pearson_chi2    (n_sites,)          Sigma_j (y - n mu)^2 / (n mu (1-mu))
     n_eff           (n_sites,)          number of samples with cov > 0
+    cov_beta        (n_sites, p, p)     OPTIONAL, only when return_cov=True
 
     Sites where the IRLS hit logistic-regression separation (any covered
     sample's eta reached the +/-30 clip bound) are NaN'd in ``deviance``,
@@ -318,8 +353,10 @@ def irls_binomial_batch(
     w_final = np.where(has_cov, cov_f * var, 0.0)
     XtWX = np.einsum("jp,ij,jq->ipq", X, w_final, X)
     se_beta = np.full((n_sites, p), np.nan, dtype=np.float64)
+    cov_beta = np.full((n_sites, p, p), np.nan, dtype=np.float64)
     try:
         XtWX_inv = np.linalg.inv(XtWX)
+        cov_beta = XtWX_inv
         diag = np.einsum("ipp->ip", XtWX_inv)
         se_beta = np.sqrt(np.where(diag > 0, diag, np.nan))
     except np.linalg.LinAlgError:
@@ -327,6 +364,7 @@ def irls_binomial_batch(
         for i in range(n_sites):
             try:
                 inv = np.linalg.inv(XtWX[i])
+                cov_beta[i] = inv
                 se_beta[i] = np.sqrt(np.where(np.diag(inv) > 0, np.diag(inv), np.nan))
             except np.linalg.LinAlgError:
                 continue
@@ -342,6 +380,7 @@ def irls_binomial_batch(
     pearson_chi2 = np.where(degenerate, np.nan, pearson_chi2)
     beta = np.where(degenerate[:, None], np.nan, beta)
     se_beta = np.where(degenerate[:, None], np.nan, se_beta)
+    cov_beta = np.where(degenerate[:, None, None], np.nan, cov_beta)
 
     n_separated = int(site_separated.sum())
     if n_separated > 0:
@@ -351,6 +390,8 @@ def irls_binomial_batch(
             n_separated, n_sites,
         )
 
+    if return_cov:
+        return beta, se_beta, deviance, pearson_chi2, n_eff, cov_beta
     return beta, se_beta, deviance, pearson_chi2, n_eff
 
 
@@ -507,3 +548,321 @@ def reference_pvalues(
     if reference == "F":
         return sp_stats.f.sf(stat, dfn=1, dfd=df_resid)
     return sp_stats.chi2.sf(stat, df=1)
+
+
+# Contrast / Wald-test helpers — used by tl.dmc(formula=..., contrast=...)
+
+def resolve_contrast(
+    contrast,
+    term_names: Sequence[str],
+    design_info=None,
+) -> tuple[np.ndarray, str]:
+    """Build a contrast matrix C of shape (k, p) from a flexible spec.
+
+    Accepted forms:
+
+    * ``contrast=str`` naming a single column in ``term_names`` — produces a
+      1×p contrast vector selecting that coefficient (e.g. ``"age"`` for a
+      continuous covariate primary effect).
+    * ``contrast=str`` naming a factor (no exact column match) — every term
+      whose name starts with ``"<factor>["`` is included (patsy treatment-
+      coded dummies). Returns a k×p contrast for a joint F-test.
+    * ``contrast=str`` containing ``"="`` or arithmetic operators (``+``,
+      ``-``, ``*``) — passed to patsy ``DesignInfo.linear_constraint`` for
+      named linear contrasts like ``"group[T.KO] - group[T.WT]"``.
+      Requires ``design_info`` to be supplied.
+    * ``contrast=np.ndarray`` shape (k, p) — used verbatim.
+
+    Returns ``(C, label)`` where ``label`` describes the contrast for
+    provenance.
+    """
+    p = len(term_names)
+    if isinstance(contrast, np.ndarray):
+        C = np.atleast_2d(contrast).astype(np.float64)
+        if C.shape[1] != p:
+            raise ValueError(
+                f"Contrast matrix has {C.shape[1]} columns but design has p={p}"
+            )
+        return C, f"matrix[{C.shape[0]}x{C.shape[1]}]"
+
+    if not isinstance(contrast, str):
+        raise TypeError(
+            f"contrast must be str or np.ndarray; got {type(contrast).__name__}"
+        )
+
+    # Exact column match — single-row contrast selecting that coefficient
+    if contrast in term_names:
+        col = term_names.index(contrast)
+        C = np.zeros((1, p), dtype=np.float64)
+        C[0, col] = 1.0
+        return C, contrast
+
+    # Linear-constraint expression — delegate to patsy
+    expr_chars = set("=+-*")
+    if any(c in contrast for c in expr_chars) and design_info is not None:
+        try:
+            constraint = design_info.linear_constraint(contrast)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not parse contrast {contrast!r} with patsy: {exc}"
+            ) from exc
+        C = np.asarray(constraint.coefs, dtype=np.float64)
+        if C.ndim == 1:
+            C = C[None, :]
+        if C.shape[1] != p:
+            raise ValueError(
+                f"patsy returned contrast with {C.shape[1]} columns but design has p={p}"
+            )
+        return C, contrast
+
+    # Factor name — collect every term beginning with "<factor>["
+    factor_terms = [
+        (i, t) for i, t in enumerate(term_names)
+        if t.startswith(f"{contrast}[") or t == f"C({contrast})"
+        or t.startswith(f"C({contrast})[")
+    ]
+    if not factor_terms:
+        raise ValueError(
+            f"Could not resolve contrast {contrast!r} against design columns "
+            f"{term_names}. Either use an exact column name, a factor name "
+            "that appears as treatment-coded dummies, or a patsy "
+            "linear-combination expression like 'group[T.A] - group[T.B]'."
+        )
+    C = np.zeros((len(factor_terms), p), dtype=np.float64)
+    for row, (col, _) in enumerate(factor_terms):
+        C[row, col] = 1.0
+    return C, contrast
+
+
+def wald_test(
+    beta: np.ndarray,
+    cov_beta: np.ndarray,
+    C: np.ndarray,
+    phi_eff: Optional[np.ndarray] = None,
+    df_resid: Optional[np.ndarray] = None,
+    reference: str = "methylkit",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-site Wald / joint-F test of H0: C·beta_i = 0.
+
+    Parameters
+    ----------
+    beta            (n_sites, p)             fitted coefficients
+    cov_beta        (n_sites, p, p)          parameter covariance matrix
+    C               (k, p)                   contrast matrix
+    phi_eff         (n_sites,) or None       per-site dispersion to scale
+                                             cov_beta by (quasi-binomial).
+                                             None → no scaling (binomial).
+    df_resid        (n_sites,) or None       per-site residual df for the F
+                                             reference distribution. None →
+                                             chi² reference.
+    reference       {"methylkit","F","chi2"} How to convert stat → p-value.
+                                             ``"methylkit"`` switches per-site:
+                                             F where phi_eff>1, chi² where
+                                             phi_eff was clamped. ``"chi2"``
+                                             forces chi². ``"F"`` forces F.
+
+    Returns
+    -------
+    stat            (n_sites,)               F-statistic / k (or chi²/k);
+                                             reduces to Wald-z² at k=1.
+    pvalue          (n_sites,)               two-sided p-value
+    k               int                      contrast rank (df1)
+
+    Implementation notes
+    --------------------
+    For a single-row contrast (k=1), Wald² = (Cβ)²/Var(Cβ) is chi²(1) under
+    H0. For multi-row contrasts (k>1), the joint Wald statistic is
+    (Cβ)ᵀ[CΣCᵀ]⁻¹(Cβ); divided by k it follows F(k, df_resid). When phi_eff
+    is supplied, cov_beta is scaled by phi (quasi-binomial). When df_resid
+    is None we use chi²(k)/k as the reference.
+    """
+    from scipy import stats as sp_stats
+
+    beta = np.asarray(beta, dtype=np.float64)
+    cov_beta = np.asarray(cov_beta, dtype=np.float64)
+    C = np.atleast_2d(np.asarray(C, dtype=np.float64))
+    n_sites, p = beta.shape
+    k = C.shape[0]
+    if C.shape[1] != p:
+        raise ValueError(
+            f"Contrast has {C.shape[1]} columns but beta has p={p}"
+        )
+    if cov_beta.shape != (n_sites, p, p):
+        raise ValueError(
+            f"cov_beta shape {cov_beta.shape} != (n_sites={n_sites}, p={p}, p={p})"
+        )
+
+    # Cβ — shape (n_sites, k)
+    Cb = beta @ C.T
+
+    # C Σ Cᵀ — shape (n_sites, k, k). When phi_eff is supplied we scale here.
+    if phi_eff is not None:
+        scale = np.asarray(phi_eff, dtype=np.float64)
+        cov_scaled = cov_beta * scale[:, None, None]
+    else:
+        cov_scaled = cov_beta
+    CSCt = np.einsum("kp,ipq,lq->ikl", C, cov_scaled, C)
+
+    stat = np.full(n_sites, np.nan, dtype=np.float64)
+    finite = (
+        np.isfinite(Cb).all(axis=1)
+        & np.isfinite(CSCt).reshape(n_sites, -1).all(axis=1)
+    )
+    if k == 1:
+        var = CSCt[:, 0, 0]
+        good = finite & (var > 0)
+        stat[good] = (Cb[good, 0] ** 2) / var[good]
+    else:
+        try:
+            inv_block = np.linalg.inv(CSCt[finite])
+            stat[finite] = np.einsum(
+                "ij,ijk,ik->i", Cb[finite], inv_block, Cb[finite]
+            )
+        except np.linalg.LinAlgError:
+            for i in np.where(finite)[0]:
+                try:
+                    inv_i = np.linalg.inv(CSCt[i])
+                    stat[i] = Cb[i] @ inv_i @ Cb[i]
+                except np.linalg.LinAlgError:
+                    pass
+
+    # Reference distribution → p-value
+    if df_resid is None or reference == "chi2":
+        pvalue = sp_stats.chi2.sf(stat, df=k)
+    elif reference == "F":
+        f_stat = stat / k
+        pvalue = sp_stats.f.sf(f_stat, dfn=k, dfd=df_resid)
+    else:  # methylkit: per-site adaptive
+        f_stat = stat / k
+        p_F = sp_stats.f.sf(f_stat, dfn=k, dfd=df_resid)
+        p_chi2 = sp_stats.chi2.sf(stat, df=k)
+        if phi_eff is None:
+            pvalue = p_chi2
+        else:
+            pvalue = np.where(np.asarray(phi_eff) > 1.0, p_F, p_chi2)
+
+    return stat, pvalue, np.int32(k)
+
+
+def delta_method_meth_diff_ci(
+    coef: np.ndarray,
+    coef_se: np.ndarray,
+    ref_eta: Optional[np.ndarray] = None,
+    alpha: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Delta-method CI on the meth-scale difference Δβ from a logit-scale Wald CI.
+
+    For a single binary-treatment coefficient, Δη = coef and the meth-scale
+    difference is Δβ ≈ expit(η_ref + coef) - expit(η_ref). At the reference
+    fitted mean η_ref, the local Jacobian of the inverse link is
+    ``dβ/dη = expit(η)·(1 - expit(η))``. The Wald CI on coef is mapped to
+    the β scale by ``Δβ ± z · |J(η_ref)| · SE(coef)``, clamped to [-1, 1].
+
+    Parameters
+    ----------
+    coef       (n_sites,) treatment coefficient on logit scale
+    coef_se    (n_sites,) Wald SE of that coefficient
+    ref_eta    (n_sites,) reference linear predictor (e.g. control-group
+               fitted η). When None we use ``eta_ref = 0``, the maximum-
+               Jacobian point ``J(0) = 0.25``; this is the most conservative
+               (widest) bound.
+    alpha      Significance level (default 0.05 → 95% CI).
+
+    Returns
+    -------
+    (ci_lo, ci_hi) — float64 arrays of shape (n_sites,), clamped to [-1, 1].
+    """
+    from scipy import stats as sp_stats
+    z = float(sp_stats.norm.isf(alpha / 2.0))
+    coef = np.asarray(coef, dtype=np.float64)
+    coef_se = np.asarray(coef_se, dtype=np.float64)
+    if ref_eta is None:
+        # J(0) = 0.25
+        jac = np.full_like(coef, 0.25)
+    else:
+        ref_eta = np.asarray(ref_eta, dtype=np.float64)
+        # expit, bounded
+        with np.errstate(over="ignore", under="ignore"):
+            p_ref = 1.0 / (1.0 + np.exp(-np.clip(ref_eta, -30.0, 30.0)))
+        jac = p_ref * (1.0 - p_ref)
+    # meth-scale Δβ at the reference (single binary coefficient case): use
+    # expit(η+coef) - expit(η) for the central estimate (more accurate than
+    # the linearisation), but use jac · coef_se for the half-width.
+    if ref_eta is None:
+        eta_ref = np.zeros_like(coef)
+    else:
+        eta_ref = np.clip(np.asarray(ref_eta, dtype=np.float64), -30.0, 30.0)
+    with np.errstate(over="ignore", under="ignore"):
+        p_treat = 1.0 / (1.0 + np.exp(-np.clip(eta_ref + coef, -30.0, 30.0)))
+        p_ref_arr = 1.0 / (1.0 + np.exp(-eta_ref))
+    diff = p_treat - p_ref_arr
+    half = z * jac * coef_se
+    lo = np.clip(diff - half, -1.0, 1.0)
+    hi = np.clip(diff + half, -1.0, 1.0)
+    return lo, hi
+
+
+def welch_meth_diff_ci(
+    mean_case: np.ndarray,
+    var_mean_case: np.ndarray,
+    mean_ctrl: np.ndarray,
+    var_mean_ctrl: np.ndarray,
+    alpha: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normal CI on Δβ from per-group Welford accumulators.
+
+    ``var_mean_*`` is the variance OF THE MEAN (= s² / n), so the SE of the
+    difference is ``sqrt(var_mean_case + var_mean_ctrl)``. CI clamped to
+    [-1, 1].
+    """
+    from scipy import stats as sp_stats
+    z = float(sp_stats.norm.isf(alpha / 2.0))
+    se = np.sqrt(np.maximum(var_mean_case + var_mean_ctrl, 0.0))
+    diff = mean_case - mean_ctrl
+    lo = np.clip(diff - z * se, -1.0, 1.0)
+    hi = np.clip(diff + z * se, -1.0, 1.0)
+    return lo, hi
+
+
+def newcombe_diff_ci(
+    meth_a: np.ndarray,
+    cov_a: np.ndarray,
+    meth_b: np.ndarray,
+    cov_b: np.ndarray,
+    alpha: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Newcombe (1998) hybrid Wilson-score CI for π_a − π_b on POOLED counts.
+
+    Used by the binomial-pool tests (lr, score, fisher, cmh) where no per-
+    replicate variance is accumulated. Uses Wilson-score CIs on each
+    pooled proportion, then combines them per Newcombe method 10.
+    """
+    from scipy import stats as sp_stats
+    z = float(sp_stats.norm.isf(alpha / 2.0))
+
+    def _wilson(m, n):
+        m = m.astype(np.float64); n = n.astype(np.float64)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            p_hat = np.where(n > 0, m / n, np.nan)
+            denom = 1.0 + (z * z) / np.maximum(n, 1e-12)
+            centre = (p_hat + (z * z) / (2.0 * np.maximum(n, 1e-12))) / denom
+            half = (
+                z * np.sqrt(
+                    np.maximum(p_hat * (1.0 - p_hat) / np.maximum(n, 1e-12)
+                               + (z * z) / (4.0 * np.maximum(n, 1e-12) ** 2),
+                               0.0)
+                )
+                / denom
+            )
+            lo = np.clip(centre - half, 0.0, 1.0)
+            hi = np.clip(centre + half, 0.0, 1.0)
+        return p_hat, lo, hi
+
+    p_a, l_a, u_a = _wilson(np.asarray(meth_a), np.asarray(cov_a))
+    p_b, l_b, u_b = _wilson(np.asarray(meth_b), np.asarray(cov_b))
+    diff = p_a - p_b
+    lo = diff - np.sqrt(np.maximum((p_a - l_a) ** 2 + (u_b - p_b) ** 2, 0.0))
+    hi = diff + np.sqrt(np.maximum((u_a - p_a) ** 2 + (p_b - l_b) ** 2, 0.0))
+    lo = np.clip(lo, -1.0, 1.0)
+    hi = np.clip(hi, -1.0, 1.0)
+    return lo, hi
