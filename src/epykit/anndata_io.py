@@ -51,9 +51,24 @@ logger = logging.getLogger(__name__)
 _VALID_LAYERS = {"beta", "coverage", "N_meth", "N_unmeth"}
 
 
-def _site_index(store: str):
+def _site_index(store: str, *, unite_type: str):
     """Build the sorted (chrom, pos) site index plus per-chromosome position
     arrays for sorted-search lookup.
+
+    Runs **one chromosome at a time** and reduces per-sample position
+    arrays in numpy. Peak transient memory is roughly
+    ``n_samples × max_chrom_sites × 8 B`` (≈ 240 MB for chr1 on 6 samples),
+    far below the multi-GB dedup-hashtable spike of a single-shot
+    ``scan_parquet(...).unique()`` across the whole store.
+
+    Parameters
+    ----------
+    store : str
+        Methylstore root (Hive-partitioned by sample then chrom).
+    unite_type : {"union", "intersect"}
+        Per-chromosome reduction across samples. ``pp.unite`` is a
+        metadata-only no-op (it doesn't rewrite the store), so the join
+        has to happen here at export time.
 
     Returns
     -------
@@ -62,41 +77,114 @@ def _site_index(store: str):
     chrom_index : dict[str, tuple[int, np.ndarray]]
         ``{chrom: (start_idx, positions_int64)}`` — the slice
         ``var[start_idx:start_idx + len(positions_int64)]`` is the
-        chromosome's contiguous block.
-
-    Memory cost is dominated by the per-chromosome int64 position arrays
-    (8 B / site). On a 338 M-CpG hg38 union store this is ~2.7 GB, vs.
-    the previous Python-dict design which needed ≥ 6-10 GB for the same
-    information.
+        chromosome's contiguous block. Empty chromosomes are dropped.
     """
     import numpy as np
+    from functools import reduce
 
-    # Cast pos to Int64 inside the scan so every downstream conversion is
-    # dtype-pinned from the source. An earlier implementation aggregated
-    # `pl.col("pos")` into a list column and then went through
-    # `iter_rows(named=True)` + `np.asarray(..., dtype=np.int64)` to slice
-    # per-chromosome arrays — that path round-tripped through polars list
-    # columns and could surface as a complex128 allocation under some
-    # polars/arrow versions, OOMing on 42M-site stores.
-    var = (
-        pl.scan_parquet(f"{store}/sample=*/chrom=*/part-*.parquet")
-        .select([pl.col("chrom"), pl.col("pos").cast(pl.Int64)])
-        .unique()
-        .sort(["chrom", "pos"])
-        .collect()
+    if unite_type not in {"union", "intersect"}:
+        raise ValueError(
+            f"unite_type must be 'union' or 'intersect'; got {unite_type!r}"
+        )
+
+    store_p = Path(store)
+    sample_dirs = sorted(d for d in store_p.glob("sample=*") if d.is_dir())
+    if not sample_dirs:
+        raise FileNotFoundError(f"No sample=* partitions under {store!r}")
+
+    # Union of chromosome names seen across any sample. For 'intersect' we
+    # still walk this union and let the per-chrom reduction short-circuit
+    # to empty when a sample is missing the chrom — matches DMC's
+    # per-chrom join semantics.
+    chrom_set: set[str] = set()
+    for s_dir in sample_dirs:
+        for d in s_dir.glob("chrom=*"):
+            if d.is_dir():
+                chrom_set.add(d.name.split("=", 1)[1])
+    # Lex sort matches polars' Utf8 .sort("chrom") (chr1, chr10, chr11, ...,
+    # chr2, ...) — preserved for compatibility with prior output ordering.
+    chroms_sorted = sorted(chrom_set)
+
+    logger.info(
+        "_site_index: %d sample(s), %d chromosome(s), unite=%s",
+        len(sample_dirs), len(chroms_sorted), unite_type,
     )
+    per_chrom_log = logger.debug if len(chroms_sorted) > 50 else logger.info
+
     chrom_index: dict[str, tuple[int, "np.ndarray"]] = {}
+    chrom_arrays: list[tuple[str, "np.ndarray"]] = []
     running_start = 0
-    for chrom in var["chrom"].unique(maintain_order=True).to_list():
-        block_pos = var.filter(pl.col("chrom") == chrom)["pos"]
-        positions = block_pos.to_numpy(zero_copy_only=False)
-        if positions.dtype != np.int64:
-            raise AssertionError(
-                f"_site_index: expected int64 positions for {chrom!r}, "
-                f"got {positions.dtype}"
+
+    for chrom in chroms_sorted:
+        per_sample_pos: list[np.ndarray] = []
+        empty = False
+        for s_dir in sample_dirs:
+            chrom_dir = s_dir / f"chrom={chrom}"
+            if not chrom_dir.exists():
+                if unite_type == "intersect":
+                    empty = True
+                    break
+                continue
+            arr = (
+                pl.scan_parquet(f"{chrom_dir}/part-*.parquet")
+                .select(pl.col("pos").cast(pl.Int64))
+                .unique()
+                .sort("pos")
+                .collect()["pos"]
+                .to_numpy(zero_copy_only=False)
             )
+            if arr.dtype != np.int64:
+                raise AssertionError(
+                    f"_site_index: expected int64 positions on "
+                    f"{s_dir.name}/{chrom}, got {arr.dtype}"
+                )
+            if len(arr) == 0:
+                if unite_type == "intersect":
+                    empty = True
+                    break
+                continue
+            per_sample_pos.append(arr)
+
+        if empty or not per_sample_pos:
+            positions = np.empty(0, dtype=np.int64)
+        elif unite_type == "union":
+            positions = np.unique(np.concatenate(per_sample_pos))
+        else:  # intersect
+            positions = reduce(np.intersect1d, per_sample_pos)
+
+        n = int(positions.size)
+        per_chrom_log(
+            "_site_index: chrom=%s n_sites=%d (start_idx=%d)",
+            chrom, n, running_start,
+        )
+        if n == 0:
+            continue
         chrom_index[chrom] = (running_start, positions)
-        running_start += len(positions)
+        chrom_arrays.append((chrom, positions))
+        running_start += n
+
+    if not chrom_arrays:
+        var = pl.DataFrame(
+            {
+                "chrom": pl.Series("chrom", [], dtype=pl.Utf8),
+                "pos": pl.Series("pos", [], dtype=pl.Int64),
+            }
+        )
+    else:
+        all_pos = np.concatenate([a for _, a in chrom_arrays])
+        chrom_col = pl.concat(
+            [
+                pl.Series("chrom", [c] * len(a), dtype=pl.Utf8)
+                for c, a in chrom_arrays
+            ]
+        )
+        var = pl.DataFrame(
+            {
+                "chrom": chrom_col,
+                "pos": pl.Series("pos", all_pos, dtype=pl.Int64),
+            }
+        )
+
     return var, chrom_index
 
 
@@ -289,8 +377,12 @@ def to_anndata(
     np_dtype = np.dtype(dtype)
     samples = md.obs.get_column("sample_id").to_list()
 
-    logger.info("to_anndata: building site index from %s", md.store)
-    var, chrom_index = _site_index(md.store)
+    unite_type = md.uns["unite"]["type"]
+    logger.info(
+        "to_anndata: building site index from %s (unite=%s)",
+        md.store, unite_type,
+    )
+    var, chrom_index = _site_index(md.store, unite_type=unite_type)
     n_sites = len(var)
     dense_gib = len(samples) * n_sites * np_dtype.itemsize / (1024 ** 3)
     logger.info(
