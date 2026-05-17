@@ -219,7 +219,7 @@ def test_normalize_coverage_before_filter_raises(synth_md):
 
 
 def test_smooth_before_filter_raises(synth_md):
-    """``pp.smooth`` must refuse to run before ``filter_coverage`` (FIX-10)."""
+    """``pp.smooth`` must refuse to run before ``filter_coverage`` ()."""
     import epykit as ep
     with pytest.raises(ValueError, match=r"filter_coverage"):
         ep.pp.smooth(synth_md, bandwidth=500)

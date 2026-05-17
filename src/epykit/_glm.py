@@ -169,8 +169,8 @@ def build_design(
     if p_full >= n_samples:
         raise ValueError(
             f"Too many covariates: design has p={p_full} parameters but "
-            f"only n_samples={n_samples}. Mirrors methylKit's "
-            "calculateDiffMeth check ('Too many covariates/too few replicates')."
+            f"only n_samples={n_samples}. Add more samples or drop "
+            "covariates before fitting."
         )
 
     if require_treatment_col:
@@ -306,10 +306,9 @@ def irls_binomial_batch(
     # poisoning the chrom-pooled dispersion estimator. Mark separated sites
     # as degenerate so they (a) drop out of compute_dispersion_phi's
     # `usable` mask and (b) carry NaN p-values downstream instead of
-    # spurious "significant" calls.
-    #
-    # methylKit handles the same failure mode via glm()'s convergence
-    # warnings; here we detect it directly from the saturated eta.
+    # spurious "significant" calls. We detect separation directly from
+    # the saturated eta rather than relying on a slower convergence-
+    # warning round-trip.
     SATURATION_THRESHOLD = 29.999  # tiny FP margin below the +/-30 clip
     separated_per_sample = (np.abs(eta_unclipped) >= SATURATION_THRESHOLD) & has_cov
     site_separated = separated_per_sample.any(axis=1)
@@ -360,14 +359,25 @@ def irls_binomial_batch(
         diag = np.einsum("ipp->ip", XtWX_inv)
         se_beta = np.sqrt(np.where(diag > 0, diag, np.nan))
     except np.linalg.LinAlgError:
-        # Fall back per-site; rare in practice.
+        # Batched inversion failed: at least one site has a singular
+        # X'WX. Fall back per-site and surface how many sites needed the
+        # rescue so users can spot a globally ill-conditioned design
+        # (collinear covariates, perfect separation, etc).
+        n_fallback_failures = 0
         for i in range(n_sites):
             try:
                 inv = np.linalg.inv(XtWX[i])
                 cov_beta[i] = inv
                 se_beta[i] = np.sqrt(np.where(np.diag(inv) > 0, np.diag(inv), np.nan))
             except np.linalg.LinAlgError:
+                n_fallback_failures += 1
                 continue
+        logger.warning(
+            "GLM design matrix singular under batched inversion; fell back "
+            "to per-site solve. %d / %d sites still failed and were NaN'd. "
+            "Check for collinear covariates or perfect separation.",
+            n_fallback_failures, n_sites,
+        )
 
     # Sites with no usable data are degenerate. Sites where the GLM
     # separated (any covered sample's eta hit the clip bound) are also
@@ -384,10 +394,15 @@ def irls_binomial_batch(
 
     n_separated = int(site_separated.sum())
     if n_separated > 0:
-        logger.debug(
-            "  GLM separation detected at %d / %d sites; NaN'd for "
-            "dispersion + p-value computation.",
-            n_separated, n_sites,
+        # >5 % of sites separated is loud enough to warn the user about
+        # a likely model-specification issue; below that, leave it as an
+        # info-level breadcrumb that doesn't spam normal runs.
+        sep_frac = n_separated / max(n_sites, 1)
+        log_fn = logger.warning if sep_frac >= 0.05 else logger.info
+        log_fn(
+            "GLM separation detected at %d / %d sites (%.1f%%); "
+            "NaN'd for dispersion + p-value computation.",
+            n_separated, n_sites, 100.0 * sep_frac,
         )
 
     if return_cov:
@@ -465,7 +480,9 @@ def compute_dispersion_phi(
         ``"shrink"``: James-Stein-style weighted average of per-site and
         chromosome estimates.
     min_dispersion
-        Clamp on phi (default 1.0, the methylKit convention).
+        Clamp on phi (default 1.0). Underdispersion (phi < 1) usually
+        reflects model misspecification rather than truly less-than-
+        binomial variability; clamping at 1 is the conservative choice.
 
     Returns
     -------
@@ -527,21 +544,28 @@ def reference_pvalues(
     stat: np.ndarray,
     phi_eff: np.ndarray,
     df_resid: np.ndarray,
-    reference: str = "methylkit",
+    reference: str = "adaptive",
 ) -> np.ndarray:
     """Convert a (already dispersion-corrected) chi-sq statistic to p-values.
 
-    ``reference="methylkit"`` switches per-site between F(1, df_resid) where
-    phi_eff > 1 and chi2(1) where phi_eff was clamped, exactly matching
-    methylKit's ``logReg`` (R/diffMeth.R:273).
+    ``reference="adaptive"`` (default) switches per-site between
+    ``F(1, df_resid)`` where ``phi_eff > 1`` (real overdispersion signal)
+    and ``chi2(1)`` where ``phi_eff`` was clamped to 1 — the right
+    behaviour for quasi-binomial GLMs whose dispersion estimate is noisy
+    at small samples. ``"F"`` and ``"chi2"`` force a single reference
+    distribution regardless of per-site dispersion.
     """
-    if reference not in {"methylkit", "F", "chi2"}:
+    if reference == "methylkit":
         raise ValueError(
-            f"reference must be 'methylkit', 'F', or 'chi2'; got {reference!r}"
+            "reference='methylkit' was renamed to 'adaptive' in this release."
+        )
+    if reference not in {"adaptive", "F", "chi2"}:
+        raise ValueError(
+            f"reference must be 'adaptive', 'F', or 'chi2'; got {reference!r}"
         )
     from scipy import stats as sp_stats
 
-    if reference == "methylkit":
+    if reference == "adaptive":
         p_F = sp_stats.f.sf(stat, dfn=1, dfd=df_resid)
         p_chi2 = sp_stats.chi2.sf(stat, df=1)
         return np.where(phi_eff > 1.0, p_F, p_chi2)
@@ -640,7 +664,7 @@ def wald_test(
     C: np.ndarray,
     phi_eff: Optional[np.ndarray] = None,
     df_resid: Optional[np.ndarray] = None,
-    reference: str = "methylkit",
+    reference: str = "adaptive",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-site Wald / joint-F test of H0: C·beta_i = 0.
 
@@ -655,8 +679,8 @@ def wald_test(
     df_resid        (n_sites,) or None       per-site residual df for the F
                                              reference distribution. None →
                                              chi² reference.
-    reference       {"methylkit","F","chi2"} How to convert stat → p-value.
-                                             ``"methylkit"`` switches per-site:
+    reference       {"adaptive","F","chi2"}  How to convert stat → p-value.
+                                             ``"adaptive"`` switches per-site:
                                              F where phi_eff>1, chi² where
                                              phi_eff was clamped. ``"chi2"``
                                              forces chi². ``"F"`` forces F.
@@ -732,7 +756,7 @@ def wald_test(
     elif reference == "F":
         f_stat = stat / k
         pvalue = sp_stats.f.sf(f_stat, dfn=k, dfd=df_resid)
-    else:  # methylkit: per-site adaptive
+    else:  # adaptive: per-site switch between F and chi2
         f_stat = stat / k
         p_F = sp_stats.f.sf(f_stat, dfn=k, dfd=df_resid)
         p_chi2 = sp_stats.chi2.sf(stat, df=k)

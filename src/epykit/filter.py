@@ -338,7 +338,7 @@ def normalize_coverage_store(
     output_dir: str,
     method: str = "median",
 ) -> dict[str, float]:
-    """methylKit-parity per-sample coverage normalisation.
+    """Per-sample coverage normalisation.
 
     For each sample, compute a single scalar factor ``s_i`` so that the
     chosen central statistic of coverage matches a common target across
@@ -351,13 +351,12 @@ def normalize_coverage_store(
 
     Each row's ``N_meth`` and ``N_unmeth (= coverage - N_meth)`` are then
     scaled by ``s_i`` and rounded to int. ``coverage`` is rebuilt as
-    ``N_meth + N_unmeth`` so the equality holds exactly after rounding.
-    (methylKit rounds the three independently and can drift by 1; we keep
-    the strict invariant because downstream Polars joins rely on it.)
+    ``N_meth + N_unmeth`` so the equality holds exactly after rounding —
+    downstream Polars joins rely on this strict invariant.
 
-    Mirrors methylKit's ``normalizeCoverage(obj, method='median')`` used
-    between ``filterByCoverage`` and ``tileMethylCounts`` to prevent
-    deeper-sequenced samples from dominating pooled-count tile tests.
+    Coverage normalisation should run between ``filter_coverage`` and
+    ``tl.dmr(method='tile')`` to prevent deeper-sequenced samples from
+    dominating pooled-count tile tests.
 
     Parameters
     ----------

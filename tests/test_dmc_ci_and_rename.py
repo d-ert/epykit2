@@ -1,4 +1,4 @@
-"""Plan 2 §2: meth_diff CI columns + welch_t / bb_lr / beta_binomial rename."""
+"""meth_diff CI columns + welch_t / bb_lr / beta_binomial rename."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def test_dmc_emits_meth_diff_ci_columns(synth_md_filtered, test):
 
 
 def test_beta_binomial_deprecation_warning(synth_md_filtered):
-    """Plan 2 §2: test='beta_binomial' fires a DeprecationWarning and routes
+    """test='beta_binomial' fires a DeprecationWarning and routes
     to welch_t.
     """
     md = synth_md_filtered
@@ -58,7 +58,7 @@ def test_beta_binomial_deprecation_warning(synth_md_filtered):
 
 
 def test_bb_lr_is_distinct_from_lr(synth_md_filtered):
-    """Plan 2 §2: bb_lr (true quasi-binomial LRT) produces a separate
+    """bb_lr (true quasi-binomial LRT) produces a separate
     output table from lr and surfaces coef_treatment / coef_se.
     """
     md = synth_md_filtered

@@ -3,7 +3,7 @@
 These run the ``epykit`` console script as a real subprocess so we catch:
 
 * argparse wiring (flag names, defaults, choices)
-* the module-level no-side-effects rule on import (S2)
+* the module-level no-side-effects rule on import
 * exit codes
 * the n=1 guard at the CLI level (B6)
 """
@@ -69,7 +69,7 @@ def test_cli_smooth_help_says_gaussian_not_bsmooth():
 
 
 
-# Import-time side effects (S2)
+# Import-time side effects
 
 
 def test_importing_epykit_does_not_clobber_root_logging(tmp_path):

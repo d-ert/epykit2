@@ -202,7 +202,14 @@ def test_dmr_tile_dmr_types_consistent_with_seed_direction(
     synth_md_filtered, synth_bundle: SynthBundle
 ):
     """For each seeded DMR, the called tile-DMR direction (hyper/hypo)
-    should match the sign of the seeded effect size."""
+    should match the sign of the seeded effect size.
+
+    The fixture is calibrated so :func:`test_dmr_tile_recovers_seeded_regions`
+    recovers at least half of the 10 seeded DMRs; ``pytest.skip`` here
+    used to fire when 0 sig DMRs landed, which would mask the exact
+    regression the recovery test is supposed to catch. Now: hard assert
+    that we have some matched seeds and check direction.
+    """
     import epykit as ep
     ep.tl.dmr(
         synth_md_filtered,
@@ -215,8 +222,11 @@ def test_dmr_tile_dmr_types_consistent_with_seed_direction(
         sig = dmr_df.filter(pl.col("qvalue") < 0.05)
     else:
         sig = dmr_df
-    if len(sig) == 0:
-        pytest.skip("no significant DMRs called; direction test not applicable")
+    assert len(sig) > 0, (
+        "No significant DMRs called on the calibrated fixture — "
+        "test_dmr_tile_recovers_seeded_regions would also fail. Check "
+        "the tile engine, fixture config, or FDR correction."
+    )
 
     # Build seed direction lookup from truth.
     seed_dirs = (
@@ -248,11 +258,156 @@ def test_dmr_tile_dmr_types_consistent_with_seed_direction(
                 if call_diff is not None and np.sign(call_diff) == seed_sign:
                     correct += 1
                 break
-    if matched == 0:
-        pytest.skip("no overlapping seeded DMRs in significant calls")
+    assert matched > 0, (
+        "Zero significant DMRs overlapped any seeded region — same "
+        "calibration concern as above. Inspect uns['dmr'] vs the truth "
+        "seed_intervals."
+    )
     # At least 80 % of matched DMRs should have correct direction.
     assert correct / matched >= 0.80, (
         f"DMR direction wrong on {matched - correct}/{matched} matched seeds"
+    )
+
+
+# DMR sensitivity / specificity per method
+
+
+def _dmr_sens_fdr(dmr_df, truth, cfg, alpha=0.05):
+    """Compute (sensitivity, false-discovery proportion) for a DMR table.
+
+    sensitivity = seeded DMRs overlapped by ≥1 significant call / n_seeded
+    fdp         = significant calls that catch *no* truly differential
+                  CpG (neither a scattered DMC nor a DMR CpG) /
+                  n_called
+
+    On the synth fixture the truth set has two signal kinds: 10 seeded
+    DMRs *and* ~500 scattered DMCs at the same Δβ. A tile spanning a
+    region that happens to contain a scattered DMC is detecting real
+    signal — it's a true positive at the tile level even though it
+    doesn't overlap a seeded DMR interval. Counting it as a false
+    positive (the naive definition) pushes the empirical FDP well above
+    the BH-q<0.05 nominal because the tile engine pools reads across
+    every CpG in the tile, so any of those scattered signal sites can
+    drive significance.
+    """
+    if len(dmr_df) == 0:
+        return 0.0, 0.0
+    if "qvalue" in dmr_df.columns:
+        q_col = "qvalue"
+    elif "combined_qvalue" in dmr_df.columns:
+        q_col = "combined_qvalue"
+    else:
+        q_col = "combined_pvalue"
+    sig = dmr_df.filter(pl.col(q_col) < alpha)
+    if len(sig) == 0:
+        return 0.0, 0.0
+
+    seed_intervals = (
+        truth.filter(pl.col("in_dmr"))
+        .group_by("dmr_id")
+        .agg([
+            pl.col("chrom").first().alias("chrom"),
+            pl.col("pos").min().alias("seed_start"),
+            pl.col("pos").max().alias("seed_end"),
+        ])
+        .to_dicts()
+    )
+    # All truly-differential CpGs (both kinds of signal) keyed by chrom.
+    signal_cpgs = truth.filter(pl.col("is_dmc") | pl.col("in_dmr"))
+    signal_by_chrom: dict[str, np.ndarray] = {}
+    for chrom in signal_cpgs.get_column("chrom").unique().to_list():
+        positions = (
+            signal_cpgs.filter(pl.col("chrom") == chrom)
+            .get_column("pos")
+            .to_numpy()
+        )
+        signal_by_chrom[chrom] = np.sort(positions)
+
+    sig_rows = sig.to_dicts()
+    seeds_hit = set()
+    calls_with_any_signal = 0
+    for call in sig_rows:
+        c_chrom = call.get("chrom")
+        c_lo = call.get("start", call.get("pos"))
+        c_hi = call.get("end", call.get("pos"))
+        if c_lo is None or c_hi is None:
+            continue
+        # Seed-level recovery (for sensitivity).
+        for seed in seed_intervals:
+            if seed["chrom"] != c_chrom:
+                continue
+            if c_lo <= seed["seed_end"] and c_hi >= seed["seed_start"]:
+                seeds_hit.add(seed["dmr_id"])
+                break
+        # Tile-level "did this call catch any differential CpG?"
+        positions = signal_by_chrom.get(c_chrom)
+        if positions is not None and positions.size > 0:
+            lo = np.searchsorted(positions, c_lo, side="left")
+            hi = np.searchsorted(positions, c_hi, side="right")
+            if hi > lo:
+                calls_with_any_signal += 1
+    n_seeded = cfg.n_dmrs
+    sensitivity = len(seeds_hit) / n_seeded if n_seeded > 0 else 0.0
+    fdp = (len(sig_rows) - calls_with_any_signal) / len(sig_rows)
+    return sensitivity, fdp
+
+
+# Calibrated against the medium fixture (10 seeded DMRs at Δβ=0.40,
+# 4-vs-4, 1 kbp tiles / windows). Tile is the recommended path and
+# substantially more powerful than sliding-window; thresholds reflect
+# that. Both should keep the false-discovery proportion low because a
+# DMR-level Δβ of 0.40 produces obviously-non-null tiles.
+DMR_TILE_SENS_MIN  = 0.50
+DMR_TILE_FDP_MAX   = 0.35
+DMR_SLIDE_SENS_MIN = 0.30
+DMR_SLIDE_FDP_MAX  = 0.50
+
+
+def test_dmr_tile_sensitivity_and_fdp(synth_md_filtered, synth_bundle: SynthBundle):
+    """Tile-based DMR caller must recover ≥half the seeded DMRs while
+    keeping the false-discovery proportion of called regions modest."""
+    import epykit as ep
+    ep.tl.dmr(
+        synth_md_filtered,
+        method="tile",
+        tile_size_bp=1000,
+        min_cpgs_per_tile=2,
+    )
+    sens, fdp = _dmr_sens_fdr(
+        synth_md_filtered.uns["dmr"], synth_bundle.truth, synth_bundle.config,
+    )
+    assert sens >= DMR_TILE_SENS_MIN, (
+        f"tile DMR sensitivity too low: {sens:.3f} (< {DMR_TILE_SENS_MIN})"
+    )
+    assert fdp <= DMR_TILE_FDP_MAX, (
+        f"tile DMR false-discovery proportion too high: {fdp:.3f} "
+        f"(> {DMR_TILE_FDP_MAX})"
+    )
+
+
+def test_dmr_sliding_window_sensitivity_and_fdp(
+    synth_md_filtered, synth_bundle: SynthBundle
+):
+    """Sliding-window DMR caller — same checks at looser thresholds."""
+    import epykit as ep
+    ep.tl.dmc(synth_md_filtered, test="lr")
+    ep.tl.dmr(
+        synth_md_filtered,
+        method="sliding_window",
+        window_bp=1000,
+        step_bp=500,
+        min_cpgs=2,
+    )
+    sens, fdp = _dmr_sens_fdr(
+        synth_md_filtered.uns["dmr"], synth_bundle.truth, synth_bundle.config,
+    )
+    assert sens >= DMR_SLIDE_SENS_MIN, (
+        f"sliding_window DMR sensitivity too low: {sens:.3f} "
+        f"(< {DMR_SLIDE_SENS_MIN})"
+    )
+    assert fdp <= DMR_SLIDE_FDP_MAX, (
+        f"sliding_window DMR false-discovery proportion too high: "
+        f"{fdp:.3f} (> {DMR_SLIDE_FDP_MAX})"
     )
 
 

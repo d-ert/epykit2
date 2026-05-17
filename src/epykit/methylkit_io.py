@@ -1,12 +1,12 @@
-"""methylKit-compatible tabix export (Plan 2 §7).
+"""methylKit-compatible tabix export.
 
-methylKit's ``methylRawDB`` reads tab-delimited files with header
+Writes tab-delimited methylation tables that methylKit's ``methylRawDB``
+can ingest. Schema:
 
     chrBase  chr  base  strand  coverage  freqC  freqT
 
-stored as bgzip + tabix-indexed text. This module writes per-sample
-files in that schema so reviewers can re-run methylKit on epykit
-output for parity checks.
+stored as bgzip + tabix-indexed text. Useful for sharing epykit output
+with downstream tools that expect the methylKit input format.
 
 Note on dependencies
 --------------------

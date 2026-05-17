@@ -1,4 +1,4 @@
-"""UMAP embedding of per-sample methylation profiles (Plan 2 §6)."""
+"""UMAP embedding of per-sample methylation profiles ."""
 
 from __future__ import annotations
 

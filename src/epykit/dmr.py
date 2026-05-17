@@ -4,9 +4,11 @@ Two algorithms:
 
 ``call_dmr_tile_based(methylstore_path, samples_treatment, samples_control,
 ...)``
-    methylKit-parity tile aggregation: sums (N_meth, coverage) across CpGs
-    per sample within each fixed-size tile, then runs a full DMC test on
-    the tile-level counts. Recommended path.
+    Tile aggregation: sums (N_meth, coverage) across CpGs per sample
+    within each fixed-size tile, then runs a full DMC test on the
+    tile-level counts. Recommended path — read-pooled tile tests have
+    dramatically more power than per-CpG p-value combination at typical
+    WGBS coverage.
 
 ``call_dmr_sliding_window(dmc_results, ...)``
     Operates on a precomputed per-CpG DMC table; combines p-values per
@@ -16,7 +18,7 @@ Two algorithms:
     meth_diff rather than a raw site tally.
 
 ``smooth_methylation_gaussian`` is a coverage-weighted Gaussian-kernel
-approximation to BSmooth — see its own docstring.
+smoother — see its own docstring.
 """
 
 from __future__ import annotations
@@ -68,11 +70,11 @@ _SMOOTH_EMPTY_SCHEMA = {
     "beta_smooth":  pl.Float32,
 }
 
-# FIX-6: cap merged DMR size to prevent biologically implausible mega-DMRs.
+# cap merged DMR size to prevent biologically implausible mega-DMRs.
 # Mammalian DMRs are typically 200 bp – 5 kb; 10 kb is a generous ceiling.
 _MAX_DMR_BP: int = 10_000
 
-# BIO-10: a window's direction is called "mixed" when the fraction of
+# a window's direction is called "mixed" when the fraction of
 # valid sites agreeing with the sign of the mean is below this threshold.
 _MIXED_DIRECTION_THRESHOLD: float = 0.6
 
@@ -96,7 +98,7 @@ def _stouffer_combine_signed(
     small; when directions are mixed, contributions cancel and the
     combined p-value stays large.
 
-    BIO-9: this replaces the previous Brown's method implementation, which
+    this replaces the previous Brown's method implementation, which
     required a correlation matrix of the per-CpG test statistics. The old
     code estimated it from genomic distances between CpGs — a proxy for the
     correlation of methylation STATES, not of the test statistics — which
@@ -177,7 +179,7 @@ def _classify_direction(
 ) -> str:
     """Classify DMR direction from mean effect + per-site sign tally.
 
-    BIO-10: previously the direction was the larger of n_hyper / n_hypo.
+    previously the direction was the larger of n_hyper / n_hypo.
     A window with 6 hyper sites at +0.12 and 4 hypo sites at -0.40 was
     called "hyper" even though the mean effect was clearly negative.
 
@@ -217,7 +219,7 @@ def _recompute_dmr_stats(
     When ``cum_sig`` is supplied the significance count is computed in O(1)
     via prefix-sum lookup; otherwise falls back to a boolean mask scan.
     """
-    # FIX-6: reject biologically implausible mega-DMRs that arise when
+    # reject biologically implausible mega-DMRs that arise when
     # overlapping candidate windows collapse across many megabases.
     if (end - start) > _MAX_DMR_BP:
         return None
@@ -248,7 +250,7 @@ def _recompute_dmr_stats(
     n_hyper = int((valid_diffs > 0).sum())
     n_hypo  = int((valid_diffs < 0).sum())
 
-    # BIO-9: signed Stouffer's Z. Sign comes from per-CpG meth_diff so the
+    # signed Stouffer's Z. Sign comes from per-CpG meth_diff so the
     # combined statistic naturally cancels mixed-direction windows.
     combined_p = _stouffer_combine_signed(window_pvals, window_diffs)
     if np.isnan(combined_p):
@@ -418,7 +420,7 @@ def call_dmr_sliding_window(
         .sort(["chrom", "start"])
     )
 
-    # BIO-11: BH-correct DMR-level combined p-values so downstream filters
+    # BH-correct DMR-level combined p-values so downstream filters
     # are operating on q-values. Without this the sliding-window output
     # was effectively un-corrected at the region level.
     from .dmc import apply_multiple_testing_correction
@@ -432,7 +434,7 @@ def call_dmr_sliding_window(
     return dmr_df
 
 
-# Public API — tile-based DMR calling (methylKit-style)
+# Public API — tile-based DMR calling
 
 def _aggregate_sample_to_tiles(
     src_part_file: Path,
@@ -504,14 +506,13 @@ def call_dmr_tile_based(
 ) -> pl.DataFrame:
     """Call DMRs by aggregating read counts within fixed-size tiles.
 
-    BIO-5: This is the methylKit-parity DMR path. methylKit's tileMethylCounts
-    sums N_meth and coverage across all CpGs in each tile per sample, then
-    runs a single tile-level test (e.g. logistic regression with
-    overdispersion). The sliding-window method in this module tests each
-    CpG individually and combines p-values, which has dramatically lower
-    power at typical WGBS coverage: a tile with 20 CpGs at +15 % effect
-    might have zero individually-significant CpGs but still trivially
-    pass when its 600 pooled reads are tested.
+    Per-sample, per-chromosome, the engine sums N_meth and coverage across
+    all CpGs in each tile, then runs a single tile-level DMC test. The
+    sliding-window alternative tests each CpG individually and combines
+    p-values, which has dramatically lower power at typical WGBS coverage:
+    a tile with 20 CpGs at +15 % effect might have zero individually-
+    significant CpGs but still trivially pass when its 600 pooled reads
+    are tested.
 
     Implementation
     --------------
@@ -532,18 +533,17 @@ def call_dmr_tile_based(
     samples_case, samples_control : list[str]
         Sample IDs.
     tile_size_bp : int
-        Tile width in bp (default 1000, matching methylKit default).
-        Adjacent tiles do not overlap.
+        Tile width in bp (default 1000). Adjacent tiles do not overlap.
     test : str
-        Statistical test for tile-level counts. Defaults to ``"logit_t"``,
-        which is the closest analogue to methylKit's logistic regression
-        at n ≥ 3 replicates.
+        Statistical test for tile-level counts. Defaults to ``"logit_t"``
+        — Welch t on logit(beta), a robust fallback at the tile level
+        where counts are large.
     chromosomes : list[str], optional
         Chromosomes to process. Auto-detected when None.
     min_cpgs_per_tile : int
         Skip tiles with fewer than this many CpGs (per sample) during the
-        per-sample aggregation step. methylKit's default is 1; we use 5 to
-        reduce noise at sparse coverage.
+        per-sample aggregation step. Default 5 to reduce noise at sparse
+        coverage.
     alpha : float
         q-value threshold for significance.
     min_abs_meth_diff : float
@@ -615,7 +615,7 @@ def call_dmr_tile_based(
 
                 # Record per-tile CpG count (use max across samples so the
                 # output reflects the most CpG-dense observation of the
-                # tile, comparable to methylKit's reporting).
+                # tile).
                 for tile_start, n_cpgs_val in zip(
                     tiled["pos"].to_list(), tiled["n_cpgs"].to_list()
                 ):
@@ -853,9 +853,7 @@ def smooth_methylation_gaussian(
 
     .. note::
        This is a Gaussian-kernel approximation, not the local-LOESS smoother
-       used by Hansen et al.'s BSmooth. The function was previously named
-       ``smooth_methylation_bsmooth``; that alias is kept for one
-       deprecation cycle. A true LOESS-based BSmooth implementation is on
+       used in Hansen et al.'s BSmooth. A true LOESS-based smoother is on
        the roadmap.
 
     Within each chromosome and sample, raw beta values are smoothed along
@@ -869,7 +867,7 @@ def smooth_methylation_gaussian(
         from scipy.ndimage import gaussian_filter1d
     except ImportError as exc:
         raise ImportError(
-            "scipy is required for BSmooth smoothing. "
+            "scipy is required for Gaussian smoothing. "
             "Install with: pip install scipy"
         ) from exc
 
@@ -968,21 +966,3 @@ def smooth_methylation_gaussian(
     return pl.concat(records).sort(["chrom", "pos", "sample"])
 
 
-# Deprecated alias — remove in v0.3
-
-def smooth_methylation_bsmooth(*args, **kwargs):
-    """Deprecated alias for :func:`smooth_methylation_gaussian`.
-
-    The implementation is Gaussian convolution on a regular grid, not the
-    local LOESS used by Hansen et al.'s BSmooth. The old name was misleading.
-    """
-    import warnings
-    warnings.warn(
-        "smooth_methylation_bsmooth is deprecated; use "
-        "smooth_methylation_gaussian instead. The implementation is "
-        "Gaussian-kernel smoothing, not local LOESS, so the old name "
-        "misrepresented the method.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return smooth_methylation_gaussian(*args, **kwargs)

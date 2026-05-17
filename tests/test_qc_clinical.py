@@ -1,4 +1,4 @@
-"""Plan 2 §5: clinical / cohort QC pack."""
+"""clinical / cohort QC pack."""
 
 from __future__ import annotations
 

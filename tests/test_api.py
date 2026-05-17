@@ -3,11 +3,11 @@
 Verifies the data-object contract:
 
 * ``MethylData`` round-trips losslessly through ``save()`` / ``load()``.
-* Preprocessing state is derived from ``uns['_store_history']`` (S6).
+* Preprocessing state is derived from ``uns['_store_history']``.
 * ``MethylData.get_dmc(test=...)`` looks up by explicit name; ``.dmc``
-  resolves to the *last-written* table via ``uns['dmc']['last_key']`` (S5).
+  resolves to the *last-written* table via ``uns['dmc']['last_key']``.
 * Deprecated ``samples_case=`` / ``min_samples_case=`` kwargs still work
-  but emit ``DeprecationWarning`` (S9).
+  but emit ``DeprecationWarning``.
 * Covariate-adjusted GLM dispatches correctly through ``tl.dmr``.
 """
 
@@ -48,7 +48,7 @@ def test_read_bismark_writes_partitioned_parquet_store(synth_md):
 
 
 
-# State derivation from _store_history (S6)
+# State derivation from _store_history
 
 
 def test_state_is_raw_before_any_preprocessing(synth_md):
@@ -138,7 +138,7 @@ def test_save_load_round_trip_preserves_obs_varm_uns(synth_md, tmp_path):
 
 
 def test_save_load_does_not_persist_boolean_state_in_meta(synth_md, tmp_path):
-    """methyldata.json should *not* hard-code _filtered etc. (S6 stipulates
+    """methyldata.json should *not* hard-code _filtered etc. (by design,
     that they are derived properties)."""
     import epykit as ep
     ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
@@ -151,7 +151,7 @@ def test_save_load_does_not_persist_boolean_state_in_meta(synth_md, tmp_path):
 
 
 
-# MethylData.dmc / .get_dmc (S5)
+# MethylData.dmc / .get_dmc
 
 
 def test_get_dmc_returns_none_before_running_dmc(synth_md_filtered):
@@ -205,7 +205,7 @@ def test_get_dmc_prefers_annotated_when_available(synth_md_filtered):
 
 
 
-# Deprecation warnings (S9)
+# Deprecation warnings
 
 
 def test_samples_case_kwarg_emits_deprecation_warning(synth_md_filtered):

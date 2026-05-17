@@ -12,7 +12,11 @@ import gc
 import polars as pl
 
 from .annotate import annotate_cpg_islands, annotate_features, _GTF_CACHE
-from .dmc import apply_multiple_testing_correction, process_chromosomes_dmc
+from .dmc import (
+    apply_multiple_testing_correction,
+    empirical_fdr_for_dmc,
+    process_chromosomes_dmc,
+)
 from .dmr import call_dmr_sliding_window, call_dmr_tile_based, empirical_fdr_for_dmr
 from .methyldata import MethylData
 from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
@@ -66,7 +70,7 @@ def _check_n1_and_union_footgun(
     min_samples_control: int,
     unit: str = "sites",
 ) -> None:
-    """Enforce n>=2 per group (unless allow_n1) and warn on union+0/0 (B6/B8)."""
+    """Enforce n>=2 per group (unless allow_n1) and warn on union+0/0."""
     if min(len(md.treatment_ids), len(md.control_ids)) < 2 and not allow_n1:
         _auto_test_simple(md, allow_n1=False)  # raises ValueError
     unite_info = md.uns.get("unite")
@@ -90,7 +94,7 @@ def _resolve_min_samples_aliases(
     min_samples_case: int | None,
     default: int = 0,
 ) -> int:
-    """Accept the deprecated ``min_samples_case`` kwarg with a DeprecationWarning (S9).
+    """Accept the deprecated ``min_samples_case`` kwarg with a DeprecationWarning.
 
     Returns the resolved canonical value. Either both None (use default), one
     set, or — illegally — both set (TypeError).
@@ -115,12 +119,11 @@ def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
     """Pick a sensible test based on group size.
 
     Current default at n>=2: ``"lr"`` — the quasi-binomial likelihood-ratio
-    chi-square with per-site McCullagh-Nelder dispersion. This is what
-    methylKit's ``calculateDiffMeth(overdispersion="MN", test="Chisq")``
-    reports, computed in closed form on the same streaming
-    (S0_g, S1_g, Σm²/n_g) accumulators we already keep for the score test.
-    LR is closer to nominal type-I error than the score test at the small
-    samples (n=6) and boundary proportions typical in WGBS.
+    chi-square with per-site McCullagh-Nelder dispersion. Closed-form on
+    the streaming (S0_g, S1_g, Σm²/n_g) accumulators we already keep for
+    the score test. LR is closer to nominal type-I error than the score
+    test at the small samples (n=6) and boundary proportions typical in
+    WGBS.
 
     The default returned here MUST match the CLI ``--test`` default (lr) and
     the ``--test`` default for ``dmr`` (lr). See cli.py for the single source
@@ -170,7 +173,7 @@ def qc(
 ) -> None:
     """Populate md.obs with per-sample QC metrics and cache QC tables in md.uns.
 
-    Plan 2 §5 additions are opt-in via the ``run_*`` flags so the default
+    additions are opt-in via the ``run_*`` flags so the default
     ``tl.qc(md)`` keeps the existing fast subset.
     """
     samples = md.obs.get_column("sample_id").to_list()
@@ -213,7 +216,7 @@ def qc(
             conv.append({"sample_id": sample, "bisulfite_conversion_rate": rate})
         obs = obs.join(pl.DataFrame(conv), on="sample_id", how="left")
 
-    # --- Plan 2 §5: clinical QC additions ----------------------------------
+    # --- clinical QC additions ----------------------------------
     if run_sex_check:
         from .qc import sex_check as _sex_check
         expected = None
@@ -266,15 +269,20 @@ def dmc(
     min_samples_treatment: int | None = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "methylkit",
+    reference: str = "adaptive",
     allow_n1: bool = False,
-    # Section 1 of Plan 2: multi-group / continuous-covariate contrasts
+    # Section 1 of multi-group / continuous-covariate contrasts
     formula: str | None = None,
     contrast=None,
     covariates: list[str] | None = None,
     treatment_col: str = "treatment",
+    # permutation-based empirical FDR (binary path only) ----------
+    empirical_fdr: bool = False,
+    n_perm: int = 100,
+    perm_seed: int = 42,
+    perm_n_jobs: int = 1,
     *,
-    min_samples_case: int | None = None,  # deprecated alias (S9)
+    min_samples_case: int | None = None,  # deprecated alias
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -288,7 +296,7 @@ def dmc(
         ``"welch_t"`` (formerly ``"beta_binomial"`` — deprecated alias),
         ``"bb_lr"`` (true quasi-binomial LRT), ``"cmh"``, ``"fisher"``,
         ``"glm"``. ``"auto"`` resolves to ``"fisher"`` at n<2 and ``"lr"``
-        (methylKit parity) at n>=2.
+        (the recommended default) at n>=2.
 
         When ``formula`` and/or ``contrast`` are supplied, the test is
         forced to a GLM-based path regardless of ``test=``.
@@ -317,12 +325,13 @@ def dmc(
         without it.
     dispersion : {"site", "chrom", "shrink"}
         McCullagh-Nelder dispersion strategy used by the ``"lr"`` and
-        ``"score"`` tests. Default ``"site"`` matches methylKit
-        ``overdispersion="MN"``.
+        ``"score"`` tests. Default ``"site"`` estimates a per-site φ̂_i
+        from the 4-df Pearson residual sum. See :func:`_score_finalize`
+        in ``dmc.py`` for the alternatives.
     chromosomes : list[str], optional
         Restrict to a subset of chromosomes. Auto-detected when None.
     min_samples_treatment, min_samples_control : int
-        BIO-7: per-site minimum number of samples with non-zero coverage in
+        per-site minimum number of samples with non-zero coverage in
         each group. Sites that fail are NaN'd out before FDR correction.
         Primarily useful when ``ep.pp.unite(..., type="union")`` was used so
         that union-introduced zero-coverage rows aren't treated as real
@@ -337,6 +346,15 @@ def dmc(
 
     # --- New contrast / multi-group path -------------------------------------
     if formula is not None or contrast is not None:
+        if empirical_fdr:
+            # Same refusal as the DMR path: label shuffling invalidates
+            # the stratified design that formula= encodes.
+            raise ValueError(
+                "empirical_fdr=True is not supported with the contrast / "
+                "multi-group DMC path (label shuffling invalidates the "
+                "stratified design). Use the binary treatment / control "
+                "path or implement a custom stratified permutation."
+            )
         _run_dmc_contrast(
             md, test=test, formula=formula, contrast=contrast,
             covariates=covariates, treatment_col=treatment_col,
@@ -374,6 +392,24 @@ def dmc(
     )
     result = apply_multiple_testing_correction(result, method="fdr_bh")
 
+    if empirical_fdr and len(result) > 0:
+        result = empirical_fdr_for_dmc(
+            methylstore_path=md.store,
+            samples_treatment=md.treatment_ids,
+            samples_control=md.control_ids,
+            observed_dmc=result,
+            n_perm=n_perm,
+            seed=perm_seed,
+            n_jobs=perm_n_jobs,
+            test=selected_test,
+            chromosomes=chromosomes,
+            unite=unite,
+            min_samples_treatment=min_samples_treatment,
+            min_samples_control=min_samples_control,
+            dispersion=dispersion,
+            reference=reference,
+        )
+
     # Canonicalise key name (test_used reflects the canonical name post-rename)
     from .dmc import _canonicalise_test_name
     canonical_used = _canonicalise_test_name(selected_test)
@@ -391,7 +427,10 @@ def dmc(
         "min_samples_case": min_samples_treatment,
         "dispersion": dispersion,
         "reference": reference,
-        # S5: explicit pointer so MethylData.get_dmc() / .dmc resolve to the
+        "empirical_fdr": empirical_fdr,
+        "n_perm": n_perm if empirical_fdr else None,
+        "perm_seed": perm_seed if empirical_fdr else None,
+        # explicit pointer so MethylData.get_dmc() / .dmc resolve to the
         # table the user just wrote, regardless of which other tests have
         # been run in the same session.
         "last_key": key,
@@ -535,7 +574,7 @@ def dmr(
     min_samples_treatment: int | None = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "methylkit",
+    reference: str = "adaptive",
     # Covariate design (tile-method only) ----------------------------------
     design: str | None = None,
     covariates: list[str] | None = None,
@@ -551,23 +590,23 @@ def dmr(
     min_mean_qvalue: float | None = 0.05,
     # Replicate-count guard --------------------------------------------------
     allow_n1: bool = False,
-    # Plan 2 §3: permutation-based empirical FDR (tile method only) --------
+    # permutation-based empirical FDR (tile method only) --------
     empirical_fdr: bool = False,
     n_perm: int = 100,
     perm_seed: int = 42,
     perm_n_jobs: int = 1,
     *,
-    min_samples_case: int | None = None,  # deprecated alias (S9)
+    min_samples_case: int | None = None,  # deprecated alias
 ) -> None:
     """Run DMR calling and store result in ``md.uns['dmr']``.
 
     Two methods are supported:
 
-    * ``method="tile"`` (default, methylKit parity, BIO-5) — aggregates
-      read counts within fixed tiles and runs a single test per tile.
-      Requires direct access to ``md.store`` and the per-sample methylstore;
-      does not need a prior DMC table. This is the recommended path for
-      whole-genome WGBS analyses.
+    * ``method="tile"`` (default, recommended) — aggregates read counts
+      within fixed tiles and runs a single test per tile. Requires direct
+      access to ``md.store`` and the per-sample methylstore; does not
+      need a prior DMC table. The right path for whole-genome WGBS
+      analyses.
     * ``method="sliding_window"`` — the legacy in-tree method: takes the
       DMC result on ``md`` and combines per-CpG p-values within overlapping
       windows with signed Stouffer's Z. Faster (no extra I/O) but
@@ -579,14 +618,14 @@ def dmr(
     method : {"tile", "sliding_window"}
         Which DMR algorithm to run.
     tile_size_bp, min_cpgs_per_tile : int
-        Tile-method options. ``tile_size_bp=1000`` matches methylKit's default.
+        Tile-method options. Default ``tile_size_bp=1000``.
     test : str
         Statistical test for tile-method (ignored when ``method="sliding_window"``).
         ``"auto"`` resolves the same way as in :func:`dmc`.
     chromosomes : list[str], optional
         Restrict tile-method processing to these chromosomes.
     min_samples_treatment, min_samples_control : int
-        Per-tile sample-count guard for tile-method (BIO-7).
+        Per-tile sample-count guard for tile-method .
         ``min_samples_case`` is accepted as a deprecated alias for
         ``min_samples_treatment`` (S9 naming unification).
     window_bp, step_bp, min_cpgs, min_sites_significant : int
@@ -597,7 +636,7 @@ def dmr(
     min_abs_meth_diff : float
         Minimum |meth_diff| for a DMC / tile to count.
     min_mean_qvalue : float or None
-        BIO-10: post-hoc filter on the DMR-level **q-value**
+        post-hoc filter on the DMR-level **q-value**
         (``combined_qvalue`` for sliding-window, ``qvalue`` for tile).
         DMRs with q >= ``min_mean_qvalue`` are dropped. Set to None to keep
         all candidate DMRs. Default 0.05.
@@ -668,7 +707,7 @@ def dmr(
         if len(dmr_df) > 0 and min_mean_qvalue is not None and "qvalue" in dmr_df.columns:
             dmr_df = dmr_df.filter(pl.col("qvalue") < min_mean_qvalue)
 
-        # Plan 2 §3: permutation FDR. Refuses to run when a covariate design
+        # permutation FDR. Refuses to run when a covariate design
         # is in play (shuffling treatment labels invalidates the assumed
         # covariate structure).
         if empirical_fdr:
@@ -744,7 +783,7 @@ def dmr(
             alpha=alpha,
             min_abs_meth_diff=min_abs_meth_diff,
         )
-        # BIO-10: filter on the BH-corrected DMR-level q-value, not the raw
+        # filter on the BH-corrected DMR-level q-value, not the raw
         # combined p-value. ``call_dmr_sliding_window`` now adds
         # ``combined_qvalue`` itself.
         if len(dmr_df) > 0 and min_mean_qvalue is not None:
@@ -776,7 +815,7 @@ def dvc(
     alpha: float = 0.05,
     mean_filter_alpha: float = 0.05,
 ) -> None:
-    """Differential-Variability CpG calling (Plan 2 §4, iEVORA-style).
+    """Differential-Variability CpG calling (iEVORA-style).
 
     Identifies CpGs whose between-replicate variance differs significantly
     between the treatment and control groups *while* the means do not —
@@ -790,11 +829,11 @@ def dvc(
 
     Parameters
     ----------
-    test : {"bartlett", "levene", "brown_forsythe"}
-        Variance-equality test. ``"bartlett"`` is the default closed-form
-        choice under the Welford streaming budget. The other two delegate
-        to the same Bartlett path under streaming (see
-        :func:`epykit.dvc._levene_per_site` for the design rationale).
+    test : {"bartlett"}
+        Variance-equality test. Only ``"bartlett"`` is supported — its
+        closed-form expression fits the Welford streaming budget. Levene /
+        Brown-Forsythe would need per-replicate centered deviations that
+        the streaming accumulators don't keep.
     alpha : float
         q-value cutoff on the variance test for the ``is_dvc`` flag.
     mean_filter_alpha : float
@@ -823,6 +862,116 @@ def dvc(
         "n_dvc": int(result.get_column("is_dvc").sum()) if len(result) else 0,
         "unite": unite,
     }
+
+
+def dvr(
+    md: MethylData,
+    *,
+    tile_size_bp: int = 1000,
+    min_cpgs_per_tile: int = 5,
+    alpha: float = 0.05,
+) -> None:
+    """Differentially Variable Regions — density-based aggregation of DVC.
+
+    Requires ``ep.tl.dvc(md)`` to have been run first; reads
+    ``md.varm['dvc']`` and writes the region call to ``md.uns['dvr']``.
+    See :func:`epykit.dvc.call_dvr_density` for the statistical model
+    (per-tile binomial enrichment vs the genome-wide DVC rate).
+
+    Parameters
+    ----------
+    tile_size_bp : int
+        Tile width in bp. Default 1 kb.
+    min_cpgs_per_tile : int
+        Tiles below this size are dropped. Default 5.
+    alpha : float
+        BH q-value threshold for the ``is_dvr`` flag. Default 0.05.
+    """
+    if "dvc" not in md.varm or md.varm["dvc"] is None:
+        raise ValueError(
+            "md.varm['dvc'] is missing. Run ep.tl.dvc(md) before ep.tl.dvr(md)."
+        )
+    from .dvc import call_dvr_density
+    dvr_df = call_dvr_density(
+        md.varm["dvc"],
+        tile_size_bp=tile_size_bp,
+        min_cpgs_per_tile=min_cpgs_per_tile,
+        alpha=alpha,
+    )
+    md.uns["dvr"] = dvr_df
+    md.uns["dvr_params"] = {
+        "method": "density",
+        "tile_size_bp": tile_size_bp,
+        "min_cpgs_per_tile": min_cpgs_per_tile,
+        "alpha": alpha,
+        "n_regions": int(dvr_df.height),
+        "n_dvr": int(dvr_df.get_column("is_dvr").sum()) if dvr_df.height else 0,
+    }
+
+
+def age_clock(
+    md: MethylData,
+    coefficients,
+    manifest,
+    *,
+    intercept: float = 0.0,
+    transform: str | None = None,
+    impute_missing: bool = True,
+    name: str = "age_clock",
+) -> None:
+    """Run a linear epigenetic-age clock and write per-sample ages to ``md.obs``.
+
+    Thin orchestrator over :func:`epykit.clocks.age_clock` that joins the
+    resulting per-sample age onto ``md.obs`` so downstream code can use it
+    as a regular obs column (e.g. as a covariate via ``tl.dmc(formula=...)``).
+    The full per-CpG diagnostic table is parked at
+    ``md.uns[f'{name}_diagnostics']`` for QC.
+    """
+    from .clocks import age_clock as _age_clock
+    result = _age_clock(
+        md, coefficients, manifest,
+        intercept=intercept, transform=transform,
+        impute_missing=impute_missing, name=name,
+    )
+    md.obs = md.obs.join(
+        result.select(["sample_id", name]),
+        on="sample_id", how="left",
+    )
+    md.uns[f"{name}_diagnostics"] = result
+
+
+def deconvolve(
+    md: MethylData,
+    reference,
+    manifest,
+    *,
+    method: str = "nnls",
+    cell_types: list[str] | None = None,
+    uns_key: str = "deconvolution",
+) -> None:
+    """Reference-based cell-type deconvolution; results to ``md.uns[uns_key]``.
+
+    Thin orchestrator over :func:`epykit.clocks.deconvolve`. The long-form
+    proportions table is stored at ``md.uns[uns_key]``; the wide pivot
+    (one column per cell type) is left-joined onto ``md.obs`` so cell-type
+    proportions can be used as covariates.
+    """
+    from .clocks import deconvolve as _deconvolve
+    long = _deconvolve(
+        md, reference, manifest, method=method, cell_types=cell_types,
+    )
+    md.uns[uns_key] = long
+    if long.is_empty():
+        return
+    wide = long.pivot(
+        values="proportion", index="sample_id", on="cell_type",
+        aggregate_function="first",
+    )
+    # Prefix columns so cell-type names like 'CD4T' don't collide with
+    # existing obs columns.
+    rename_map = {c: f"frac_{c}" for c in wide.columns if c != "sample_id"}
+    wide = wide.rename(rename_map)
+    md.obs = md.obs.join(wide, on="sample_id", how="left")
 
 
 def annotate(

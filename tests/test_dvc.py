@@ -1,8 +1,9 @@
-"""Plan 2 §4: differential variability calling (tl.dvc / iEVORA-style)."""
+"""Differential variability calling (tl.dvc / iEVORA-style)."""
 
 from __future__ import annotations
 
 import polars as pl
+import pytest
 
 import epykit as ep
 
@@ -22,10 +23,9 @@ def test_dvc_writes_expected_schema(synth_md_filtered):
     assert df.schema["is_dvc"] == pl.Boolean
 
 
-def test_dvc_levene_and_brown_forsythe_aliases(synth_md_filtered):
-    """Both 'levene' and 'brown_forsythe' should run without error."""
+@pytest.mark.parametrize("bad_test", ["levene", "brown_forsythe", "f_test"])
+def test_dvc_rejects_unsupported_tests(synth_md_filtered, bad_test):
+    """Only 'bartlett' is supported; others should raise a clear ValueError."""
     md = synth_md_filtered
-    ep.tl.dvc(md, test="levene")
-    assert "dvc" in md.varm
-    ep.tl.dvc(md, test="brown_forsythe")
-    assert "dvc" in md.varm
+    with pytest.raises(ValueError, match="bartlett"):
+        ep.tl.dvc(md, test=bad_test)

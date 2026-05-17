@@ -1,4 +1,4 @@
-"""Composite QC dashboard (Plan 2 §6).
+"""Composite QC dashboard .
 
 A single figure summarising the most-used QC signals so users don't have
 to assemble seven PNGs themselves. Reads only material that ``tl.qc`` has

@@ -1,4 +1,4 @@
-"""MultiQC custom-content emitter (Plan 2 §7).
+"""MultiQC custom-content emitter .
 
 Writes ``*_mqc.json`` files into ``output_dir`` so MultiQC's
 ``--config``-driven custom-content scanner picks them up. Each metric

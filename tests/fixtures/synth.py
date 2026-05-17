@@ -74,7 +74,7 @@ class SimConfig:
     replicate_sd: float = 0.03
     seed: int = 42
 
-    # --- Plan 2 extensions for multi-group / continuous-covariate tests ----
+    # --- Multi-group / continuous-covariate extensions --------------------
     # When n_groups >= 3, samples are drawn from group_labels[:n_groups] in
     # equal-size blocks. The first half of scattered DMCs become "multi-
     # group" DMCs whose effect ramps with the group index (multiplied by
@@ -216,7 +216,7 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
     positions = _positions(cfg, rng)
     n = cfg.n_total_sites
 
-    # ---- Plan 2: optional multi-group / continuous-covariate truths ------
+    # ---- Optional multi-group / continuous-covariate truths --------------
     multigroup_sites = np.zeros(n, dtype=bool)
     age_sites = np.zeros(n, dtype=bool)
     age_slope = np.zeros(n, dtype=np.float64)

@@ -26,7 +26,11 @@ from . import _cache
 
 RAW_MANIFEST_NAME = ".epykit_raw_manifest.json"
 
-# Bismark .cov column order
+# Bismark .cov column order. MethylDackel's extract --mergeContext output
+# uses the same six columns (chrom, start, end, percent, M, U) but prepends
+# a single ``track type="bedGraph" ...`` header line. _FORMAT_SKIP_ROWS
+# encodes that difference so a polars scan_csv can ingest both without
+# format-specific parsing logic.
 _COV_COLUMNS = ["chrom", "start", "end", "methyl_percent", "N_meth", "N_unmeth"]
 
 _COV_SCHEMA: dict[str, type[pl.DataType]] = {
@@ -38,6 +42,11 @@ _COV_SCHEMA: dict[str, type[pl.DataType]] = {
     "N_unmeth": pl.Int32,
 }
 
+_FORMAT_SKIP_ROWS: dict[str, int] = {
+    "bismark": 0,
+    "methyldackel": 1,
+}
+
 
 # Manifest helpers
 
@@ -47,6 +56,7 @@ class _SampleManifest:
     source: dict[str, object]
     chroms: list[str]
     row_group_size: int
+    format: str = "bismark"
 
 
 _file_signature = _cache.file_signature
@@ -67,11 +77,13 @@ def _manifest_payload(manifest: _SampleManifest) -> dict[str, object]:
         "source": manifest.source,
         "chroms": manifest.chroms,
         "row_group_size": manifest.row_group_size,
+        "format": manifest.format,
     }
 
 
 def _can_reuse_sample(
-    input_path: Path, sample_dir: Path, row_group_size: int
+    input_path: Path, sample_dir: Path, row_group_size: int,
+    format: str = "bismark",
 ) -> bool:
     manifest = _load_json(_manifest_path(sample_dir))
     if not manifest:
@@ -79,6 +91,11 @@ def _can_reuse_sample(
     if manifest.get("source") != _file_signature(input_path):
         return False
     if manifest.get("row_group_size") != row_group_size:
+        return False
+    # Reject cached conversions made under a different source format. The
+    # default "bismark" preserves cache compatibility for stores converted
+    # before the format key existed.
+    if manifest.get("format", "bismark") != format:
         return False
     chroms = manifest.get("chroms")
     if not isinstance(chroms, list) or not all(
@@ -105,7 +122,7 @@ def _promote_sample_dir(temp_sample_dir: Path, final_sample_dir: Path) -> None:
             shutil.rmtree(backup_dir)
 
 
-# CpG strand merging (BIO-2)
+# CpG strand merging
 
 def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
     """Merge + and - strand CpG pairs into single sites at the + strand position.
@@ -246,14 +263,15 @@ def convert_sample(
     context: str = "CpG",
     reference_fasta: str | None = None,
     merge_strands: bool = True,
+    format: str = "bismark",
 ) -> None:
-    """Convert a Bismark .cov (optionally gzipped) file into a partitioned
-    Parquet store.
+    """Convert a Bismark .cov or MethylDackel .bedGraph file into a
+    partitioned Parquet store.
 
     Parameters
     ----------
     input_path : str
-        Path to the .cov or .cov.gz file
+        Path to the .cov / .cov.gz / .bedGraph / .bedGraph.gz file.
     sample_name : str
         Sample identifier written into the `sample` column
     output_dir : str
@@ -265,13 +283,18 @@ def convert_sample(
         ("CpG", "CHG", "CHH"). Default "CpG".
     reference_fasta : str, optional
         Path to an indexed reference FASTA. When provided, strand is inferred
-        from the reference base at each position (BIO-1). Without this
+        from the reference base at each position . Without this
         argument, strand defaults to "*".
     merge_strands : bool
         If True (default), merge + and - strand CpG pairs into single sites
-        at the + strand position (BIO-2). This is appropriate for .cov files
+        at the + strand position . This is appropriate for .cov files
         from bismark_methylation_extractor with both strands. Files from
         bismark2bedGraph are typically already strand-merged.
+    format : {"bismark", "methyldackel"}
+        Source format. Both use the same 6-column layout
+        (chrom, start, end, methylation_percent, count_methylated,
+        count_unmethylated); MethylDackel prepends a one-line ``track``
+        header that is skipped automatically. Default "bismark".
 
     Output schema
     -------------
@@ -284,6 +307,12 @@ def convert_sample(
     coverage Int32
     sample  Utf8
     """
+    if format not in _FORMAT_SKIP_ROWS:
+        raise ValueError(
+            f"Unknown format {format!r}; expected one of "
+            f"{sorted(_FORMAT_SKIP_ROWS)}"
+        )
+
     p = Path(input_path)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -292,6 +321,7 @@ def convert_sample(
         str(p),
         separator="\t",
         has_header=False,
+        skip_rows=_FORMAT_SKIP_ROWS[format],
         new_columns=_COV_COLUMNS,
         schema_overrides=_COV_SCHEMA,
     ).with_columns(
@@ -308,7 +338,7 @@ def convert_sample(
 
     df = lf.collect()
 
-    # Strand inference (BIO-1): requires reference FASTA via pyfaidx
+    # Strand inference : requires reference FASTA via pyfaidx
     if reference_fasta is not None:
         strand_series = _infer_strand(df, reference_fasta)
     else:
@@ -319,7 +349,7 @@ def convert_sample(
          "sample"]
     )
 
-    # CpG strand merging (BIO-2): merge + and - strand pairs if requested
+    # CpG strand merging : merge + and - strand pairs if requested
     if merge_strands and reference_fasta is not None:
         df = _merge_cpg_pairs(df)
 
@@ -342,6 +372,7 @@ def ensure_converted_sample(
     row_group_size: int = 1_000_000,
     context: str = "CpG",
     reference_fasta: str | None = None,
+    format: str = "bismark",
 ) -> bool:
     """Convert a sample unless a valid on-disk conversion already exists.
 
@@ -353,7 +384,9 @@ def ensure_converted_sample(
     output_root.mkdir(parents=True, exist_ok=True)
 
     final_sample_dir = _sample_dir(output_root, sample_name)
-    if _can_reuse_sample(source_path, final_sample_dir, row_group_size):
+    if _can_reuse_sample(
+        source_path, final_sample_dir, row_group_size, format=format,
+    ):
         return False
 
     temp_root = output_root.parent / f".{output_root.name}.{sample_name}.tmp"
@@ -368,6 +401,7 @@ def ensure_converted_sample(
             row_group_size=row_group_size,
             context=context,
             reference_fasta=reference_fasta,
+            format=format,
         )
         temp_sample_dir = _sample_dir(temp_root, sample_name)
         chroms = _expected_chrom_dirs(temp_sample_dir)
@@ -376,6 +410,7 @@ def ensure_converted_sample(
             source=_file_signature(source_path),
             chroms=chroms,
             row_group_size=row_group_size,
+            format=format,
         )
         _write_json(_manifest_path(temp_sample_dir), _manifest_payload(manifest))
         _promote_sample_dir(temp_sample_dir, final_sample_dir)

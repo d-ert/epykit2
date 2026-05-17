@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _MIN_GENOME_COVERAGE_FRACTION = 0.80   # 80 % of CpGs at ≥1×
 _CONVERSION_WARNING_THRESHOLD  = 0.005  # 0.5 % CHH methylation
 
-# Plan 2 §5: chromosome aliases used by qc.sex_check. Both UCSC ("chrX")
+# chromosome aliases used by qc.sex_check. Both UCSC ("chrX")
 # and Ensembl ("X") naming conventions are accepted.
 _X_CHROM_NAMES: tuple[str, ...] = ("chrX", "X")
 
@@ -48,6 +48,22 @@ def bisulfite_conversion_rate(
 
     A value below 99.5 % (i.e. >0.5 % residual CHH methylation) should be
     flagged as a potential quality issue.
+
+    .. note::
+
+        This rate is **reported, not applied**. epykit's DMC / DMR tests
+        consume the raw ``count_methylated`` / ``count_unmethylated``
+        values exactly as Bismark / MethylDackel emit them; the
+        conversion rate is surfaced in the QC dashboard, the MultiQC
+        export, and the HTML report so users can gate their analysis on
+        it, but it is **not** used to rescale read counts before testing.
+        This matches the default behaviour of ``methylKit`` and the
+        ``bsseq`` family (``read.bismark`` etc.), which leave count-level
+        correction to the user. For a well-converted library (≥99.5 %)
+        the correction is statistically negligible; for a poorly
+        converted one the right action is usually to re-prep the
+        library, not to paper over the issue with a multiplicative
+        adjustment that distorts variance.
 
     Parameters
     ----------
@@ -369,7 +385,7 @@ def coverage_uniformity(
     return result.sort(["chrom"])
 
 
-# Plan 2 §5: Clinical / cohort QC pack
+# Clinical / cohort QC pack
 
 def _resolve_x_chrom_dir(store: Path, sample: str) -> Path | None:
     """Find the X-chromosome partition for a sample under any naming."""
@@ -387,7 +403,7 @@ def sex_check(
     min_coverage: int = 5,
     expected_sex: dict[str, str] | None = None,
 ) -> pl.DataFrame:
-    """Infer sample sex from mean β on the X chromosome (Plan 2 §5).
+    """Infer sample sex from mean β on the X chromosome .
 
     Female samples carry one inactivated X and have mean(β) ≈ 0.4 - 0.5
     on the X chromosome; male samples have mean(β) ≈ 0.05 - 0.10. We
@@ -500,7 +516,7 @@ def contamination_estimate(
     (0.2 < β < 0.8) — the score is the fraction of well-covered CpGs in
     that band.
 
-    Plan 2 §5: this is the lightweight "boundary-mass" version. A fuller
+    this is the lightweight "boundary-mass" version. A fuller
     EM-based three-component mixture is mentioned in the plan but adds
     a sklearn dep; the histogram score is robust and matches the
     contamination signal direction in practice.
@@ -554,7 +570,7 @@ def sample_correlation(
     min_coverage: int = 10,
     chromosomes: list[str] | None = None,
 ) -> pl.DataFrame:
-    """Pairwise sample-vs-sample β correlation matrix (Plan 2 §5).
+    """Pairwise sample-vs-sample β correlation matrix .
 
     Builds the per-sample β vector over the intersection of CpGs covered
     at ``min_coverage`` in every sample, then returns the
@@ -655,7 +671,7 @@ def power(
     replicate_sd: float = 0.05,
     two_sided: bool = True,
 ) -> float | int:
-    """Methylation-specific power / sample-size calculator (Plan 2 §5).
+    """Methylation-specific power / sample-size calculator .
 
     Models β at each replicate as a mixture of binomial sampling noise
     (variance ``β(1-β)/coverage`` per replicate per CpG) plus between-

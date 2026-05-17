@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epykit"
-version = "0.1.0"
-description = "Parquet-backed WGBS methylation analysis pipeline (Bismark → DMC/DMR → annotation)"
+version = "0.3.0"
+description = "Parquet-backed WGBS methylation analysis pipeline (Bismark / MethylDackel → DMC/DMR → annotation)"
 authors = [ { name = "epykit user" } ]
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -87,7 +87,8 @@ extend-exclude = [
     ".venv",
     "build",
     "dist",
-    "scratch2.py",
+    "scratch/",
+    "scratch_plan2.py",
     "**/.claude/**",
     "raw_data",
 ]

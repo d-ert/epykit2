@@ -10,7 +10,7 @@ def coverage_histogram(md: MethylData, bins: int = 100, ax=None, figsize=(6, 4),
     
     For large datasets, samples every Kth site to avoid OOM.
     """
-    # Count total sites — FIX-11: pl.count() removed in Polars ≥0.20; use pl.len()
+    # Count total sites — pl.count() removed in Polars ≥0.20; use pl.len()
     total_sites = (
         pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
         .select(pl.len())
@@ -118,4 +118,99 @@ def methylation_heatmap(md: MethylData, n_top: int = 1000, ax=None, figsize=(8, 
     return fig, ax
 
 
-__all__ = ["coverage_histogram", "methylation_heatmap"]
+def mbias_plot(
+    mbias_data,
+    *,
+    context: str = "CpG",
+    ax=None,
+    figsize=(7, 4),
+    save: str | None = None,
+    md: MethylData | None = None,
+):
+    """Plot per-read-position methylation bias for one or more samples.
+
+    Input shape is ``{sample_id: pl.DataFrame}`` where each frame is the
+    output of :func:`epykit.nfcore_qc.parse_bismark_mbias`, or
+    ``{sample_id: str | Path}`` pointing at the raw M-bias text files
+    (they'll be parsed inline).
+
+    The plot shows percent methylation against read position, one line
+    per sample × read (``R1`` / ``R2``). Standard interpretation: a flat
+    plateau in the middle of the read with deflections at either end
+    indicates the safe trim region. A consistently sloped line is a sign
+    of incomplete bisulfite conversion or fill-in artefacts at PBAT /
+    EM-seq library tails.
+
+    Parameters
+    ----------
+    mbias_data : dict[str, pl.DataFrame | str | Path]
+        Per-sample M-bias tables or file paths.
+    context : {"CpG", "CHG", "CHH"}
+        Which methylation context to plot. Default ``"CpG"``.
+    ax : matplotlib.axes.Axes, optional
+        Existing axes to draw onto. Pass for composition into a dashboard.
+    figsize : (w, h)
+        Figure size when ``ax`` isn't provided. Default ``(7, 4)``.
+    save : str, optional
+        If a ``MethylData`` is supplied via ``md=``, the figure is saved
+        under its plot directory using :func:`_save_fig`.
+    md : MethylData, optional
+        Used only for ``save`` path resolution; not read otherwise.
+
+    Returns
+    -------
+    (matplotlib.figure.Figure, matplotlib.axes.Axes)
+    """
+    if not mbias_data:
+        raise ValueError("mbias_data is empty; provide at least one sample.")
+
+    from .._style import PALETTE
+
+    fig, ax = _get_ax(ax, figsize)
+    samples = sorted(mbias_data.keys())
+    palette = (
+        list(PALETTE.values()) if isinstance(PALETTE, dict) else list(PALETTE)
+    )
+
+    drawn = 0
+    for i, sample in enumerate(samples):
+        entry = mbias_data[sample]
+        if not isinstance(entry, pl.DataFrame):
+            from ..nfcore_qc import parse_bismark_mbias
+            entry = parse_bismark_mbias(entry)
+        sub = entry.filter(pl.col("context") == context)
+        if sub.is_empty():
+            continue
+        colour = palette[i % len(palette)] if palette else None
+        for read in sorted(sub.get_column("read").unique().to_list()):
+            ssub = sub.filter(pl.col("read") == read).sort("position")
+            if ssub.is_empty():
+                continue
+            ls = "-" if read == "R1" else "--"
+            ax.plot(
+                ssub.get_column("position").to_numpy(),
+                ssub.get_column("percent").to_numpy(),
+                label=f"{sample} {read}",
+                color=colour, linestyle=ls, linewidth=1.2,
+            )
+            drawn += 1
+
+    if drawn == 0:
+        raise ValueError(
+            f"No rows for context={context!r} in any provided sample. "
+            "Did the M-bias report cover this context?"
+        )
+
+    ax.set_xlabel("Read position (bp)")
+    ax.set_ylabel("% methylated")
+    ax.set_title(f"M-bias ({context})")
+    ax.set_ylim(0, 100)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=7, ncol=2)
+
+    if save and md is not None:
+        _save_fig(md, fig, save)
+    return fig, ax
+
+
+__all__ = ["coverage_histogram", "methylation_heatmap", "mbias_plot"]

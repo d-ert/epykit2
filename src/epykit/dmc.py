@@ -6,22 +6,29 @@ memory is O(n_sites) per chromosome, independent of sample count.
 Tests
 -----
   lr            — Quasi-binomial likelihood-ratio chi-square with per-site
-                  McCullagh-Nelder dispersion. Default; matches methylKit
-                  calculateDiffMeth(overdispersion='MN', test='Chisq').
+                  McCullagh-Nelder dispersion. The default at n>=2.
+                  Closed-form on the streaming (S0_g, S1_g, Σm²/n_g)
+                  accumulators; closer to nominal type-I error than the
+                  score test at the small samples and boundary β typical
+                  in WGBS.
   score         — Pearson score on the same dispersion-corrected
                   accumulators as lr. Marginally more powerful but mildly
                   anti-conservative at π̂ near 0/1.
   glm           — Binomial GLM via batched IRLS (see _glm.py). Required for
-                  covariate-adjusted designs.
+                  covariate-adjusted designs and multi-group contrasts.
   logit_t       — Welch t on logit(beta) via Welford. Variance-stabilising
                   fallback. Weak near β=0/1: anti-conservative under H0
                   when one group's between-replicate variance collapses
                   by binomial sampling chance. Use ``lr`` for trustworthy
                   inference; reach for ``logit_t`` only when count-model
                   assumptions are doubtful.
-  beta_binomial — Welch t on raw betas. NOT a beta-binomial GLM despite the
-                  name; kept for backward compatibility. Same boundary-β
+  welch_t       — Welch t on raw betas (formerly ``"beta_binomial"`` —
+                  see the rename DeprecationWarning). Same boundary-β
                   caveat as ``logit_t``.
+  bb_lr         — True quasi-binomial LRT via a full per-site GLM on a
+                  binary-treatment design. The honest "fit-the-model"
+                  alternative to ``welch_t``; slower than ``lr`` and
+                  produces near-identical results on binary designs.
   cmh           — Cochran-Mantel-Haenszel with one 2×2 stratum per
                   (case_i, ctrl_j) pair.
   fisher        — Fisher exact on reads pooled across replicates. Ignores
@@ -64,7 +71,7 @@ _WELCH_T_RENAME_WARNED = False
 
 
 def _canonicalise_test_name(test: str) -> str:
-    """Map deprecated test names to their canonical form (S-plan-2)."""
+    """Map deprecated test names to their canonical form."""
     global _WELCH_T_RENAME_WARNED
     if test == "beta_binomial":
         if not _WELCH_T_RENAME_WARNED:
@@ -91,7 +98,7 @@ _BETA_EPSILON: float = 1e-6
 def _resolve_treatment_aliases(
     samples_treatment, samples_case, min_samples_treatment, min_samples_case
 ):
-    """Resolve deprecated samples_case / min_samples_case kwargs (S9).
+    """Resolve deprecated samples_case / min_samples_case kwargs.
 
     Returns ``(samples_treatment, min_samples_treatment)`` with the
     deprecation warning fired iff the legacy alias was used.
@@ -168,140 +175,6 @@ def fisher_exact_vectorized(
         pvals[valid] = np.minimum(2.0 * pvals_valid, 1.0)
 
     return pvals, log2_or
-
-
-def beta_binomial_test(
-    meth_counts: np.ndarray,
-    total_counts: np.ndarray,
-    group_labels: np.ndarray,
-    method: str = "mom",
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Beta-binomial–aware differential methylation test.
-
-    Public entry point kept for unit-test compatibility.  Production code
-    inside _process_one_chromosome now uses _beta_binom_mom_from_welford
-    directly to avoid materialising the full beta matrix.
-
-    method="mom"         — Welch t-test on per-replicate betas (fast, default)
-    method="statsmodels" — per-site BetaBinomialModel MLE (slow, exact)
-    """
-    meth_counts  = np.asarray(meth_counts,  dtype=np.float64)
-    total_counts = np.asarray(total_counts, dtype=np.float64)
-    group_labels = np.asarray(group_labels, dtype=np.int32)
-
-    if meth_counts.ndim == 1:
-        meth_counts  = meth_counts[:, np.newaxis]
-        total_counts = total_counts[:, np.newaxis]
-
-    n_sites   = meth_counts.shape[0]
-    case_mask = group_labels == 1
-    ctrl_mask = group_labels == 0
-    n_case    = int(case_mask.sum())
-    n_ctrl    = int(ctrl_mask.sum())
-
-    if n_case < 2 or n_ctrl < 2:
-        warnings.warn(
-            f"beta_binomial_test requires ≥2 replicates per group; "
-            f"got case={n_case}, control={n_ctrl}.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        beta = np.where(total_counts > 0, meth_counts / total_counts, np.nan)
-
-    beta_case = beta[:, case_mask]
-    beta_ctrl = beta[:, ctrl_mask]
-
-    if method == "mom":
-        return _beta_binom_mom(beta_case, beta_ctrl, n_case, n_ctrl, n_sites)
-    elif method == "statsmodels":
-        return _beta_binom_statsmodels(
-            meth_counts, total_counts, case_mask, ctrl_mask, n_sites
-        )
-    else:
-        raise ValueError(f"Unknown method '{method}'. Choose 'mom' or 'statsmodels'.")
-
-
-def _beta_binom_mom(
-    beta_case: np.ndarray,
-    beta_ctrl: np.ndarray,
-    n_case: int,
-    n_ctrl: int,
-    n_sites: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Vectorised Welch t-test on per-replicate beta values (matrix form).
-
-    Used by the public beta_binomial_test() entry point.  The production
-    path inside _process_one_chromosome uses _beta_binom_mom_from_welford
-    instead, which avoids building the matrix in the first place.
-    """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        mu_case = np.nanmean(beta_case, axis=1)
-        mu_ctrl = np.nanmean(beta_ctrl, axis=1)
-        var_mean_case = np.nanvar(beta_case, axis=1, ddof=1) / max(n_case, 1)
-        var_mean_ctrl = np.nanvar(beta_ctrl, axis=1, ddof=1) / max(n_ctrl, 1)
-
-    se = np.sqrt(var_mean_case + var_mean_ctrl)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        t_stat = np.where(se > 0, (mu_case - mu_ctrl) / se, np.nan)
-
-    dof_num = (var_mean_case + var_mean_ctrl) ** 2
-    dof_den = (
-        np.where(n_case > 1, var_mean_case**2 / (n_case - 1), 0.0)
-        + np.where(n_ctrl > 1, var_mean_ctrl**2 / (n_ctrl - 1), 0.0)
-    )
-    with np.errstate(invalid="ignore", divide="ignore"):
-        dof = np.where(dof_den > 0, dof_num / dof_den, 1.0)
-        dof = np.maximum(dof, 1.0)
-
-    pvals     = 2.0 * sp_stats.t.sf(np.abs(t_stat), df=dof)
-    meth_diff = (mu_case - mu_ctrl).astype(np.float32)
-
-    degenerate = np.isnan(mu_case) | np.isnan(mu_ctrl) | np.isnan(t_stat)
-    pvals[degenerate]     = np.nan
-    meth_diff[degenerate] = np.nan
-
-    return pvals, meth_diff
-
-
-def _beta_binom_statsmodels(
-    meth_counts, total_counts, case_mask, ctrl_mask, n_sites
-):
-    try:
-        from statsmodels.discrete.count_model import BetaBinomialModel
-    except ImportError as exc:
-        raise ImportError(
-            "statsmodels ≥ 0.14 is required for the 'statsmodels' path."
-        ) from exc
-
-    pvals     = np.full(n_sites, np.nan, dtype=np.float64)
-    meth_diff = np.full(n_sites, np.nan, dtype=np.float32)
-    groups    = np.zeros(meth_counts.shape[1], dtype=np.int32)
-    groups[case_mask] = 1
-
-    for i in range(n_sites):
-        mc  = meth_counts[i]
-        tot = total_counts[i]
-        if tot.sum() == 0:
-            continue
-        try:
-            endog  = np.column_stack([mc, tot - mc]).astype(np.float64)
-            exog   = np.column_stack([
-                np.ones(len(groups), dtype=np.float64),
-                groups.astype(np.float64),
-            ])
-            result = BetaBinomialModel(endog, exog).fit(disp=False, method="bfgs")
-            pvals[i]     = float(result.pvalues[1])
-            mu_case      = float(result.predict(exog=np.array([[1.0, 1.0]]))[0])
-            mu_ctrl      = float(result.predict(exog=np.array([[1.0, 0.0]]))[0])
-            meth_diff[i] = np.float32(mu_case - mu_ctrl)
-        except Exception as exc:
-            logger.debug("statsmodels BetaBinomial failed at site %d: %s", i, exc)
-
-    return pvals, meth_diff
 
 
 # CMH test — O(n_sites) memory, statistically correct for replicates
@@ -413,7 +286,7 @@ def _welford_update(
 
     Sites with zero coverage are treated as missing and skipped, so
     n_valid[i] counts only samples that actually covered site i.
-    This handles BIO-4 (union sites with partial coverage) correctly.
+    This handles (union sites with partial coverage) correctly.
     """
     with np.errstate(invalid="ignore", divide="ignore"):
         beta = np.where(cov > 0, meth.astype(np.float64) / cov, np.nan)
@@ -468,7 +341,7 @@ def _safe_log2_odds_ratio(
 ) -> np.ndarray:
     """Symmetric log2 odds ratio with bounded clipping in both groups.
 
-    BIO-6 fix: the previous formulation clipped only `(1 - mean_case)` and
+    fix: the previous formulation clipped only `(1 - mean_case)` and
     `(1 - mean_ctrl)` in the denominators of the inner ratios, so the
     numerators `mean_case` and `mean_ctrl` could remain at their raw values
     of 1.0, producing ratios of ``1 / ε`` that propagated to ``log2 ≈ 30``
@@ -512,11 +385,10 @@ def _safe_log2_odds_ratio(
 # (the closed-form expansion lets us avoid materialising the n_sites × n_reps
 # matrix). φ̂ = sum_i_g X²_g(i) / (n_obs − 2·n_sites_fit), clamped at 1.
 #
-# This is what methylKit does in calculateDiffMeth(overdispersion='MN',
-# test='Chisq'). It is replicate-aware (variance scales with the *number of
-# replicates* via φ̂, not with the number of pooled reads), it is a real
+# The test is replicate-aware (variance scales with the *number of
+# replicates* via φ̂, not with the number of pooled reads), is a true
 # count-based test (does not throw away the information that 5/10 carries
-# less weight than 500/1000), and it is single-pass / O(n_sites) memory.
+# less weight than 500/1000), and runs single-pass / O(n_sites) memory.
 
 def _score_init(
     n: int,
@@ -570,7 +442,7 @@ def _score_finalize(
     dispersion:     str   = "site",
     shrink_pseudo_df: float = 4.0,
     statistic:      str   = "lr",
-    reference:      str   = "methylkit",
+    reference:      str   = "adaptive",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Compute per-site score p-values with McCullagh-Nelder overdispersion.
 
@@ -581,10 +453,10 @@ def _score_finalize(
     chrom_name : str
         Used only for logging.
     min_dispersion : float
-        Floor on φ̂.  Underdispersion (φ̂ < 1) usually reflects model
+        Floor on φ̂. Underdispersion (φ̂ < 1) usually reflects model
         misspecification rather than truly less-than-binomial variability;
-        clamping at 1 is the conservative choice and matches methylKit's
-        default.  Set < 1 to allow underdispersion.
+        clamping at 1 is the conservative choice. Set < 1 to allow
+        underdispersion.
     min_disp_sites : int
         If fewer than this many sites are usable for the chromosome-level
         dispersion estimate (e.g. tiny alt contigs), fall back to
@@ -594,29 +466,28 @@ def _score_finalize(
     dispersion : {"site", "chrom", "shrink"}
         Strategy for the McCullagh-Nelder dispersion correction:
 
-        ``"site"`` (default, methylKit ``overdispersion="MN"`` parity)
+        ``"site"`` (default)
             Each site/tile gets its own φ̂_i computed from its 4-df Pearson
             residual sum:  φ̂_i = (X²_case_i + X²_ctrl_i) / max(nv_i − 2, 1),
             clamped at ``min_dispersion``. This is what R's
-            ``glm(family=quasibinomial)`` does on a per-site fit and is the
-            assumption baked into methylKit's reference pipeline. The
+            ``glm(family=quasibinomial)`` does on a per-site fit. The
             estimator is noisy with the typical 4 df, but it correctly
             tracks region-specific dispersion (CpG-islands vs gene bodies
             have different between-replicate variance).
-        ``"chrom"`` (previous default)
+        ``"chrom"``
             Single chromosome-pooled φ̂ from all qualifying sites. Most
             powerful when between-replicate variance really is constant
             along the chromosome, but anti-conservative when it is not.
             Equivalent to fitting the quasi-binomial GLM as a single model
             with one shared dispersion. Use when you want strictly more
             power and you accept the modelling assumption.
-        ``"shrink"`` (methylKit ``overdispersion="shrinkMN"`` parity)
+        ``"shrink"``
             James-Stein-style shrinkage: φ̂_shrunk_i is a weighted average of
             φ̂_site_i (with weight = site df) and the chromosome-pooled
             φ̂_chrom (with weight = ``shrink_pseudo_df``, default 4).
             Trades a small bias for a large variance reduction on the
-            per-site estimate; reproduces the published behaviour of
-            methylKit's shrunk dispersion and DSS's empirical Bayes prior.
+            per-site estimate (the same idea behind DSS's empirical-Bayes
+            shrinkage of dispersion).
     shrink_pseudo_df : float
         Pseudo-df weight on φ̂_chrom in the ``"shrink"`` mode (default 4 ≈
         the typical real per-site df). Ignored otherwise.
@@ -626,43 +497,39 @@ def _score_finalize(
         same dispersion correction, so the difference manifests only at
         small effective sample sizes (n=6 is small):
 
-        ``"lr"`` (default, methylKit ``test='Chisq'`` parity)
+        ``"lr"`` (default)
             Quasi-binomial likelihood-ratio chi-square. Closed-form in
             S0_g and S1_g, so no per-tile GLM fit is required:
               LRT = 2 · Σ_g [ S1_g·log(p̂_g/p̂_pool)
                             + (S0_g − S1_g)·log((1 − p̂_g)/(1 − p̂_pool)) ]
             divided by the dispersion φ̂_i. Closer to nominal coverage near
             the boundaries (π̂ near 0 or 1) — exactly where DMR tiles tend
-            to live. This is what methylKit reports.
+            to live.
 
-        ``"score"`` (previous default; slightly more powerful)
+        ``"score"`` (slightly more powerful)
             Pearson score statistic U²/V_pool with quasi-binomial inflation.
             Asymptotically equivalent to the LR test but mildly
             anti-conservative at the boundaries. Kept as an option for
             users who want the small extra power.
-    reference : {"methylkit", "chi2", "F"}
+    reference : {"adaptive", "chi2", "F"}
         Reference distribution used to convert the test statistic to a
         p-value.
 
-        ``"methylkit"`` (default, exact methylKit-parity)
-            Per-site adaptive: F(1, df_residual_i) where the per-site
-            dispersion φ̂_i > 1 (overdispersion detected), χ²(1) elsewhere.
-            This is what methylKit's ``calculateDiffMeth`` does with its
-            default ``test`` argument (the first option of
-            ``c("F","Chisq",...)`` resolves to ``"F"``, which logReg then
-            switches to ``"Chisq"`` only where ``phi <= 1``). See line
-            273 of methylKit's ``R/diffMeth.R``. This is the only choice
-            that gives parity at BOTH the per-CpG (DMC) and per-tile
-            (DMR) levels.
+        ``"adaptive"`` (default)
+            Per-site: F(1, df_residual_i) where the per-site dispersion
+            φ̂_i > 1 (real overdispersion signal made it past the
+            min-dispersion floor), χ²(1) where φ̂_i was clamped to 1. This
+            is the right behaviour for quasi-binomial GLMs whose
+            dispersion estimate is noisy at small samples — F handles the
+            overdispersed sites, χ² handles the ones where the
+            quasi-binomial collapses to a binomial.
         ``"chi2"``
-            Always reference to χ²(1). Matches methylKit only at sites
-            where φ̂ was clamped to 1. Over-liberal at tiles with real
+            Always reference to χ²(1). Over-liberal at tiles with real
             overdispersion (typical DMR setting).
         ``"F"``
-            Always reference to F(1, df_residual_i). Matches methylKit
-            only at sites where φ̂ > 1. Wildly conservative at sites with
-            clamped φ̂ = 1 — will reject zero genome-wide CpGs on typical
-            n=3+3 WGBS.
+            Always reference to F(1, df_residual_i). Wildly conservative
+            at sites where φ̂ is clamped to 1 — will reject ~zero
+            genome-wide CpGs on typical n=3+3 WGBS.
 
     Returns
     -------
@@ -683,9 +550,13 @@ def _score_finalize(
         raise ValueError(
             f"statistic must be 'lr' or 'score'; got {statistic!r}"
         )
-    if reference not in {"methylkit", "F", "chi2"}:
+    if reference == "methylkit":
         raise ValueError(
-            f"reference must be 'methylkit', 'F', or 'chi2'; got {reference!r}"
+            "reference='methylkit' was renamed to 'adaptive' in this release."
+        )
+    if reference not in {"adaptive", "F", "chi2"}:
+        raise ValueError(
+            f"reference must be 'adaptive', 'F', or 'chi2'; got {reference!r}"
         )
     eps = _BETA_EPSILON
 
@@ -754,7 +625,7 @@ def _score_finalize(
     # --- Per-site Pearson dispersion φ̂_i (only used when needed) ---------
     if dispersion in ("site", "shrink"):
         # df_i = (replicates_case + replicates_ctrl) − 2 fitted proportions.
-        # At a typical methylKit-style site with n=3 per group this is 4.
+        # At a typical n=3 per group this is 4.
         df_i = (nv_case + nv_ctrl).astype(np.float64) - 2.0
         df_i_safe = np.where(df_i > 0, df_i, 1.0)
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -830,18 +701,16 @@ def _score_finalize(
         chi2_stat = np.where(var_U_bin > 0, chi2_stat, np.nan)
 
     # --- Reference distribution → p-value ---------------------------------
-    # methylKit's logReg (R/diffMeth.R line 273):
-    #     test = ifelse(test=="F" & phi>1, "F", "Chisq")
-    # i.e. with the default test="F", logReg uses F(1, df_residual) at sites
-    # where overdispersion was detected (phi > 1) and falls back to χ²(1)
-    # where φ̂ was clamped to 1.
+    # Per-site adaptive switch: F(1, df_residual) where the dispersion phi
+    # cleared the min-dispersion floor (phi > 1, i.e. real overdispersion
+    # signal), chi²(1) where phi was clamped to 1. F handles the over-
+    # dispersed sites; chi² handles the ones where the quasi-binomial
+    # collapses to a binomial.
     df_resid = np.maximum(
         (nv_case + nv_ctrl).astype(np.float64) - 2.0,
         1.0,
     )
-    if reference == "methylkit":
-        # Per-site adaptive: F where phi_eff > 1 (i.e. real overdispersion
-        # signal made it past the floor), chi² where phi_eff is clamped to 1.
+    if reference == "adaptive":
         p_F    = sp_stats.f.sf(chi2_stat, dfn=1, dfd=df_resid)
         p_chi2 = sp_stats.chi2.sf(chi2_stat, df=1)
         pvals  = np.where(phi_eff > 1.0, p_F, p_chi2)
@@ -939,7 +808,7 @@ def _beta_binom_mom_from_welford_logit(
     )
     pvals[degenerate] = np.nan
 
-    # Compute log2 odds ratio on original scale using symmetric clamp (BIO-6)
+    # Compute log2 odds ratio on original scale using symmetric clamp
     log2_ors = _safe_log2_odds_ratio(mean_case, mean_ctrl)
     log2_ors[degenerate] = np.nan
 
@@ -999,7 +868,7 @@ def _beta_binom_mom_from_welford(
     )
     pvals[degenerate] = np.nan
 
-    # BIO-6: symmetric clamp on both group means so log2 OR cannot blow up
+    # symmetric clamp on both group means so log2 OR cannot blow up
     # to ±inf when one group is at the boundary 0 or 1.
     log2_ors = _safe_log2_odds_ratio(mean_case, mean_ctrl)
     log2_ors[degenerate] = np.nan
@@ -1024,14 +893,14 @@ def _intersect_chrom(
 ) -> pl.DataFrame:
     """Return (pos, strand) rows present in every sample for one chromosome.
 
-    FIX-5: The previous implementation joined on ["pos", "strand"].  Samples
+    The previous implementation joined on ["pos", "strand"].  Samples
     without a reference FASTA receive strand="*" while samples converted with
     a FASTA receive "+"/"-".  A mixed cohort produced an empty intersection
     with no warning.  We now join on "pos" only and resolve the strand column
     by taking the first non-"*" value seen across samples (falling back to "*"
     when all samples lack strand information).
 
-    BIO-8 (this revision): the per-sample `sites` frame is now deduplicated on
+    (this revision): the per-sample `sites` frame is now deduplicated on
     `pos` (keeping the first row) before the join.  Without this guard, a
     sample whose .cov file recorded both strands of one CpG dinucleotide
     (e.g. + at N and - at N+1 that were not merged by _merge_cpg_pairs)
@@ -1055,7 +924,7 @@ def _intersect_chrom(
                 "strand": pl.Series([], dtype=pl.Utf8),
             })
 
-        # BIO-8: dedupe on pos to prevent duplicate-row blow-up from unmerged
+        # dedupe on pos to prevent duplicate-row blow-up from unmerged
         # +/- strand pairs of a single CpG dinucleotide.
         sites = (
             pl.read_parquet(str(part_file), columns=["pos", "strand"])
@@ -1094,7 +963,7 @@ def _intersect_chrom(
             "strand": pl.Series([], dtype=pl.Utf8),
         })
 
-    # BIO-8: belt-and-braces dedupe in case a left-frame pos had multiple
+    # belt-and-braces dedupe in case a left-frame pos had multiple
     # right-frame strand variants after a join.
     return intersect.unique(subset=["pos"], keep="first").sort("pos")
 
@@ -1121,7 +990,7 @@ def _union_chrom(
         })
     return (
         pl.concat(site_dfs)
-        .unique(subset=["pos"], keep="first")  # BIO-8: dedupe on pos only
+        .unique(subset=["pos"], keep="first")  # dedupe on pos only
         .sort("pos")
     )
 
@@ -1135,7 +1004,7 @@ def _load_sample_chrom(
     """Load N_meth and coverage for ONE sample / ONE chromosome.
 
     Left-joins to canonical_pos so arrays are aligned to the same site order.
-    Missing sites are filled with 0 (BIO-4).
+    Missing sites are filled with 0 .
     """
     part_file = (
         methylstore_path / f"sample={sample}" / f"chrom={chrom}" / "part-0.parquet"
@@ -1150,7 +1019,7 @@ def _load_sample_chrom(
 
     df = (
         pl.read_parquet(str(part_file), columns=["pos", "N_meth", "coverage"])
-        # BIO-8: collapse any duplicate-pos rows by summing reads so the
+        # collapse any duplicate-pos rows by summing reads so the
         # left-join below yields exactly one row per canonical position.
         .group_by("pos")
         .agg([
@@ -1176,7 +1045,7 @@ def _process_one_chromosome(
     min_samples_case: int = 0,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "methylkit",
+    reference: str = "adaptive",
     design_full: Optional[np.ndarray] = None,
     design_reduced: Optional[np.ndarray] = None,
     coef_idx: Optional[int] = None,
@@ -1245,7 +1114,7 @@ def _process_one_chromosome(
 
     # --- Statistical test ---
     if test == "fisher":
-        # BIO-5: Fisher exact on per-group POOLED read counts.
+        # Fisher exact on per-group POOLED read counts.
         #
         # The previous "fisher"/"cmh" path pooled control reads then ran
         # one CMH stratum per case sample against the pool, producing a
@@ -1287,7 +1156,7 @@ def _process_one_chromosome(
         del meth_ctrl_sum, cov_ctrl_sum, unmeth_ctrl_sum
 
     elif test == "cmh":
-        # BIO-5: properly stratified CMH — one 2×2 stratum per
+        # properly stratified CMH — one 2×2 stratum per
         # (case_i, ctrl_j) pair, so each replicate's coverage marginal
         # enters its own variance term V. With n_case = n_ctrl = 1 this
         # degenerates to a single 2×2 table and matches Fisher; with
@@ -1332,7 +1201,7 @@ def _process_one_chromosome(
             meth, cov = _load_sample_chrom(methylstore_path, chrom, sample, canonical_pos)
             _score_update(sn_case, sm_case, sm2n_case, nv_case, meth, cov)
             # Welford accumulators are also updated so that downstream code
-            # which reads ``n_valid_case`` for the BIO-7 guard sees the
+            # which reads ``n_valid_case`` for the guard sees the
             # same per-site sample count.  ``mean_case`` from Welford is
             # overwritten below with the coverage-weighted score-test
             # equivalent, so its post-update value is irrelevant.
@@ -1660,7 +1529,7 @@ def _process_one_chromosome(
             "'welch_t', 'bb_lr', or 'glm'."
         )
 
-    # --- BIO-3: equal-weight per-replicate mean beta ---
+    # --- equal-weight per-replicate mean beta ---
     # Welford mean IS the equal-weight nanmean — no extra storage needed.
     mean_beta_case = mean_case.astype(np.float32)
     mean_beta_ctrl = mean_ctrl.astype(np.float32)
@@ -1668,7 +1537,7 @@ def _process_one_chromosome(
     mean_beta_ctrl[n_valid_ctrl == 0] = np.nan
     meth_diff = (mean_beta_case - mean_beta_ctrl).astype(np.float32)
 
-    # Wald CI on Δβ from Welford accumulators (Section 2 of Plan 2). For the
+    # Wald CI on Δβ from Welford accumulators. For the
     # multi-group joint test (k>1) the scalar Δβ is undefined, so we leave
     # CI columns as NaN and let the multi-group schema speak through
     # f_stat / df1 / df2 / mean_beta_<level>.
@@ -1686,7 +1555,7 @@ def _process_one_chromosome(
         ci_lo = np.full(n_sites, np.nan, dtype=np.float32)
         ci_hi = np.full(n_sites, np.nan, dtype=np.float32)
 
-    # BIO-7: per-site min-samples guard. Sites where fewer than
+    # per-site min-samples guard. Sites where fewer than
     # `min_samples_*` replicates contributed valid (coverage > 0) data
     # have their p-value masked to NaN. apply_multiple_testing_correction
     # passes NaNs through, so these sites are effectively excluded from
@@ -1815,7 +1684,7 @@ def process_chromosomes_dmc(
     min_samples_treatment: Optional[int] = None,
     min_samples_control: int = 0,
     dispersion: str = "site",
-    reference: str = "methylkit",
+    reference: str = "adaptive",
     design_full: Optional[np.ndarray] = None,
     design_reduced: Optional[np.ndarray] = None,
     coef_idx: Optional[int] = None,
@@ -1835,25 +1704,29 @@ def process_chromosomes_dmc(
         Path to filtered partitioned Parquet methylstore.
     samples_case, samples_control : list[str]
         Sample identifiers for case and control groups.
-    test : {"lr", "score", "fisher", "cmh", "logit_t", "beta_binomial"}
+    test : {"lr", "score", "fisher", "cmh", "logit_t", "welch_t", "bb_lr"}
         Statistical test.
             "lr"       (default) — Quasi-binomial likelihood-ratio chi-square
                                    on per-group read counts with per-site
-                                   McCullagh-Nelder dispersion. Matches
-                                   methylKit's calculateDiffMeth
-                                   (overdispersion='MN', test='Chisq').
-                                   Recommended at n >= 2.
+                                   McCullagh-Nelder dispersion. Closed-form on
+                                   the streaming accumulators (S0_g, S1_g,
+                                   Σm²/n_g). Recommended at n >= 2.
             "score"              — Pearson score statistic on the same
                                    accumulators. Marginally more powerful
                                    than "lr" but mildly anti-conservative
                                    when π̂ is near 0 or 1.
             "logit_t"            — Welch t on logit(beta), variance via
-                                   Welford. Fallback when count-model
-                                   assumptions are doubtful (e.g. very low
-                                   coverage). Not a GLM.
-            "beta_binomial"      — Welch t on raw betas. Despite the name,
-                                   not a beta-binomial GLM; superseded by
-                                   "lr". Kept for backward compatibility.
+                                   Welford. Variance-stabilising fallback
+                                   when count-model assumptions are
+                                   doubtful (e.g. very low coverage).
+            "welch_t"            — Welch t on raw betas (renamed from
+                                   "beta_binomial" — see the deprecation
+                                   warning). Same boundary-β caveat as
+                                   logit_t.
+            "bb_lr"              — True quasi-binomial LRT via a full per-
+                                   site GLM on a binary-treatment design.
+                                   Slow, but the honest "fit-the-model"
+                                   version of "welch_t".
             "cmh"                — Cochran-Mantel-Haenszel with one stratum
                                    per (case_i, ctrl_j) pair.
             "fisher"             — Fisher exact on reads pooled across
@@ -1866,24 +1739,25 @@ def process_chromosomes_dmc(
         If False, test all sites covered in at least one sample
         (union / outer join).
     min_samples_case, min_samples_control : int
-        BIO-7: per-site minimum number of replicates with non-zero coverage
+        Per-site minimum number of replicates with non-zero coverage
         required in each group. Sites failing the threshold have their
         p-value masked to NaN before FDR correction. Use this with
         ``unite=False`` (union mode) to drop tests that effectively run on
         a singleton observation in one group.
     dispersion : {"site", "chrom", "shrink"}
         McCullagh-Nelder dispersion strategy used by ``test="lr"`` and
-        ``test="score"``. Default ``"site"`` matches methylKit
-        ``overdispersion="MN"``. See :func:`_score_finalize` for details.
-        Ignored for other tests.
-    reference : {"methylkit", "chi2", "F"}
+        ``test="score"``. Default ``"site"`` estimates a per-site φ̂_i from
+        the 4-df Pearson residual sum; ``"chrom"`` pools one φ̂ across the
+        whole chromosome; ``"shrink"`` is a weighted average of the two.
+        See :func:`_score_finalize` for details. Ignored for other tests.
+    reference : {"adaptive", "chi2", "F"}
         Reference distribution for the quasi-binomial test statistic.
-        Default ``"methylkit"`` switches per-site between F(1, df) where
-        φ̂ > 1 and χ²(1) where φ̂ was clamped to 1 — exactly what
-        methylKit's ``logReg`` does (see ``R/diffMeth.R`` line 273).
-        ``"chi2"`` and ``"F"`` force a single reference distribution
-        regardless of dispersion. See :func:`_score_finalize` for details.
-        Ignored for other tests.
+        Default ``"adaptive"`` switches per-site between F(1, df) where
+        φ̂ > 1 and χ²(1) where φ̂ was clamped to 1 (the right behaviour for
+        quasi-binomial GLMs whose dispersion estimate is noisy at small
+        samples). ``"chi2"`` and ``"F"`` force a single reference
+        distribution regardless of dispersion. See :func:`_score_finalize`
+        for details. Ignored for other tests.
 
     Returns
     -------
@@ -1906,7 +1780,7 @@ def process_chromosomes_dmc(
     samples_case = samples_treatment
     min_samples_case = min_samples_treatment
 
-    # S-plan-2: canonicalise legacy test names before any branching so that
+    # canonicalise legacy test names before any branching so that
     # downstream code only ever sees the new names.
     test = _canonicalise_test_name(test)
 
@@ -2003,46 +1877,6 @@ def process_chromosomes_dmc(
         return combined
 
 
-def calculate_diff_meth_chromosome(
-    chrom_df: pl.DataFrame,
-    samples_case: list[str],
-    samples_control: list[str],
-    test: str = "logit_t",
-) -> pl.DataFrame:
-    """Legacy entry-point kept for unit-test compatibility."""
-    warnings.warn(
-        "calculate_diff_meth_chromosome is deprecated; "
-        "use process_chromosomes_dmc for production workloads.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    if len(chrom_df) == 0:
-        return pl.DataFrame(schema=_EMPTY_SCHEMA)
-
-    chroms = chrom_df["chrom"].unique().to_list()
-    if len(chroms) != 1:
-        raise ValueError(f"Expected exactly one chromosome; got {chroms}")
-    chrom = chroms[0]
-
-    with tempfile.TemporaryDirectory(prefix="epykit_legacy_") as tmpdir:
-        store       = Path(tmpdir) / "store"
-        all_samples = samples_case + samples_control
-
-        for sample in all_samples:
-            sample_df = chrom_df.filter(pl.col("sample") == sample)
-            if len(sample_df) == 0:
-                continue
-            part_dir = store / f"sample={sample}" / f"chrom={chrom}"
-            part_dir.mkdir(parents=True, exist_ok=True)
-            sample_df.write_parquet(str(part_dir / "part-0.parquet"))
-
-        canonical_df = _intersect_chrom(store, chrom, all_samples)
-        return _process_one_chromosome(
-            store, chrom, canonical_df, samples_case, samples_control, test
-        )
-
-
 def apply_multiple_testing_correction(
     dmc_results: pl.DataFrame,
     method: str = "fdr_bh",
@@ -2071,4 +1905,273 @@ def apply_multiple_testing_correction(
     return dmc_results.with_columns([
         pl.Series(qvalue_col, qvals),
         pl.Series(reject_col, reject),
+    ])
+
+
+# Empirical-Bayes shrinkage of meth_diff
+
+def shrink_meth_diff(
+    dmc_df: pl.DataFrame,
+    *,
+    se_from: str = "ci",
+    out_col: str = "meth_diff_shrunk",
+) -> pl.DataFrame:
+    """Empirical-Bayes shrinkage of per-CpG meth_diff toward zero.
+
+    Model: ``meth_diff_i ~ N(θ_i, SE_i²)`` with θ_i ~ N(0, τ²), so the
+    posterior mean is
+
+        θ̂_i^shrunk = meth_diff_i * τ² / (τ² + SE_i²)
+
+    τ² is the empirical-Bayes between-site variance estimate
+
+        τ² = max(0, Var(meth_diff) − mean(SE²)).
+
+    This is the Normal-prior special case of the ashr / apeglm family
+    (no MLE in a GLM, no Cauchy prior — but the same shrinkage
+    behaviour at the user-visible level: low-information estimates
+    collapse to 0 while well-powered effects barely move). Useful for
+    ranking and for downstream regression-on-meth_diff analyses where
+    raw low-coverage estimates inflate variance.
+
+    Parameters
+    ----------
+    dmc_df : pl.DataFrame
+        DMC output from any backend. Must carry ``meth_diff`` and a
+        source of per-site standard errors (see ``se_from``).
+    se_from : {"ci", "coef_se"}
+        How to derive SE_i.
+
+        * ``"ci"`` (default): infer SE from the 95 % Wald CI on
+          ``meth_diff`` as ``(ci_hi − ci_lo) / (2 · 1.96)``. Works on
+          every backend that emits ``meth_diff_ci_lo`` /
+          ``meth_diff_ci_hi``.
+        * ``"coef_se"``: use ``coef_se`` directly (GLM /
+          ``bb_lr`` backends). Avoids the CI-width round-trip but is
+          on the *linear-predictor* scale (logit β coefficients), so
+          the shrinkage acts on logit-Δβ rather than Δβ. Prefer ``"ci"``
+          unless you specifically want logit-scale shrinkage.
+    out_col : str
+        Name of the appended shrunk-estimate column. Default
+        ``"meth_diff_shrunk"``.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``dmc_df`` plus three new columns:
+
+        * ``out_col`` — shrunk Δβ.
+        * ``meth_diff_se`` — the SE used for shrinkage (handy for QC).
+        * ``shrinkage_factor`` — τ² / (τ² + SE²) ∈ [0, 1]; values
+          near 0 mean "shrink hard," near 1 mean "barely touched."
+    """
+    if "meth_diff" not in dmc_df.columns:
+        raise ValueError(
+            "shrink_meth_diff: dmc_df has no 'meth_diff' column."
+        )
+    if se_from == "ci":
+        for col in ("meth_diff_ci_lo", "meth_diff_ci_hi"):
+            if col not in dmc_df.columns:
+                raise ValueError(
+                    f"se_from='ci' needs '{col}' on the DMC table; "
+                    "pass se_from='coef_se' if you're using a GLM backend "
+                    "without CIs."
+                )
+        ci_lo = dmc_df.get_column("meth_diff_ci_lo").to_numpy().astype(np.float64)
+        ci_hi = dmc_df.get_column("meth_diff_ci_hi").to_numpy().astype(np.float64)
+        se = (ci_hi - ci_lo) / (2.0 * 1.959963984540054)  # ≈ 2 · z_{0.975}
+    elif se_from == "coef_se":
+        if "coef_se" not in dmc_df.columns:
+            raise ValueError(
+                "se_from='coef_se' requires the 'coef_se' column "
+                "(present on GLM / bb_lr DMC outputs)."
+            )
+        se = dmc_df.get_column("coef_se").to_numpy().astype(np.float64)
+    else:
+        raise ValueError(
+            f"se_from must be 'ci' or 'coef_se'; got {se_from!r}"
+        )
+
+    meth_diff = dmc_df.get_column("meth_diff").to_numpy().astype(np.float64)
+    finite = np.isfinite(meth_diff) & np.isfinite(se) & (se > 0)
+    if not finite.any():
+        # Nothing to shrink; return all-NaN columns so downstream code
+        # doesn't trip on missing fields.
+        n = dmc_df.height
+        return dmc_df.with_columns([
+            pl.Series(out_col, np.full(n, np.nan, dtype=np.float64)),
+            pl.Series("meth_diff_se", np.where(np.isfinite(se), se, np.nan)),
+            pl.Series("shrinkage_factor", np.full(n, np.nan, dtype=np.float64)),
+        ])
+
+    var_md = float(np.var(meth_diff[finite], ddof=1))
+    mean_se2 = float(np.mean(se[finite] ** 2))
+    tau2 = max(0.0, var_md - mean_se2)
+    # Numerical floor: if every effect has zero variance after subtracting
+    # mean sampling variance, every effect collapses to 0. That's the
+    # correct EB answer (no signal between sites means everything is noise).
+
+    shrink_factor = np.full_like(meth_diff, np.nan, dtype=np.float64)
+    shrunk = np.full_like(meth_diff, np.nan, dtype=np.float64)
+    if tau2 == 0.0:
+        shrink_factor[finite] = 0.0
+        shrunk[finite] = 0.0
+    else:
+        denom = tau2 + se[finite] ** 2
+        shrink_factor[finite] = tau2 / denom
+        shrunk[finite] = meth_diff[finite] * shrink_factor[finite]
+
+    return dmc_df.with_columns([
+        pl.Series(out_col, shrunk),
+        pl.Series("meth_diff_se", np.where(np.isfinite(se), se, np.nan)),
+        pl.Series("shrinkage_factor", shrink_factor),
+    ])
+
+
+# Permutation-based empirical FDR for DMC
+
+def empirical_fdr_for_dmc(
+    methylstore_path: str,
+    samples_treatment: list[str],
+    samples_control: list[str],
+    observed_dmc: pl.DataFrame,
+    *,
+    n_perm: int = 100,
+    seed: int = 42,
+    n_jobs: int = 1,
+    **dmc_kwargs,
+) -> pl.DataFrame:
+    """Empirical (permutation) FDR for per-CpG DMC results.
+
+    Re-runs :func:`process_chromosomes_dmc` ``n_perm`` times with the
+    treatment / control sample labels shuffled. For each observed CpG, the
+    empirical p-value is estimated from the fraction of null DMCs (across
+    all permutations and all sites) with raw p-value <= the observed raw
+    p-value. The result is BH-adjusted to ``empirical_qvalue``.
+
+    Parallels :func:`epykit.dmr.empirical_fdr_for_dmr`; same caveats apply:
+
+    * The shuffler ignores any structure in ``md.obs`` (donor, batch).
+      Covariate-adjusted DMC (``formula=`` / ``contrast=`` in
+      :func:`tl.dmc`) refuses to call this — label shuffling invalidates
+      the stratified design.
+    * Computational cost is roughly n_perm × (cost of one DMC run); on a
+      whole-genome WGBS analysis this is the dominant runtime. Use a
+      smaller ``n_perm`` (e.g. 50) or fewer chromosomes during exploration.
+
+    Parameters
+    ----------
+    methylstore_path, samples_treatment, samples_control
+        Same arguments forwarded to :func:`process_chromosomes_dmc`.
+    observed_dmc
+        DMC DataFrame returned by the observed (unpermuted) run. Must
+        carry a ``pvalue`` column. Empirical columns are appended to a
+        copy of this frame.
+    n_perm
+        Number of permutations. Default 100.
+    seed
+        Seed for the per-permutation label shuffler.
+    n_jobs
+        joblib parallel worker count. -1 uses all cores. Falls back to
+        serial execution when joblib is not installed. Default 1.
+    **dmc_kwargs
+        Forwarded to :func:`process_chromosomes_dmc` for each permutation;
+        should match the observed run's settings (test, chromosomes,
+        unite, min_samples_*, dispersion, reference).
+
+    Returns
+    -------
+    pl.DataFrame
+        ``observed_dmc`` with added columns ``empirical_pvalue`` and
+        ``empirical_qvalue``.
+    """
+    if len(observed_dmc) == 0:
+        return observed_dmc.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias("empirical_pvalue"),
+            pl.lit(None, dtype=pl.Float64).alias("empirical_qvalue"),
+        ])
+    if "pvalue" not in observed_dmc.columns:
+        raise ValueError(
+            "observed_dmc has no 'pvalue' column; empirical FDR needs raw "
+            "p-values to compute null tail probabilities."
+        )
+
+    n_treat = len(samples_treatment)
+    pool = list(samples_treatment) + list(samples_control)
+
+    def _run_one_perm(perm_idx: int) -> np.ndarray:
+        # Local RNG so parallel workers stay deterministic across n_jobs.
+        local_rng = np.random.default_rng(seed + perm_idx + 1)
+        shuffled = pool.copy()
+        local_rng.shuffle(shuffled)
+        perm_treat = shuffled[:n_treat]
+        perm_ctrl = shuffled[n_treat:]
+        kwargs = dict(dmc_kwargs)
+        # Strip deprecated aliases so they don't double-bind.
+        kwargs.pop("samples_case", None)
+        kwargs.pop("min_samples_case", None)
+        try:
+            null_df = process_chromosomes_dmc(
+                methylstore_path=methylstore_path,
+                samples_treatment=perm_treat,
+                samples_control=perm_ctrl,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.warning("DMC permutation %d failed: %s", perm_idx, exc)
+            return np.array([], dtype=np.float64)
+        if "pvalue" not in null_df.columns or len(null_df) == 0:
+            return np.array([], dtype=np.float64)
+        return null_df.get_column("pvalue").drop_nulls().to_numpy()
+
+    null_pvals_list: list[np.ndarray]
+    if n_jobs == 1:
+        null_pvals_list = [_run_one_perm(i) for i in range(n_perm)]
+    else:
+        try:
+            from joblib import Parallel, delayed
+            null_pvals_list = Parallel(n_jobs=n_jobs)(
+                delayed(_run_one_perm)(i) for i in range(n_perm)
+            )
+        except ImportError:
+            logger.warning(
+                "joblib not installed; running DMC permutations serially."
+            )
+            null_pvals_list = [_run_one_perm(i) for i in range(n_perm)]
+
+    if all(len(arr) == 0 for arr in null_pvals_list):
+        logger.warning(
+            "All %d DMC permutations produced zero null sites. Empirical "
+            "p-values default to 1 / (1 + n_perm).",
+            n_perm,
+        )
+    null_pool = (
+        np.concatenate(null_pvals_list)
+        if any(len(a) for a in null_pvals_list)
+        else np.array([1.0])
+    )
+    null_sorted = np.sort(null_pool)
+    obs_p = observed_dmc.get_column("pvalue").to_numpy()
+    # For each observed p, count null sites with raw pvalue <= obs_p.
+    # +1 in num/den is the standard correction so empirical p never
+    # collapses to 0 at finite n_perm. NaN observed p-values map to NaN
+    # empirical p so degenerate sites stay degenerate.
+    obs_finite_mask = np.isfinite(obs_p)
+    obs_safe = np.where(obs_finite_mask, obs_p, 1.0)
+    counts = np.searchsorted(null_sorted, obs_safe, side="right")
+    total_null = max(len(null_sorted), 1)
+    emp_p = (counts + 1.0) / (total_null + 1.0)
+    emp_p = np.clip(emp_p, 0.0, 1.0)
+    emp_p = np.where(obs_finite_mask, emp_p, np.nan)
+
+    from statsmodels.stats.multitest import multipletests
+    finite = np.isfinite(emp_p)
+    emp_q = np.full_like(emp_p, np.nan, dtype=np.float64)
+    if finite.any():
+        _, q_finite, _, _ = multipletests(emp_p[finite], method="fdr_bh")
+        emp_q[finite] = q_finite
+
+    return observed_dmc.with_columns([
+        pl.Series("empirical_pvalue", emp_p),
+        pl.Series("empirical_qvalue", emp_q),
     ])

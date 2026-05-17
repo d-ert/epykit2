@@ -315,33 +315,3 @@ def test_irls_batched_solves_multiple_sites_independently():
 
 
 
-# beta_binomial_test public API
-
-
-def test_beta_binomial_mom_returns_finite_pvalues_for_realistic_data():
-    """The MoM path should run and return p-values in [0, 1] on a small
-    sample-balanced dataset.
-
-    Signature reminder: ``beta_binomial_test`` expects
-    ``meth_counts.shape == (n_sites, n_replicates)`` and an integer
-    ``group_labels`` array (1=case, 0=control) of length n_replicates.
-    """
-    from epykit.dmc import beta_binomial_test
-
-    rng = np.random.default_rng(0)
-    n_sites = 20
-    n_reps = 8  # 4 case + 4 control
-
-    cov = rng.integers(10, 30, size=(n_sites, n_reps)).astype(np.int64)
-    pi_case = 0.5  # hyper-methylated half of the sites
-    pi_ctrl = 0.3
-    # All sites get the same case/ctrl betas here — just exercising the API.
-    meth_case = rng.binomial(cov[:, :4], pi_case).astype(np.int64)
-    meth_ctrl = rng.binomial(cov[:, 4:], pi_ctrl).astype(np.int64)
-    meth = np.concatenate([meth_case, meth_ctrl], axis=1)
-    labels = np.array([1, 1, 1, 1, 0, 0, 0, 0], dtype=np.int32)
-
-    pvals, _ = beta_binomial_test(meth, cov, labels, method="mom")
-    finite = np.isfinite(pvals)
-    assert finite.sum() >= n_sites // 2
-    assert ((pvals[finite] >= 0) & (pvals[finite] <= 1)).all()

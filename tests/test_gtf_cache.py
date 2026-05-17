@@ -1,4 +1,4 @@
-"""LRU bound on the GTF parse cache (S7).
+"""LRU bound on the GTF parse cache.
 
 The cache must:
 1. Re-use parsed GTFs when keyed by the same canonical path (hit).

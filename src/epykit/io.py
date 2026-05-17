@@ -24,29 +24,16 @@ def _count_store_rows(store_dir: str) -> int | None:
         return None
 
 
-def read_bismark(
+def _build_obs_from_samplesheet(
     samplesheet: str,
-    treatment_group: str | None = None,
-    control_group: str | None = None,
-    assembly: str = "unknown",
-    store_dir: str = "methyl_store",
-    context: str = "CpG",
-    reference_fasta: str | None = None,
-    groups: list[str] | None = None,
-) -> MethylData:
-    """Read a samplesheet and create a MethylData analysis object.
+    treatment_group: str | None,
+    control_group: str | None,
+    groups: list[str] | None,
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Parse the samplesheet CSV into obs rows and (path, sample_id) pairs.
 
-    Expected samplesheet columns: sample_id, group, path
-
-    Two operating modes:
-
-    * Binary (legacy, default): pass ``treatment_group`` and
-      ``control_group``. Only those two groups are kept; ``obs.treatment``
-      is set to 1 for treatment-group samples and 0 for control.
-    * Multi-group (Plan 2): pass ``groups=[g1, g2, ...]`` to load any
-      subset of groups. ``obs.treatment`` is added only if
-      ``treatment_group`` is also supplied; otherwise the column is
-      omitted and downstream code falls back to formula-based contrasts.
+    Shared by every read_* entry point so format-specific code can focus
+    on the conversion step.
     """
     with open(samplesheet) as handle:
         rows = list(csv.DictReader(handle))
@@ -92,11 +79,29 @@ def read_bismark(
             "No samples matched the requested groups from samplesheet. "
             f"groups={sorted(allowed)}"
         )
+    return obs_rows, files
 
-    # Organize stores under a .cache subdirectory for a cleaner output layout
+
+def _read_methylation_samplesheet(
+    samplesheet: str,
+    *,
+    pipeline: str,
+    source_format: str,
+    treatment_group: str | None,
+    control_group: str | None,
+    groups: list[str] | None,
+    assembly: str,
+    store_dir: str,
+    context: str,
+    reference_fasta: str | None,
+) -> MethylData:
+    """Backend shared by ``read_bismark`` and ``read_methyldackel``."""
+    obs_rows, files = _build_obs_from_samplesheet(
+        samplesheet, treatment_group, control_group, groups,
+    )
+
     analysis_root = Path(store_dir)
     cache_store_dir = str(analysis_root / ".cache" / "raw")
-    
     Path(cache_store_dir).mkdir(parents=True, exist_ok=True)
     for path, sample_id in files:
         converted = ensure_converted_sample(
@@ -105,14 +110,16 @@ def read_bismark(
             cache_store_dir,
             context=context,
             reference_fasta=reference_fasta,
+            format=source_format,
         )
         status = "converted" if converted else "cached"
         logger.info("  %s: %s", sample_id, status)
 
     n_sites_raw = _count_store_rows(cache_store_dir)
-    uns = {
+    uns: dict = {
         "samplesheet": samplesheet,
-        "pipeline": "bismark",
+        "pipeline": pipeline,
+        "source_format": source_format,
         "epykit_version": "0.1.0",
     }
     if n_sites_raw is not None:
@@ -130,6 +137,79 @@ def read_bismark(
     )
     md._analysis_root = str(analysis_root)
     return md
+
+
+def read_bismark(
+    samplesheet: str,
+    treatment_group: str | None = None,
+    control_group: str | None = None,
+    assembly: str = "unknown",
+    store_dir: str = "methyl_store",
+    context: str = "CpG",
+    reference_fasta: str | None = None,
+    groups: list[str] | None = None,
+) -> MethylData:
+    """Read a samplesheet of Bismark ``.cov[.gz]`` files into a MethylData.
+
+    Expected samplesheet columns: sample_id, group, path
+
+    Two operating modes:
+
+    * Binary (legacy, default): pass ``treatment_group`` and
+      ``control_group``. Only those two groups are kept; ``obs.treatment``
+      is set to 1 for treatment-group samples and 0 for control.
+    * Multi-group : pass ``groups=[g1, g2, ...]`` to load any
+      subset of groups. ``obs.treatment`` is added only if
+      ``treatment_group`` is also supplied; otherwise the column is
+      omitted and downstream code falls back to formula-based contrasts.
+    """
+    return _read_methylation_samplesheet(
+        samplesheet,
+        pipeline="bismark",
+        source_format="bismark",
+        treatment_group=treatment_group,
+        control_group=control_group,
+        groups=groups,
+        assembly=assembly,
+        store_dir=store_dir,
+        context=context,
+        reference_fasta=reference_fasta,
+    )
+
+
+def read_methyldackel(
+    samplesheet: str,
+    treatment_group: str | None = None,
+    control_group: str | None = None,
+    assembly: str = "unknown",
+    store_dir: str = "methyl_store",
+    context: str = "CpG",
+    reference_fasta: str | None = None,
+    groups: list[str] | None = None,
+) -> MethylData:
+    """Read a samplesheet of MethylDackel ``.bedGraph[.gz]`` files into a
+    MethylData.
+
+    MethylDackel's ``extract`` output uses the same 6-column layout as
+    Bismark ``.cov`` (``chrom, start, end, percent, M, U``) with one
+    ``track`` header line at the top; that header is skipped automatically.
+
+    Parameters are identical to :func:`read_bismark`; ``path`` entries in
+    the samplesheet point at MethylDackel ``.bedGraph[.gz]`` files instead
+    of Bismark ``.cov[.gz]``.
+    """
+    return _read_methylation_samplesheet(
+        samplesheet,
+        pipeline="methyldackel",
+        source_format="methyldackel",
+        treatment_group=treatment_group,
+        control_group=control_group,
+        groups=groups,
+        assembly=assembly,
+        store_dir=store_dir,
+        context=context,
+        reference_fasta=reference_fasta,
+    )
 
 
 def load(path: str) -> MethylData:

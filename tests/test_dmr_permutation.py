@@ -1,4 +1,4 @@
-"""Plan 2 §3: permutation-based empirical FDR for DMR."""
+"""permutation-based empirical FDR for DMR."""
 
 from __future__ import annotations
 

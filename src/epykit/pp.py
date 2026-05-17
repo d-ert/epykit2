@@ -78,7 +78,7 @@ def filter_coverage(
 
 
 def normalize_coverage(md: MethylData, method: str = "median") -> None:
-    """methylKit-parity coverage normalisation, in-place on a MethylData.
+    """Per-sample coverage normalisation, in-place on a MethylData.
 
     Computes a per-sample scaling factor so that each sample's central
     coverage statistic (median by default, or mean) matches a common
@@ -89,9 +89,8 @@ def normalize_coverage(md: MethylData, method: str = "median") -> None:
     This prevents deeper-sequenced samples from dominating pooled-count
     tile / region tests downstream. The per-CpG score test in
     ``ep.tl.dmc`` is much less sensitive to coverage imbalance, but
-    ``ep.tl.dmr(method='tile')`` is — methylKit's reference pipeline
-    inserts ``normalizeCoverage`` between ``filterByCoverage`` and
-    ``tileMethylCounts`` for exactly this reason.
+    ``ep.tl.dmr(method='tile')`` is — running normalisation between
+    coverage filtering and tile aggregation removes that bias.
 
     Call order: ``filter_coverage`` → ``normalize_coverage`` → ``unite``.
 
@@ -100,8 +99,8 @@ def normalize_coverage(md: MethylData, method: str = "median") -> None:
     md : MethylData
         Object whose store has been ``filter_coverage``'d.
     method : {"median", "mean"}
-        Central statistic to align. ``"median"`` matches methylKit's
-        default and is robust to extreme-coverage tails.
+        Central statistic to align. ``"median"`` is the robust default
+        — robust to extreme-coverage tails.
 
     Raises
     ------
@@ -225,11 +224,10 @@ def aggregate_regions(
 ) -> None:
     """Aggregate per-CpG methylation counts within user-supplied BED regions.
 
-    This is the methylKit ``regionCounts`` analogue. After this call,
-    ``md.store`` points at a new partitioned Parquet store whose rows are
-    *regions* rather than CpGs, but with a schema compatible with the rest
-    of the pipeline so ``ep.tl.dmc(md)`` runs unchanged. Each region row
-    carries:
+    After this call, ``md.store`` points at a new partitioned Parquet
+    store whose rows are *regions* rather than CpGs, but with a schema
+    compatible with the rest of the pipeline so ``ep.tl.dmc(md)`` runs
+    unchanged. Each region row carries:
 
     * ``chrom``, ``pos`` (region midpoint, Int32), ``strand`` ("*")
     * ``context`` (inherited from md.context)
@@ -440,7 +438,7 @@ def smooth(
     Raises
     ------
     ValueError
-        If called before ``ep.pp.filter_coverage`` (FIX-10).
+        If called before ``ep.pp.filter_coverage`` .
 
     Notes
     -----
@@ -448,7 +446,7 @@ def smooth(
     Currently these are not used by ``ep.tl.dmr()``, but can be accessed
     via the Parquet store for custom downstream analysis.
     """
-    # FIX-10: smoothing on unfiltered data silently degrades results.
+    # smoothing on unfiltered data silently degrades results.
     if not md._filtered:
         raise ValueError(
             "Run ep.pp.filter_coverage(md) before ep.pp.smooth(md)."

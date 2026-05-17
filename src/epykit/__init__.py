@@ -4,17 +4,18 @@ This package provides a complete WGBS analysis pipeline:
 
   - convert:   Bismark .cov → partitioned Parquet methylstore
   - filter:    QC / coverage filtering / site intersection
-  - dmc:       Differential methylation calling per CpG (lr is the default,
-               matching methylKit overdispersion="MN" test="Chisq"; other
-               backends: score, glm, logit_t, beta_binomial, cmh, fisher)
+  - dmc:       Differential methylation calling per CpG. Default test is
+               ``lr`` (quasi-binomial likelihood-ratio with McCullagh-
+               Nelder dispersion). Other backends: score, glm, logit_t,
+               welch_t, bb_lr, cmh, fisher.
   - dmr:       DMR calling (tile-based default, sliding-window legacy) and
-               BSmooth-style Gaussian smoothing
+               Gaussian-kernel methylation smoothing
   - annotate:  Gene-feature and CpG-island context annotation
   - qc:        Bisulfite conversion rate, global methylation, coverage
-               uniformity
+               uniformity, plus opt-in clinical / cohort checks
 
-Logging convention (S3)
------------------------
+Logging convention
+------------------
 Library modules (everything under ``epykit.*`` except ``epykit.cli``) emit
 progress and diagnostics through the standard :mod:`logging` module via
 ``logger = logging.getLogger(__name__)`` — they never call :func:`print`.
@@ -34,21 +35,20 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 from .methyldata import MethylData
-from .io import read_bismark, read_nfcore_methylseq, load
+from .io import read_bismark, read_methyldackel, read_nfcore_methylseq, load
 from . import pp, tl, pl
 
 from .convert import convert_sample
 from .dmc import (
     process_chromosomes_dmc,
-    calculate_diff_meth_chromosome,
     apply_multiple_testing_correction,
+    empirical_fdr_for_dmc,
     fisher_exact_vectorized,
-    beta_binomial_test,
+    shrink_meth_diff,
 )
 from .dmr import (
     call_dmr_sliding_window,
     smooth_methylation_gaussian,
-    smooth_methylation_bsmooth,  # deprecated alias; see dmr.py
 )
 from .annotate import (
     annotate_features,
@@ -69,7 +69,9 @@ from .methylkit_io import to_methylkit_tabix
 from .multiqc_export import report_multiqc
 from .nfcore_qc import read_nfcore_methylseq_qc
 from .report import generate_report
-from .dvc import process_chromosomes_dvc
+from .dvc import process_chromosomes_dvc, call_dvr_density  # noqa: F401
+from .impute import impute_knn_beta, impute_knn_anndata
+from .clocks import age_clock, deconvolve
 from .qc import (
     sex_check,
     contamination_estimate,
@@ -83,22 +85,29 @@ __all__ = [
     # data object
     "MethylData",
     # I/O
-    "read_bismark", "read_nfcore_methylseq", "load",
+    "read_bismark", "read_methyldackel", "read_nfcore_methylseq", "load",
     # namespaces (scanpy-style)
     "pp", "tl", "pl",
     # ingestion
     "convert_sample",
     # DMC engines (advanced users; tl.dmc is the recommended entry)
     "process_chromosomes_dmc",
-    "calculate_diff_meth_chromosome",
     "apply_multiple_testing_correction",
+    "empirical_fdr_for_dmc",
     "fisher_exact_vectorized",
-    "beta_binomial_test",
+    "shrink_meth_diff",
     # DMR engines
     "call_dmr_sliding_window",
     "smooth_methylation_gaussian",
-    # DVC engine (Plan 2 §4)
+    # DVC / DVR engines
     "process_chromosomes_dvc",
+    "call_dvr_density",
+    # Imputation
+    "impute_knn_beta",
+    "impute_knn_anndata",
+    # Clocks / deconvolution
+    "age_clock",
+    "deconvolve",
     # annotation
     "annotate_features",
     "annotate_cpg_islands",

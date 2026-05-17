@@ -2,18 +2,13 @@
 
 Default DMC test is ``lr`` everywhere (CLI, Python API, docstrings) — the
 quasi-binomial likelihood-ratio chi-square with per-site McCullagh-Nelder
-dispersion. This matches methylKit's ``calculateDiffMeth(overdispersion="MN",
-test="Chisq")`` and is the recommended path at n >= 2 replicates per group.
-
-Historical note: earlier development iterations defaulted to ``fisher`` (n<6
-pooled), then briefly to ``logit_t``, then to ``score``. ``lr`` is now the
-single canonical default; the other engines (``score``, ``logit_t``, ``glm``,
-``beta_binomial``, ``cmh``, ``fisher``) remain available via ``--test``.
+dispersion. Closed-form on streaming (S0_g, S1_g, Σm²/n_g) accumulators,
+recommended at n >= 2 replicates per group.
 
 CLI surface:
-* ``dmc`` — per-CpG calling with ``--test {lr,score,glm,logit_t,beta_binomial,
-  cmh,fisher}``, ``--min-samples-treatment`` / ``--min-samples-control`` filters
-  (the older ``--min-samples-case`` is accepted as a deprecated alias, S9),
+* ``dmc`` — per-CpG calling with ``--test {lr,score,glm,logit_t,welch_t,
+  bb_lr,cmh,fisher}``, ``--min-samples-treatment`` / ``--min-samples-control``
+  filters (the older ``--min-samples-case`` is accepted as a deprecated alias),
   and ``--allow-n1`` to opt into the (anti-conservative) Fisher fallback when
   there are fewer than 2 replicates per group.
 * ``dmr`` — ``--method {tile,sliding_window}``. The tile path takes a
@@ -35,7 +30,7 @@ def _add_min_samples_args(p: argparse.ArgumentParser, scope_help_prefix: str = "
 
     The legacy ``--min-samples-case`` is parsed into a separate hidden
     attribute and resolved post-parse by :func:`_resolve_min_samples_case`
-    with a DeprecationWarning (S9).
+    with a DeprecationWarning.
     """
     p.add_argument(
         "--min-samples-treatment", type=int, default=0,
@@ -43,7 +38,7 @@ def _add_min_samples_args(p: argparse.ArgumentParser, scope_help_prefix: str = "
         help=(
             f"{scope_help_prefix}Per-site minimum number of treatment samples "
             f"with non-zero coverage. Sites failing the threshold are NaN'd "
-            f"before FDR. Useful with --no-unite (BIO-7)."
+            f"before FDR. Useful with --no-unite ."
         ),
     )
     p.add_argument(
@@ -111,7 +106,8 @@ def _cmd_convert(args: argparse.Namespace):
         args.output_dir,
         context=args.context,
         reference_fasta=args.reference_fasta,
-        merge_strands=args.merge_cpg,  # FIX-9: CLI flag is --merge-cpg; param is merge_strands
+        merge_strands=args.merge_cpg,  # CLI flag is --merge-cpg; param is merge_strands
+        format=args.format,
     )
 
 
@@ -135,7 +131,7 @@ def _cmd_sample_summary(args: argparse.Namespace):
 
 
 def _cli_n1_and_footgun_checks(args, unit: str = "sites") -> None:
-    """Mirror tl.* guards on the CLI side (B6 + B8)."""
+    """Mirror tl.* guards on the CLI side."""
     treatment_samples, control_samples = args._samples  # set by caller
     if min(len(treatment_samples), len(control_samples)) < 2 and not args.allow_n1:
         raise SystemExit(
@@ -162,7 +158,7 @@ def _cmd_dmc(args: argparse.Namespace):
     """Handler for 'dmc' subcommand."""
     _resolve_min_samples_case(args)
 
-    # Plan 2 §1: formula/contrast path uses ALL samples from the
+    # formula/contrast path uses ALL samples from the
     # samplesheet rather than binary case/control. We build a tiny
     # MethylData on the fly so tl.dmc can resolve the contrast against
     # md.obs.
@@ -239,7 +235,7 @@ def _cmd_dmr(args: argparse.Namespace):
     from .dmr import call_dmr_sliding_window, call_dmr_tile_based
 
     if args.method == "tile":
-        # --- BIO-5: tile-based path. Needs methylstore + samplesheet. ---
+        # --- tile-based path. Needs methylstore + samplesheet. ---
         if not args.methylstore or not args.samplesheet:
             raise ValueError(
                 "method=tile requires --methylstore, --samplesheet, "
@@ -480,8 +476,13 @@ def main():
                 # Detached / non-text stream; nothing to do.
                 pass
 
+    from . import __version__
+
     ap  = argparse.ArgumentParser(
         prog="epykit", description="Methylation Parquet store tools"
+    )
+    ap.add_argument(
+        "--version", action="version", version=f"epykit {__version__}",
     )
     ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="Increase logging verbosity (-v: DEBUG)")
@@ -490,10 +491,23 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # convert
-    p_conv = sub.add_parser("convert", help="Convert a Bismark .cov file to Parquet")
+    p_conv = sub.add_parser(
+        "convert",
+        help="Convert a Bismark .cov or MethylDackel .bedGraph file to Parquet",
+    )
     p_conv.add_argument("--input",        required=True)
     p_conv.add_argument("--sample-id",    required=True)
     p_conv.add_argument("--output-dir",   required=True)
+    p_conv.add_argument(
+        "--format", choices=["bismark", "methyldackel"], default="bismark",
+        help=(
+            "Source file format. 'bismark' (default) for .cov[.gz] files "
+            "produced by bismark_methylation_extractor / bismark2bedGraph. "
+            "'methyldackel' for .bedGraph[.gz] files produced by "
+            "MethylDackel extract — same 6-column layout, with the leading "
+            "track header skipped automatically."
+        ),
+    )
     p_conv.add_argument(
         "--context", choices=["CpG", "CHG", "CHH"], default="CpG",
     )
@@ -538,9 +552,8 @@ def main():
         help=(
             "Statistical test (default: lr). "
             "lr — Quasi-binomial likelihood-ratio chi-square with per-site "
-            "McCullagh-Nelder dispersion. Matches methylKit's "
-            "calculateDiffMeth(overdispersion='MN', test='Chisq'). "
-            "Recommended default at n>=2. "
+            "McCullagh-Nelder dispersion. Closed-form on streaming "
+            "accumulators; recommended default at n>=2. "
             "score — Quasi-binomial score test on the same dispersion-corrected "
             "accumulators as lr; marginally more powerful but mildly "
             "anti-conservative at the boundaries. "
@@ -559,14 +572,14 @@ def main():
     p_dmc.add_argument(
         "--formula", default=None,
         help=(
-            "Plan 2 §1: patsy formula on md.obs columns (e.g. '~ group'). "
+            "patsy formula on md.obs columns (e.g. '~ group'). "
             "Triggers the GLM-contrast path; pair with --contrast."
         ),
     )
     p_dmc.add_argument(
         "--contrast", default=None,
         help=(
-            "Plan 2 §1: contrast specification. Either a single column "
+            "contrast specification. Either a single column "
             "name (continuous covariate primary effect), a factor name "
             "for a joint F-test (e.g. 'group'), or a patsy linear "
             "combination ('group[T.KO] - group[T.WT]')."
@@ -599,7 +612,7 @@ def main():
         default="tile",
         help=(
             "DMR algorithm. "
-            "'tile' (default, methylKit parity, BIO-5) pools reads across "
+            "'tile' (default) pools reads across "
             "CpGs within each fixed-size tile and runs one test per tile. "
             "'sliding_window' takes a precomputed DMC parquet and combines "
             "per-CpG p-values with signed Stouffer's Z (legacy)."
@@ -617,7 +630,7 @@ def main():
     p_dmr.add_argument("--control-group",
                        help="(tile only) Group label for control samples.")
     p_dmr.add_argument("--tile-size-bp",       type=int,   default=1000,
-                       help="(tile only) Tile width in bp. Default 1000 (methylKit default).")
+                       help="(tile only) Tile width in bp. Default 1000.")
     p_dmr.add_argument("--min-cpgs-per-tile",  type=int,   default=5,
                        help="(tile only) Minimum CpGs per tile per sample.")
     p_dmr.add_argument(
@@ -629,11 +642,11 @@ def main():
         ],
         default="lr",
         help="(tile only) Statistical test applied to tile-level counts. "
-             "Default 'lr' matches methylKit overdispersion='MN' test='Chisq'.",
+             "Default 'lr': quasi-binomial LR with McCullagh-Nelder dispersion.",
     )
     p_dmr.add_argument(
         "--empirical-fdr", action="store_true", default=False,
-        help="(tile only) Plan 2 §3: permutation-based empirical FDR.",
+        help="(tile only) permutation-based empirical FDR.",
     )
     p_dmr.add_argument(
         "--n-perm", type=int, default=100,
@@ -742,7 +755,7 @@ def main():
     # aggregate-regions
     p_agg = sub.add_parser(
         "aggregate-regions",
-        help="Aggregate CpG counts to user-supplied BED regions (methylKit regionCounts)",
+        help="Aggregate CpG counts to user-supplied BED regions",
     )
     p_agg.add_argument("--md", required=True,
                        help="Path to a directory previously written with md.save(...)")

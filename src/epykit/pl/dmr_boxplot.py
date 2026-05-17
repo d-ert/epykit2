@@ -1,9 +1,9 @@
-"""Per-sample β strip-plot panels for the top DMRs (Plan 2 §6 + report).
+"""Per-sample β strip-plot panels for the top DMRs.
 
-Closes the loop on Plan 1's out-of-scope follow-up: for each of the top
-``n`` DMRs (ranked by qvalue, pvalue, or any column on the DMR table),
-this function queries the per-sample β within the DMR's coordinates and
-renders a strip/box plot grouped by ``md.obs[group_by]``.
+For each of the top ``n`` DMRs (ranked by qvalue, pvalue, or any column
+on the DMR table), this function queries the per-sample β within the
+DMR's coordinates and renders a strip/box plot grouped by
+``md.obs[group_by]``.
 """
 
 from __future__ import annotations

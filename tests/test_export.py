@@ -68,8 +68,14 @@ def test_dmrs_to_bed(synth_md_filtered, tmp_path):
     ep.tl.dmr(synth_md_filtered, method="tile", tile_size_bp=500, min_cpgs_per_tile=3,
               min_mean_qvalue=1.0)
     out = tmp_path / "dmrs.bed"
-    if synth_md_filtered.uns.get("dmr") is None or len(synth_md_filtered.uns["dmr"]) == 0:
-        pytest.skip("no DMRs called on synthetic fixture")
+    dmr_df = synth_md_filtered.uns.get("dmr")
+    # With min_mean_qvalue=1.0 (no q-cut) on the calibrated fixture we
+    # expect a non-trivial DMR table; if this is empty something upstream
+    # regressed (covered by test_accuracy.test_dmr_tile_recovers_seeded_regions).
+    assert dmr_df is not None and len(dmr_df) > 0, (
+        "tile DMR returned 0 rows even with min_mean_qvalue=1.0 — "
+        "BED export test cannot run; investigate the DMR engine."
+    )
     synth_md_filtered.dmrs_to_bed(str(out))
     lines = [ln for ln in out.read_text(encoding="utf-8").splitlines()
              if ln and not ln.startswith("track")]

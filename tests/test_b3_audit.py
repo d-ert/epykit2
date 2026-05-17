@@ -209,8 +209,15 @@ def test_b3_2_logit_t_detects_signal_at_moderate_boundary_beta(tmp_path):
             "N_unmeth": (coverage - N_meth).astype(np.int64),
         })
         cov_path = cov_dir / f"{sid}.bismark.cov.gz"
-        with gzip.open(cov_path, "wt") as fh:
-            df.to_csv(fh, sep="\t", header=False, index=False, float_format="%.4f")
+        # newline="" + lineterminator="\n" matches tests/fixtures/synth.py;
+        # without these, Windows produces \r\r\n line endings that polars
+        # refuses to parse (gzip's text wrapper translates \n → os.linesep
+        # *and* pandas writes \r\n on Windows by default).
+        with gzip.open(cov_path, "wt", newline="") as fh:
+            df.to_csv(
+                fh, sep="\t", header=False, index=False,
+                float_format="%.4f", lineterminator="\n",
+            )
         rows.append({"sample_id": sid, "group": group, "path": str(cov_path)})
 
     samplesheet = out_dir / "samplesheet.csv"

@@ -1,4 +1,4 @@
-"""Plan 2 §6: visualization pack smoke tests."""
+"""visualization pack smoke tests."""
 
 from __future__ import annotations
 

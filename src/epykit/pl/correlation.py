@@ -1,4 +1,4 @@
-"""Clustered sample correlation heatmap (Plan 2 §6)."""
+"""Clustered sample correlation heatmap ."""
 
 from __future__ import annotations
 

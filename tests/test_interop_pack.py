@@ -1,4 +1,4 @@
-"""Plan 2 §7: ecosystem interop pack — MuData / methylKit / MultiQC / nf-core."""
+"""ecosystem interop pack — MuData / methylKit / MultiQC / nf-core."""
 
 from __future__ import annotations
 
