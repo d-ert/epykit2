@@ -6,7 +6,7 @@ Sites are flagged DVC when:
     q_variance < alpha   AND   p_mean   > mean_filter_alpha
 
 i.e. the between-group variance differs significantly while the means do
-not — the signature of an outlier-driven shift in variability (common in
+not -- the signature of an outlier-driven shift in variability (common in
 cancer / aging methylomes) rather than a simple mean shift.
 
 Memory and I/O follow the same per-chromosome streaming layout as
@@ -253,7 +253,7 @@ def process_chromosomes_dvc(
     ])
 
 
-# Differentially Variable Regions (DVR) — density-based aggregation
+# Differentially Variable Regions (DVR) -- density-based aggregation
 
 def call_dvr_density(
     dvc_df: pl.DataFrame,
@@ -273,8 +273,8 @@ def call_dvr_density(
     interpretable test statistic:
 
       H0: DVCs distribute uniformly across CpGs at rate
-          p₀ = total_DVCs / total_CpGs.
-      Per-tile test: Binomial(n=n_cpgs_in_tile, p=p₀); call is the
+          p_0 = total_DVCs / total_CpGs.
+      Per-tile test: Binomial(n=n_cpgs_in_tile, p=p_0); call is the
           number of DVCs in the tile; one-sided enrichment p-value.
 
     The tile direction (``dvr_type``) is the majority sign of
@@ -298,7 +298,7 @@ def call_dvr_density(
     pl.DataFrame
         Columns: ``chrom``, ``start``, ``end``, ``n_cpgs``, ``n_dvc``,
         ``frac_dvc``, ``pvalue``, ``qvalue``, ``mean_var_log_ratio``,
-        ``dvr_type`` ∈ {var_up, var_down, mixed}, ``is_dvr``.
+        ``dvr_type``  in  {var_up, var_down, mixed}, ``is_dvr``.
     """
     needed = {"chrom", "pos", "var_log_ratio", "is_dvc"}
     missing = needed - set(dvc_df.columns)
@@ -325,7 +325,7 @@ def call_dvr_density(
     p0 = total_dvc / total_cpgs if total_cpgs > 0 else 0.0
     if p0 == 0.0:
         logger.warning(
-            "call_dvr_density: no DVCs in the input — every tile is null."
+            "call_dvr_density: no DVCs in the input -- every tile is null."
         )
 
     # Per-tile aggregation.
@@ -370,7 +370,7 @@ def call_dvr_density(
     if p0 > 0.0:
         pvals = sp_stats.binom.sf(n_dvc - 1, n_cpgs, p0)
     else:
-        # No background DVCs ⇒ any tile with ≥1 DVC has p≈0;
+        # No background DVCs => any tile with >=1 DVC has p~=0;
         # tiles with 0 DVCs have p=1.
         pvals = np.where(n_dvc > 0, 0.0, 1.0)
     pvals = np.clip(pvals, np.finfo(float).tiny, 1.0)

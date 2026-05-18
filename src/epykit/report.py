@@ -42,10 +42,10 @@ def _require_jinja():
 
 def _fmt_value(v: Any) -> str:
     if v is None:
-        return "—"
+        return "--"
     if isinstance(v, float):
         if v != v:  # NaN
-            return "—"
+            return "--"
         if abs(v) >= 1000 or (abs(v) < 0.001 and v != 0):
             return f"{v:.4g}"
         return f"{v:.4f}".rstrip("0").rstrip(".") or "0"
@@ -100,7 +100,7 @@ def _history_entries(md: MethylData) -> list[dict]:
             "path": h.get("path", "?"),
             "n_sites_str": (
                 f"{h.get('n_sites'):,}" if isinstance(h.get("n_sites"), int)
-                else "—"
+                else "--"
             ),
         })
     return out
@@ -182,7 +182,7 @@ def _fig_html(fig) -> Optional[str]:
 
 def _safe(fn, *args, **kwargs):
     """Call a Plotly-twin function; swallow exceptions to keep the report
-    rendering even if one section fails (e.g. PCA needs ≥2 samples)."""
+    rendering even if one section fails (e.g. PCA needs >=2 samples)."""
     try:
         return fn(*args, **kwargs)
     except Exception as exc:
@@ -212,7 +212,7 @@ def generate_report(
     output : str
         Output HTML file path. Parent directory is created if needed.
     title : str, optional
-        Report title. Defaults to ``"epykit report — <assembly>"``.
+        Report title. Defaults to ``"epykit report -- <assembly>"``.
     gtf_path : str, optional
         If supplied, a TSS metaplot section is rendered using this GTF.
     alpha : float
@@ -282,7 +282,7 @@ def generate_report(
     }
 
     ctx = {
-        "title": title or f"epykit report — {md.assembly}",
+        "title": title or f"epykit report -- {md.assembly}",
         "css_inline": css_inline,
         "epykit_version": version,
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -340,7 +340,7 @@ def _serialisable(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, pl.DataFrame):
-        return f"<DataFrame: {len(value)} rows × {value.width} cols>"
+        return f"<DataFrame: {len(value)} rows x {value.width} cols>"
     if isinstance(value, dict):
         return {k: _serialisable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

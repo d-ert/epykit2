@@ -2,7 +2,7 @@
 
 A single figure summarising the most-used QC signals so users don't have
 to assemble seven PNGs themselves. Reads only material that ``tl.qc`` has
-already written onto ``md.obs`` / ``md.uns`` — no extra methylstore reads.
+already written onto ``md.obs`` / ``md.uns`` -- no extra methylstore reads.
 Missing panels degrade gracefully to a placeholder caption.
 """
 
@@ -33,7 +33,7 @@ def qc_dashboard(
     """Composite QC figure: conversion rate, coverage, methylation, correlation.
 
     Reads everything from ``md.obs`` / ``md.uns``. Missing metrics are
-    rendered as captioned placeholders rather than crashing — so
+    rendered as captioned placeholders rather than crashing -- so
     ``pl.qc_dashboard`` works on a partially-run pipeline.
     """
     import matplotlib.pyplot as plt
@@ -89,7 +89,7 @@ def qc_dashboard(
         ax3.bar(range(len(samples)), vals, color=colors)
         ax3.set_xticks(range(len(samples)))
         ax3.set_xticklabels(samples, rotation=90, fontsize=7)
-        ax3.set_ylabel("Global β")
+        ax3.set_ylabel("Global beta")
         ax3.set_title("Global methylation")
     else:
         _empty_panel(ax3, "global methylation\n(qc not run)")
@@ -135,7 +135,7 @@ def qc_dashboard(
             sex_df.get_column("sample_id").to_list(),
             rotation=90, fontsize=7,
         )
-        ax5.set_ylabel("Mean β (chrX)")
+        ax5.set_ylabel("Mean beta (chrX)")
         ax5.set_title("Sex check")
     else:
         _empty_panel(ax5, "sex check\n(run qc(..., run_sex_check=True))")

@@ -1,16 +1,16 @@
 """Tabix-style random-access queries on the partitioned Parquet methylstore.
 
 This module exposes :func:`query_region`, :func:`query_regions`, and
-:func:`query_sites` — three single-purpose entry points for fetching
+:func:`query_sites` -- three single-purpose entry points for fetching
 methylation data at specific genomic loci without scanning the whole
 store. New in 0.4.0.
 
 Why no extra dependency?
 ------------------------
 The store is already hive-partitioned by ``sample=*/chrom=*``. Polars
-lazy I/O (``pl.scan_parquet``) reads parquet row-group statistics —
+lazy I/O (``pl.scan_parquet``) reads parquet row-group statistics --
 ``min(pos)`` / ``max(pos)`` per row group, written automatically when
-``convert_sample`` ran — and prunes row groups whose statistics don't
+``convert_sample`` ran -- and prunes row groups whose statistics don't
 overlap the query before reading any data. That gives tabix-equivalent
 random access on the existing store, with no separate index file.
 
@@ -28,7 +28,7 @@ Examples
 
     import epykit as ep
     df = ep.query.query_region(md.store, "chr7", 140_453_000, 140_500_000)
-    # → pl.DataFrame with one row per (sample_id, pos) in the region.
+    # -> pl.DataFrame with one row per (sample_id, pos) in the region.
 
     regions = pl.DataFrame({"chrom": ["chr1", "chr2"],
                              "start": [1_000_000, 2_000_000],
@@ -85,7 +85,7 @@ def query_region(
         Chromosome name (must match the partition key, e.g. ``"chr1"``).
     start, end
         Half-open BED-style interval. ``start`` is inclusive, ``end``
-        is exclusive — matches the convention used everywhere else in
+        is exclusive -- matches the convention used everywhere else in
         epykit (see the ``convert.py`` module docstring on coordinates).
     samples
         Sample ids to include. ``None`` returns every sample present in
@@ -146,7 +146,7 @@ def query_regions(
     *,
     samples: Optional[Iterable[str]] = None,
 ) -> pl.DataFrame:
-    """Batched region query — concatenates results across multiple regions.
+    """Batched region query -- concatenates results across multiple regions.
 
     ``regions`` must have at least columns ``chrom``, ``start``, ``end``
     (any extra columns are ignored). Returns the same schema as
@@ -178,7 +178,7 @@ def query_sites(
     *,
     samples: Optional[Iterable[str]] = None,
 ) -> pl.DataFrame:
-    """Exact-position queries — return rows at specified (chrom, pos) sites.
+    """Exact-position queries -- return rows at specified (chrom, pos) sites.
 
     Useful for epigenetic clock CpGs, validation against reference panels,
     or any analysis that targets a fixed set of CpGs rather than a

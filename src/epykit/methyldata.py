@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
 import polars as pl
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -14,7 +19,7 @@ class MethylData:
 
     Preprocessing state (``filtered``, ``united``, ``smoothed``) is *derived*
     from ``uns`` and its ``_store_history`` log rather than stored as
-    independent booleans — see the ``state`` property and the ``_filtered``
+    independent booleans -- see the ``state`` property and the ``_filtered``
     / ``_united`` / ``_smoothed`` aliases below. This means the flags can
     never drift from reality.
     """
@@ -94,7 +99,7 @@ class MethylData:
         """Names of stages recorded in the top-level pipeline manifest.
 
         Reads ``<_analysis_root>/.epykit_manifest.json`` (the 0.4.0
-        checkpoint/resume manifest). Always reflects what is on disk —
+        checkpoint/resume manifest). Always reflects what is on disk --
         unlike :py:attr:`state`, which is derived from ``uns`` and can
         diverge after a manual ``md.uns.pop()``.
 
@@ -138,15 +143,15 @@ class MethylData:
         op = Path(out_path)
         if not op.is_absolute():
             op = Path(root) / op
-        # varm/<key>.parquet → re-load into varm
+        # varm/<key>.parquet -> re-load into varm
         if op.exists() and op.suffix == ".parquet" and stage.startswith(("dmc_", "dvc", "asm", "entropy")):
             self.varm[stage] = pl.read_parquet(str(op))
             return True
-        # uns/<key>.parquet → re-load into uns
+        # uns/<key>.parquet -> re-load into uns
         if op.exists() and op.suffix == ".parquet" and stage.startswith(("dmr_", "dvr", "pmd", "hmr", "lmr", "smooth")):
             self.uns[stage] = pl.read_parquet(str(op))
             return True
-        # Stage references a directory (filtered/normalized stores etc.) —
+        # Stage references a directory (filtered/normalized stores etc.) --
         # just point md.store at it.
         if op.is_dir():
             self.store = str(op)
@@ -201,7 +206,7 @@ class MethylData:
         """
         # Pointer-first resolution: ep.tl.dmc writes uns["dmc"]["last_key"]
         # on every run. If that's absent (older sessions), fall back to a
-        # single existing key — but never auto-prioritize, to avoid the
+        # single existing key -- but never auto-prioritize, to avoid the
         # surprise documented in S5.
         last = self.get_dmc()
         if last is not None:
@@ -232,7 +237,7 @@ class MethylData:
 
         * If ``path`` contains any directory components (relative or
           absolute), the data is written there verbatim. ``load(path)``
-          reads from the same place — save and load are symmetric.
+          reads from the same place -- save and load are symmetric.
         * If ``path`` is a bare name (no separators) **and**
           ``_analysis_root`` is set, the data is written under
           ``<_analysis_root>/results/<path>``. This is the
@@ -254,8 +259,59 @@ class MethylData:
 
         self.obs.write_parquet(str(out / "obs.parquet"))
 
+        # Resolve the DMCStore reference (if any) so we can detect varm
+        # entries that are *already* on disk in chrom-partitioned form
+        # and just need to be linked / copied rather than re-encoded.
+        # Encoding a 22M-row Polars DataFrame to a single parquet allocates
+        # a second-copy buffer the same size as the table (~3 GB) -- that's
+        # what makes naive `df.write_parquet(...)` OOM the host.
+        dmc_meta       = self.uns.get("dmc", {}) if isinstance(self.uns.get("dmc"), dict) else {}
+        dmc_store_path = dmc_meta.get("store_path")
+        dmc_last_key   = dmc_meta.get("last_key")
+
+        varm_format: dict[str, str] = {}
         for name, df in self.varm.items():
-            df.write_parquet(str(out / f"varm_{name}.parquet"))
+            target_single = out / f"varm_{name}.parquet"
+
+            # Path 1: DMCStore-backed varm table -> copy per-chrom parquets
+            # directly. Zero re-encoding, constant memory. The DMCStore
+            # already carries BH-corrected q-values (apply_multiple_testing_
+            # correction writes them back per chrom), so the on-disk files
+            # are exactly the table held in self.varm[name].
+            is_dmcstore_backed = (
+                name == dmc_last_key
+                and dmc_store_path is not None
+                and (Path(dmc_store_path) / ".epykit_dmc_manifest.json").exists()
+            )
+            if is_dmcstore_backed:
+                store_dir = Path(dmc_store_path)
+                target_dir = out / f"varm_{name}"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                # Hardlink where possible (no extra disk, instant); fall
+                # back to a chunked file copy elsewhere (different drive /
+                # filesystem that doesn't support hardlinks).
+                for src in store_dir.glob("chrom=*.parquet"):
+                    dst = target_dir / src.name
+                    if dst.exists():
+                        dst.unlink()
+                    try:
+                        os.link(src, dst)
+                    except (OSError, NotImplementedError):
+                        shutil.copyfile(src, dst)
+                # Carry the manifest along so load() can verify integrity.
+                manifest = store_dir / ".epykit_dmc_manifest.json"
+                if manifest.exists():
+                    shutil.copyfile(manifest, target_dir / manifest.name)
+                varm_format[name] = "dmcstore"
+                logger.info(
+                    "save: %s linked from DMCStore at %s (no materialization)",
+                    name, store_dir,
+                )
+                continue
+
+            # Path 2: legacy / small varm -> single-file parquet.
+            df.write_parquet(str(target_single))
+            varm_format[name] = "parquet"
 
         serialisable_uns = self.uns.copy()
         for key, value in list(serialisable_uns.items()):
@@ -273,6 +329,10 @@ class MethylData:
             # uns dict (which includes _store_history, unite, smooth_path).
             "_analysis_root": self._analysis_root,
             "varm_keys": list(self.varm.keys()),
+            # Per-varm storage format: "parquet" (single file) or
+            # "dmcstore" (chrom-partitioned dir). Older saves omit this
+            # field and load() falls back to "parquet" for back-compat.
+            "varm_format": varm_format,
             "uns": serialisable_uns,
         }
         (out / "methyldata.json").write_text(json.dumps(meta, indent=2, default=str))
@@ -282,10 +342,24 @@ class MethylData:
         out = Path(path)
         meta = json.loads((out / "methyldata.json").read_text())
         obs = pl.read_parquet(str(out / "obs.parquet"))
-        varm = {
-            key: pl.read_parquet(str(out / f"varm_{key}.parquet"))
-            for key in meta.get("varm_keys", [])
-        }
+        varm_format = meta.get("varm_format", {})
+        varm: dict[str, pl.DataFrame] = {}
+        for key in meta.get("varm_keys", []):
+            fmt = varm_format.get(key, "parquet")
+            if fmt == "dmcstore":
+                # Chrom-partitioned directory written by save() via direct
+                # link-from-DMCStore. Streaming scan keeps the read on a
+                # single pass and avoids a second-copy materialisation
+                # buffer; we still collect into an eager frame for
+                # back-compat with all the code that expects md.varm[key]
+                # to be a pl.DataFrame.
+                varm_dir = out / f"varm_{key}"
+                varm[key] = (
+                    pl.scan_parquet(str(varm_dir / "chrom=*.parquet"))
+                    .collect()
+                )
+            else:
+                varm[key] = pl.read_parquet(str(out / f"varm_{key}.parquet"))
 
         uns = meta.get("uns", {})
         for key, value in list(uns.items()):
@@ -300,7 +374,7 @@ class MethylData:
             varm=varm,
             uns=uns,
             # _filtered / _united / _smoothed are properties derived from
-            # uns — nothing to pass through the constructor. Older saves
+            # uns -- nothing to pass through the constructor. Older saves
             # that include those keys in meta are silently ignored.
         )
         md._analysis_root = meta.get("_analysis_root")
@@ -361,7 +435,7 @@ class MethylData:
         start: int,
         end: int,
     ) -> pl.DataFrame:
-        """Per-sample mean β within ``chrom:start-end``.
+        """Per-sample mean beta within ``chrom:start-end``.
 
         Returns columns: sample, mean_beta, n_cpgs, mean_coverage.
         """
@@ -429,18 +503,18 @@ class MethylData:
         Shows every column in ``self.obs`` rather than a hardcoded subset, so
         user-supplied covariates (sex, batch, age, ...) are visible. Floats are
         rounded to 4 significant figures; the ``treatment`` column, if present,
-        renders as ▶ (1) / ○ (0).
+        renders as > (1) / o (0).
         """
         cols = list(self.obs.columns)
 
         def _fmt(value: object, col: str) -> str:
             if value is None:
-                return "—"
+                return "--"
             if col == "treatment":
-                return "▶" if value == 1 else "○" if value == 0 else str(value)
+                return ">" if value == 1 else "o" if value == 0 else str(value)
             if isinstance(value, float):
                 if value != value:  # NaN
-                    return "—"
+                    return "--"
                 return f"{value:.4g}"
             return str(value)
 

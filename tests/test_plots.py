@@ -1,7 +1,7 @@
 """Layer 6b: matplotlib plot smoke tests.
 
 Renders every public ``ep.pl.*`` function once against the fixture using
-the Agg backend (no display required). We don't assert on pixel content —
+the Agg backend (no display required). We don't assert on pixel content --
 just that the function returns a Figure/Axes without raising.
 
 A failure here typically means an API drift (e.g. a column rename in the

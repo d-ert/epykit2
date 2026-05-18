@@ -3,7 +3,7 @@
 Writes ``*_mqc.json`` files into ``output_dir`` so MultiQC's
 ``--config``-driven custom-content scanner picks them up. Each metric
 becomes its own file with the
-``{id, section_name, plot_type, data}`` schema. No new dependencies —
+``{id, section_name, plot_type, data}`` schema. No new dependencies --
 just JSON serialisation.
 
 Reference: https://multiqc.info/docs/custom_content/#a-custom-content-file-with-static-data
@@ -30,7 +30,7 @@ def report_multiqc(md, output_dir: str) -> str:
     """Write per-metric ``*_mqc.json`` files for MultiQC pickup.
 
     Returns the output directory. Files written depend on what's
-    populated on ``md.obs`` / ``md.uns`` — missing metrics are simply
+    populated on ``md.obs`` / ``md.uns`` -- missing metrics are simply
     skipped (no empty stubs).
     """
     out = Path(output_dir)
@@ -77,7 +77,7 @@ def report_multiqc(md, output_dir: str) -> str:
         payload = {
             "id": "epykit_global_methylation",
             "section_name": "epykit: Global methylation",
-            "description": "Genome-wide CpG mean β per sample.",
+            "description": "Genome-wide CpG mean beta per sample.",
             "plot_type": "bargraph",
             "data": {
                 s: {"global_methylation": float(v) if v is not None else None}

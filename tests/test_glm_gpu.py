@@ -3,7 +3,7 @@
 The CPU implementation in :mod:`epykit._glm` is the source of truth; the
 GPU implementation in :mod:`epykit._glm_gpu` must produce numerically
 identical results (within float64 round-off) for the same input. These
-tests run only when CuPy is importable — they cleanly skip on CPU-only
+tests run only when CuPy is importable -- they cleanly skip on CPU-only
 runners so CI doesn't fail.
 
 Tolerance rationale: both paths run the same algorithm with the same
@@ -29,7 +29,7 @@ def _make_glm_inputs(n_sites=512, n_samples=8, p=3, seed=42):
     """Build deterministic synthetic GLM inputs.
 
     A small (~few hundred sites, few samples) batch keeps the GPU
-    parity test fast — the goal is bit-equivalence, not throughput.
+    parity test fast -- the goal is bit-equivalence, not throughput.
     """
     rng = np.random.default_rng(seed)
     # design: intercept + binary treatment + continuous covariate

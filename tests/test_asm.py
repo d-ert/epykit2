@@ -54,7 +54,7 @@ def _write_synth_bam_and_vcf(tmp_path: Path) -> tuple[Path, Path]:
             r.query_qualities = pysam.qualitystring_to_array("E" * 30)
             # XM: 30 chars. Position 15 carries the CpG call.
             xm = ["."] * 30
-            xm[15] = "Z" if i < 10 else "z"   # h1 → methylated, h2 → unmethylated
+            xm[15] = "Z" if i < 10 else "z"   # h1 -> methylated, h2 -> unmethylated
             r.set_tag("XM", "".join(xm))
             out.write(r)
 

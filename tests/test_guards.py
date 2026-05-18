@@ -3,7 +3,7 @@
 Verifies the safety nets that prevent users from silently getting wrong
 answers:
 
-* n=1 per group → ``ValueError`` unless ``allow_n1=True`` (B6).
+* n=1 per group -> ``ValueError`` unless ``allow_n1=True`` (B6).
 * ``allow_n1=True`` runs Fisher but emits a ``UserWarning`` (B6).
 * ``unite='union'`` + ``min_samples_*=0`` warns once (B8).
 * Explicit ``test='fisher'`` emits a one-shot ``UserWarning`` per session
@@ -26,7 +26,7 @@ from tests.fixtures.synth import SimConfig, generate
 
 @pytest.fixture
 def synth_md_n1(tmp_path):
-    """A MethylData with only 1 replicate per group — exercises the n=1 path."""
+    """A MethylData with only 1 replicate per group -- exercises the n=1 path."""
     import epykit as ep
     cfg = SimConfig(
         n_per_group=1,
@@ -91,7 +91,7 @@ def test_n1_dmr_tile_raises_without_allow_n1(synth_md_n1):
 
 
 def test_union_with_zero_min_samples_warns(synth_md, tmp_path):
-    """``pp.unite('union') + tl.dmc(min_samples_*=0)`` must warn — testing
+    """``pp.unite('union') + tl.dmc(min_samples_*=0)`` must warn -- testing
     sites covered in only one sample per group is the textbook footgun."""
     import epykit as ep
     ep.pp.filter_coverage(synth_md, lo_count=5, hi_perc=99.9)
@@ -178,10 +178,10 @@ def test_fisher_warning_fires_only_once_per_session(synth_md_filtered):
 
     * tl-level (``tl._warn_fisher_once``): one-shot per session, gated
       by ``_FISHER_WARNED``. Message: "test='fisher' ignores
-      between-replicate variance; …". This test asserts that gate works.
+      between-replicate variance; ...". This test asserts that gate works.
     * dmc-level (``_validate_sample_size_and_warn``): once per
       ``process_chromosomes_dmc`` call. Message: "test='fisher' pools
-      reads across replicates; …". *Intentionally* not session-gated —
+      reads across replicates; ...". *Intentionally* not session-gated --
       direct-API users get warned every call.
 
     Both messages contain "Prefer test='lr'", so we identify the

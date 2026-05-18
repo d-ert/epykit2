@@ -12,18 +12,18 @@ Effect placement:
 
 * ``n_dmrs`` contiguous regions of ``dmr_size_cpgs`` CpGs each receive the
   same signed ``dmr_effect`` (a real biological DMR).
-* ``n_scattered_dmcs`` isolated CpGs outside any DMR receive ±``dmc_effect``
+* ``n_scattered_dmcs`` isolated CpGs outside any DMR receive +/-``dmc_effect``
   with random signs (scattered DMCs, not part of a DMR).
 
 The remainder are null (effect == 0).
 
 Outputs in ``out_dir/``:
 
-  cov/<sample_id>.bismark.cov.gz   — per-sample Bismark .cov files
-  samplesheet.csv                  — sample_id, group, path
-  truth.parquet                    — chrom, pos, is_dmc, true_meth_diff,
+  cov/<sample_id>.bismark.cov.gz   -- per-sample Bismark .cov files
+  samplesheet.csv                  -- sample_id, group, path
+  truth.parquet                    -- chrom, pos, is_dmc, true_meth_diff,
                                      dmr_id, in_dmr
-  config.json                      — dataclass dump for reproducibility
+  config.json                      -- dataclass dump for reproducibility
 """
 
 from __future__ import annotations
@@ -43,14 +43,14 @@ class SimConfig:
     """Knobs for the synthetic methylation generator.
 
     The defaults are chosen so that a "standard" 4-vs-4 WGBS comparison
-    at ~20× coverage produces detectable signal under BH-corrected
+    at ~20x coverage produces detectable signal under BH-corrected
     multiple testing across ~75 k post-filter CpGs. Specifically:
 
-    * dmc_effect = 0.40: bigger than the typical 0.20-0.30 promoter Δβ,
+    * dmc_effect = 0.40: bigger than the typical 0.20-0.30 promoter Deltabeta,
       so n=4 replicates can resolve it with a per-site count test (LR /
-      score) at BH q<0.05. With Δβ=0.30 and n=4 the BH cutoff after
+      score) at BH q<0.05. With Deltabeta=0.30 and n=4 the BH cutoff after
       75k tests demands an unrealistic z-statistic.
-    * coverage_mean = 20 × NB(disp=5): puts most sites at ≥10× after
+    * coverage_mean = 20 x NB(disp=5): puts most sites at >=10x after
       filter, well within the "well-powered" regime for binomial GLMs.
     * replicate_sd = 0.03: modest between-replicate variation that still
       makes the count-vs-Welch-t comparison interesting.
@@ -70,7 +70,7 @@ class SimConfig:
     dmr_size_cpgs: int = 10
     dmr_effect: float = 0.40
     coverage_mean: float = 20.0
-    coverage_disp: float = 5.0  # NB shape (k); larger → less overdispersion
+    coverage_disp: float = 5.0  # NB shape (k); larger -> less overdispersion
     replicate_sd: float = 0.03
     seed: int = 42
 
@@ -84,13 +84,13 @@ class SimConfig:
     group_labels: tuple[str, ...] = ("control", "treatment", "extra1", "extra2")
     dmc_effect_multigroup_step: float = 0.20
     # When set, adds an `age` column to the samplesheet drawn U(age_low,
-    # age_high) and injects a linear age × β effect at `n_age_dmcs`
-    # sites with slope `age_effect_per_year` (per-year Δβ).
+    # age_high) and injects a linear age x beta effect at `n_age_dmcs`
+    # sites with slope `age_effect_per_year` (per-year Deltabeta).
     continuous_covariate: bool = False
     age_low: float = 20.0
     age_high: float = 80.0
     n_age_dmcs: int = 200
-    age_effect_per_year: float = 0.005  # 0.5pp Δβ per year of age, 60yr span = 0.30
+    age_effect_per_year: float = 0.005  # 0.5pp Deltabeta per year of age, 60yr span = 0.30
 
     @property
     def total_samples(self) -> int:
@@ -117,7 +117,7 @@ def _place_effects(cfg: SimConfig, rng: np.random.Generator) -> tuple[np.ndarray
     """Decide per-site effect size + DMR membership.
 
     Returns (effects, dmr_id, chrom_of_site) where:
-      effects[i]    = true Δβ at site i (0 for null sites)
+      effects[i]    = true Deltabeta at site i (0 for null sites)
       dmr_id[i]     = DMR index (0..n_dmrs-1) or -1 if not in a DMR
       chrom_of_site = chromosome name per site (for joining)
     """
@@ -131,7 +131,7 @@ def _place_effects(cfg: SimConfig, rng: np.random.Generator) -> tuple[np.ndarray
     # 1. Place DMRs first: each DMR sits entirely on one chromosome.
     # Sign assignment is *deterministically* balanced (half hyper, half hypo)
     # so the truth table has zero mean effect over DMRs. Without this the
-    # random ±1 draw produces a small fixture-level imbalance (e.g. 7/3 at
+    # random +/-1 draw produces a small fixture-level imbalance (e.g. 7/3 at
     # n_dmrs=10) that shows up as "bias" in test assertions.
     dmr_signs = np.concatenate([
         np.full(cfg.n_dmrs // 2, 1.0),
@@ -162,7 +162,7 @@ def _place_effects(cfg: SimConfig, rng: np.random.Generator) -> tuple[np.ndarray
 
 
 def _positions(cfg: SimConfig, rng: np.random.Generator) -> np.ndarray:
-    """Generate sorted positions per chromosome, spaced 50–400 bp apart."""
+    """Generate sorted positions per chromosome, spaced 50-400 bp apart."""
     parts = []
     base = 1_000
     for _ in cfg.chromosomes:
@@ -270,7 +270,7 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
             if cfg.continuous_covariate else None
         )
 
-        # True per-site β for this sample. Decompose into:
+        # True per-site beta for this sample. Decompose into:
         #   - binary effect (existing): only "treatment" group gets it
         #   - multi-group effect: scales with group_idx (centered)
         #   - age effect: linear with age at age_sites
@@ -315,10 +315,10 @@ def generate(cfg: SimConfig, out_dir: str | Path) -> dict:
 
     # Truth table.
     #
-    # ``true_meth_diff`` stores the **post-clip effective Δβ**, not the
-    # raw ``effects[i]``. With baseline=0.30 + effect=±0.40, the intended
-    # hypo β_treatment of −0.10 gets clipped to 0.01 by the sampling
-    # model, so the actual realised Δβ is 0.01 − 0.30 = −0.29 (not −0.40).
+    # ``true_meth_diff`` stores the **post-clip effective Deltabeta**, not the
+    # raw ``effects[i]``. With baseline=0.30 + effect=+/-0.40, the intended
+    # hypo beta_treatment of -0.10 gets clipped to 0.01 by the sampling
+    # model, so the actual realised Deltabeta is 0.01 - 0.30 = -0.29 (not -0.40).
     # If we stored the unclipped intended effect, the estimator would
     # appear ~5pp positively biased on hypo sites even though it's
     # correctly recovering what was sampled.

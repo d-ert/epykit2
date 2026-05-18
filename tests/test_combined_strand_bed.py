@@ -58,7 +58,7 @@ def test_convert_sample_combined_strand_bed_basic(tmp_path):
     assert row0["coverage"] == 8
     assert row0["N_unmeth"] == 3
 
-    # Row 4 (chr1): the asymmetric case 4/8 vs 1/1 — combined is 5/9.
+    # Row 4 (chr1): the asymmetric case 4/8 vs 1/1 -- combined is 5/9.
     row3 = chr1.filter(pl.col("pos") == 10577).row(0, named=True)
     assert row3["N_meth"] == 5
     assert row3["coverage"] == 9
@@ -79,7 +79,7 @@ def test_combined_strand_bed_zero_coverage_strand(tmp_path):
 
 
 def test_combined_strand_bed_end_to_end_dmc(tmp_path):
-    """A two-sample, two-condition synth BED runs through read → filter → dmc."""
+    """A two-sample, two-condition synth BED runs through read -> filter -> dmc."""
     # Two samples per group, very simple methylation: treatment is hyper at 5 of 10 sites.
     chroms = ["chr1"] * 10
     positions = list(range(1000, 1100, 10))

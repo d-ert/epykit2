@@ -32,7 +32,7 @@ def test_hmm_dmr_recovers_planted_hypo_run():
         "meth_diff": md.astype(np.float32),
     })
     dmrs = call_dmr_hmm(dmc, min_cpgs=10, min_abs_meth_diff=0.10, alpha=0.05)
-    # Expect ≥ 1 DMR; at least one of dmr_type "hypo" overlapping our run.
+    # Expect >= 1 DMR; at least one of dmr_type "hypo" overlapping our run.
     assert dmrs.height >= 1
     hypo = dmrs.filter(pl.col("dmr_type") == "hypo")
     assert hypo.height >= 1, "no hypo DMR called for planted hypo run"

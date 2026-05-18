@@ -243,7 +243,7 @@ def test_build_design_missing_covariate_value_raises():
 
 
 
-# irls_binomial_batch — full-rank GLM solver
+# irls_binomial_batch -- full-rank GLM solver
 
 
 def test_irls_recovers_known_coefficients():

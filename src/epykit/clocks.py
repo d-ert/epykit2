@@ -1,14 +1,14 @@
 """Epigenetic age clocks and reference-based cell-type deconvolution.
 
-These are *infrastructure* — generic runners that consume user-supplied
-coefficient / reference tables — not bundled scientific data. The
+These are *infrastructure* -- generic runners that consume user-supplied
+coefficient / reference tables -- not bundled scientific data. The
 coefficient tables for the published clocks (Horvath 2013, Hannum 2013,
 PhenoAge, DunedinPACE) and the EpiDISH / CIBERSORT reference matrices
 have their own licences and citation requirements; we don't redistribute
 them. The user points the runner at a CSV / Parquet table and gets a
 per-sample age estimate or cell-type composition.
 
-Both runners take a CpG → coefficient table and a CpG → (chrom, pos)
+Both runners take a CpG -> coefficient table and a CpG -> (chrom, pos)
 manifest. The clocks were trained on Illumina array CpG IDs (cgXXXXXXXX)
 which don't carry genomic coordinates directly, so the user-supplied
 manifest is what wires probe IDs to the WGBS coordinate system. A
@@ -22,8 +22,8 @@ table" and a "reference matrix" through the same plumbing:
 
 * Clock table: ``cpg_id``, ``coefficient``; an optional intercept passed
   as a kwarg.
-* Reference matrix: ``cpg_id`` + one column per cell type — the rest of
-  the values are the reference β profile per type.
+* Reference matrix: ``cpg_id`` + one column per cell type -- the rest of
+  the values are the reference beta profile per type.
 """
 
 from __future__ import annotations
@@ -45,13 +45,13 @@ def _build_sample_beta_at_clock_cpgs(
     chrom_col: str = "chrom",
     pos_col: str = "pos",
 ) -> tuple[np.ndarray, list[str], list[str], np.ndarray]:
-    """Build a (n_samples × n_cpgs) β matrix at the clock / reference
+    """Build a (n_samples x n_cpgs) beta matrix at the clock / reference
     CpGs.
 
     Returns
     -------
     beta : np.ndarray, shape (n_samples, n_cpgs)
-        β at clock CpGs in coords' row order. NaN where the sample has
+        beta at clock CpGs in coords' row order. NaN where the sample has
         no coverage at that site (or the site is missing from the
         store).
     sample_ids : list[str]
@@ -125,7 +125,7 @@ def age_clock(
 
     Computes one age estimate per sample as
 
-        age_hat = transform( intercept + Σ_i coefficient_i · β_i )
+        age_hat = transform( intercept + Sigma_i coefficient_i * beta_i )
 
     where the sum is over CpGs in ``coefficients`` that are also in
     ``manifest`` (which maps probe IDs to genomic coordinates) and
@@ -140,17 +140,17 @@ def age_clock(
         coefficient column. The intercept, if any, is supplied
         separately via ``intercept``.
     manifest : pl.DataFrame
-        Probe → (chrom, pos) lookup. Must carry the ``manifest_cpg_col``
+        Probe -> (chrom, pos) lookup. Must carry the ``manifest_cpg_col``
         column plus ``chrom`` and ``pos``. Typically the array vendor's
         annotation file.
     intercept : float
         Linear-model intercept. Default 0.0 (e.g. Hannum's blood clock
-        — Horvath needs ~0.696).
+        -- Horvath needs ~0.696).
     transform : {"horvath", None}, optional
         Post-linear transformation. ``"horvath"`` applies the standard
-        anti-transform for samples ≥20 years old::
+        anti-transform for samples >=20 years old::
 
-            age = exp(linear) − 1  if linear < 0 else linear * 21 + 20
+            age = exp(linear) - 1  if linear < 0 else linear * 21 + 20
 
         ``None`` (default) returns the raw linear combination.
     coef_cpg_col, coef_value_col : str
@@ -159,10 +159,10 @@ def age_clock(
     manifest_cpg_col : str
         Probe-ID column name in ``manifest``. Default ``cpg_id``.
     impute_missing : bool
-        If True (default), missing β values are replaced with the mean
-        β at that CpG across the samples that *do* have coverage. If no
+        If True (default), missing beta values are replaced with the mean
+        beta at that CpG across the samples that *do* have coverage. If no
         sample covers a CpG, that CpG drops out (its coefficient is
-        ignored) — its weight is redistributed implicitly by being
+        ignored) -- its weight is redistributed implicitly by being
         absent from the sum, which biases the result; the returned
         table flags how many CpGs were dropped per sample so the user
         can decide whether the estimate is trustworthy.
@@ -181,7 +181,7 @@ def age_clock(
             f"coefficients table must carry '{coef_cpg_col}' and "
             f"'{coef_value_col}' columns."
         )
-    # Resolve probe → genomic coordinates.
+    # Resolve probe -> genomic coordinates.
     coords = (
         manifest.select([
             pl.col(manifest_cpg_col).alias("cpg_id"),
@@ -226,7 +226,7 @@ def age_clock(
     n_cpgs_used = int(cpg_has_any.sum())
     n_cpgs_missing = int(coords.height - n_cpgs_used)
 
-    # Replace NaN coefficient×β products with 0 for the sum (post-impute
+    # Replace NaN coefficientxbeta products with 0 for the sum (post-impute
     # any remaining NaN is exactly the cpg_has_any==False columns).
     beta_clean = np.where(np.isnan(beta_imp), 0.0, beta_imp)
     coefs_clean = np.where(cpg_has_any, coefs, 0.0)
@@ -263,29 +263,29 @@ def deconvolve(
 
     Solves, per sample,
 
-        β_sample ≈ R · π
+        beta_sample ~= R * pi
 
-    where ``R`` is the (n_cpgs × n_cell_types) reference β matrix and
-    ``π`` is the (n_cell_types,) composition vector. By default the
+    where ``R`` is the (n_cpgs x n_cell_types) reference beta matrix and
+    ``pi`` is the (n_cell_types,) composition vector. By default the
     solve is non-negative least squares (``method="nnls"``, the
     Houseman / EpiDISH "CP" estimator); the composition is then
     re-normalised to sum to 1.
 
-    The standard published references — EpiDISH ``centDHSbloodDMC.m``
-    for whole blood, the saliva and breast reference panels, etc. — are
-    distributed as Illumina-array β tables and licensed separately; you
+    The standard published references -- EpiDISH ``centDHSbloodDMC.m``
+    for whole blood, the saliva and breast reference panels, etc. -- are
+    distributed as Illumina-array beta tables and licensed separately; you
     supply the reference matrix and the array manifest, this runner
     does the math.
 
     Parameters
     ----------
     md : MethylData
-        Sample β matrix source.
+        Sample beta matrix source.
     reference : pl.DataFrame
         ``ref_cpg_col`` column + one column per cell type. Values are
-        per-CpG mean β in that cell type.
+        per-CpG mean beta in that cell type.
     manifest : pl.DataFrame
-        Probe → (chrom, pos) lookup with the column named by
+        Probe -> (chrom, pos) lookup with the column named by
         ``manifest_cpg_col``.
     method : {"nnls"}
         Solver. Only ``"nnls"`` is implemented (the standard Houseman
@@ -323,7 +323,7 @@ def deconvolve(
         if ct not in reference.columns:
             raise ValueError(f"cell type {ct!r} not in reference columns")
 
-    # Resolve probe → coords. Inner join on CpG ID then on manifest
+    # Resolve probe -> coords. Inner join on CpG ID then on manifest
     # coords; rows where any join misses are dropped.
     coords = (
         manifest.select([

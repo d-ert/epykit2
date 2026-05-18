@@ -4,6 +4,101 @@ All notable changes to **epykit** are tracked here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
 SemVer (`MAJOR.MINOR.PATCH`).
 
+## [Unreleased] — 0.7.0
+
+Adds a DSS-compatible DMR caller, DSS-style raw-count smoothing for DMC,
+annotatr-style multi-annotation (nearest TSS + all overlapping genes /
+features), and a UCSC `refGene.txt` parser. Existing 0.6.x defaults are
+unchanged — every new capability is opt-in via an explicit kwarg.
+
+### Added
+
+#### DMR
+- **`ep.call_dmr_chain_merge` / `ep.tl.dmr(method="chain_merge")`.** DSS
+  `callDMR` semantics on top of an epykit DMC table: mark sig CpGs by
+  `(pvalue < alpha) AND (|meth_diff| >= min_abs_meth_diff)`, chain
+  contiguous sig CpGs within `dis_merge_bp`, then filter by `min_cpgs`,
+  `pct_sig`, and `minlen_bp`. `use_q_for_sig=True` switches the gate to
+  the q-value column when one is present. Cached per chrom by the same
+  DMC `input_sig` fingerprint as the sliding-window caller.
+- **`ep.DMR_PRESETS` parameter bundles** for chain-merge: `"strict"`
+  (alpha=1e-6, min_cpgs=5, |Δβ|≥0.20 — validation-ready), `"default"`
+  (alpha=1e-4, |Δβ|≥0.10, min_cpgs=3 — balanced; one order looser than
+  DSS to capture real-but-moderate signal without crashing PPV), and
+  `"permissive"` (alpha=1e-4, dis_merge_bp=200, |Δβ|≥0.05 — recall-
+  oriented). Surfaced through `ep.tl.dmr(..., preset="...")`; any
+  explicit kwarg overrides the bundle value.
+- **`ep.tl.diagnose_dmr_calling(md, reference_dmrs, ...)`.** Bucket
+  reference DMRs into actionable categories — `SUCCESS_OVERLAP`,
+  `H1_NO_CPGS` (lost in coverage / unite), `H2_NO_SIG_CPGS` (test
+  too conservative), `H3a_WEAK_ALPHA` (loosen `alpha`), `H3b_STRUCTURE`
+  (loosen `dis_merge_bp` / `min_cpgs`) — so a low-recall number maps to
+  a specific knob instead of guesswork.
+
+#### DMC
+- **DSS-style raw-count smoothing** in `ep.tl.dmc(..., smoothing=True,
+  smoothing_span_bp=500)`. Applies DSS's uniform-box ±`span/2`
+  moving-average to each sample's per-CpG `(meth, cov)` before the test
+  hits them — matches `DMLfit.multiFactor(smoothing=TRUE)` semantics.
+  Cached separately from the un-smoothed run (`dmc/<test>_smooth/` vs
+  `dmc/<test>/`) and signature-versioned so `False → True` correctly
+  invalidates a stale cache.
+
+#### Annotation
+- **annotatr-style multi-annotation** in `ep.annotate_features` (default
+  on, also `ep.tl.annotate(..., multi_annotation=True)`). Adds
+  `nearest_tss_gene` / `nearest_tss_distance` (HOMER-style signed
+  distance, flipped on `-` strand so positive is downstream of the TSS)
+  and `all_overlapping_genes` / `all_overlapping_features` (one-to-many,
+  so a site that's intronic for one gene AND promoter for another is
+  faithfully represented instead of collapsed by the best-pick rule).
+- **UCSC `refGene.txt(.gz)` annotation source.** Pass
+  `ep.tl.annotate(md, refgene=...)` (or `annotate_features(..., source=
+  "refgene")`) to use HOMER's default catalog — curated, protein-coding-
+  biased, and gives the highest paper-gene recall on methylation work.
+  Schema-compatible with the GTF path; same downstream consumers.
+- **`gene_type_filter` kwarg.** Restrict the gene catalog before
+  building overlap intervals (`"protein_coding"` to drop lincRNAs /
+  pseudogenes). Works on both GTF (`gene_type` / `gene_biotype`) and
+  refGene (derived from accession prefix).
+- **GENCODE / Ensembl GTF gene-type parity.** `_parse_gtf_streaming`
+  now accepts both `gene_type` (GENCODE) and `gene_biotype` (Ensembl);
+  files that omit it stay annotatable.
+
+### Deprecated
+- **`ep.tl.dmc(..., use_smoothed=True)`** (the BSmooth pseudo-count
+  transform) now emits a `DeprecationWarning` pointing at the new
+  `smoothing=True` path. The pseudo-count path is too aggressive
+  (replaces the count signal entirely with the smoothed version, washing
+  out per-CpG resolution at default BSmooth parameters) and will be
+  removed in a future minor release. Existing callers keep working
+  for now.
+
+### Changed
+- **Internal cleanup: ASCII docstrings.** Library docstrings, log
+  messages, and inline comments have been rewritten in plain ASCII
+  (`β → beta`, `μ → mu`, `Σ → Sigma`, `² → ^2`, `→ → ->`, `— → --`,
+  `× → x`, `≥ → >=`, `≤ → <=`, `≈ → ~=`). No semantic changes — this
+  fixes `argparse --help` crashing with `UnicodeEncodeError` on Windows
+  consoles running the default `cp1252` codec and removes the need for
+  the CLI's stdout/stderr `utf-8` reconfigure to be load-bearing on
+  every path. The CLI still reconfigures to UTF-8 defensively.
+
+### Tests
+- New: `test_dmr_chain_merge.py`, `test_dmr_presets_and_diagnose.py`,
+  `test_dmc_smooth_dispersion.py`, `test_annotate_multi.py`. Existing
+  tests realigned with the ASCII docstring rewrite (no behavioural
+  changes).
+
+### Deferred to 0.8+
+
+CLI surface for `chain_merge` (`epykit dmr --method chain_merge ...`),
+RefSeq / UCSC functional-element annotation tracks beyond gene models,
+DMR caller for mixed designs (random-effects), Zarr storage backing,
+single-cell sparse stores.
+
+---
+
 ## [0.6.0] — HMM segmentation
 
 One shared HMM engine, three callers on top. All three operate on the

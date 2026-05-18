@@ -4,6 +4,21 @@ Public API: ``annotate_features`` (gene-feature overlap from a GTF) and
 ``annotate_cpg_islands`` (island / shore / shelf / open-sea context from a
 UCSC CpG-island BED).
 
+By default ``annotate_features`` returns a single best gene per site
+(intronic-host-first priority). Pass ``multi_annotation=True`` to also
+populate:
+
+  - ``nearest_tss_gene`` / ``nearest_tss_distance`` -- HOMER-style nearest
+    TSS assignment (signed distance, ``-`` strand flipped so positive is
+    downstream of the TSS in transcription direction). Independent of the
+    feature-overlap pick -- answers a different biological question (likely
+    regulated promoter) than the intronic-host gene.
+  - ``all_overlapping_genes`` / ``all_overlapping_features`` -- annotatr-style
+    one-to-many: every gene whose feature interval overlaps the site, and
+    every feature class that overlaps. Useful when a site sits inside one
+    gene's intron while also being in another gene's promoter window --
+    something the single-best pick necessarily hides.
+
 The per-chromosome join loop bounds peak memory by the largest single
 chromosome rather than the whole genome. GTFs are parsed once per process
 and cached in a bounded LRU (``_GTF_CACHE``, default 2 slots; override via
@@ -56,14 +71,15 @@ _GTF_CACHE: "OrderedDict[str, tuple[Any, Any]]" = OrderedDict()
 # group by chromosome, build TSS / strand lookups) on every invocation even
 # when the GTF was already parsed via _GTF_CACHE. On a human GENCODE GTF the
 # rebuild is ~5-6 s, which is meaningful when annotate is called twice in a
-# row (once on the DMC table, once on the DMR table — see ``ep.tl.annotate``).
+# row (once on the DMC table, once on the DMR table -- see ``ep.tl.annotate``).
 # Caching the built index lets the second call skip straight to the per-site
 # overlap loop. Key includes promoter window + feature tuple so changing
 # either invalidates the cache automatically.
 _BUILT_FEATURES_CACHE_MAX_SIZE: int = max(
     1, int(os.environ.get("EPYKIT_BUILT_FEATURES_CACHE_SIZE", "2"))
 )
-_BUILT_FEATURES_CACHE: "OrderedDict[tuple, tuple[Any, Any, Any]]" = OrderedDict()
+# Bundle: (features_by_chrom, tss_series, strand_lut, tss_by_chrom)
+_BUILT_FEATURES_CACHE: "OrderedDict[tuple, tuple[Any, Any, Any, Any]]" = OrderedDict()
 
 
 def set_gtf_cache_size(max_size: int) -> None:
@@ -99,14 +115,14 @@ def _gtf_cache_put(key: str, value: tuple[Any, Any]) -> None:
         logger.debug("[annotate] GTF cache evicted (LRU): %s", evicted)
 
 
-def _built_features_cache_get(key: tuple) -> tuple[Any, Any, Any] | None:
+def _built_features_cache_get(key: tuple) -> tuple[Any, Any, Any, Any] | None:
     val = _BUILT_FEATURES_CACHE.get(key)
     if val is not None:
         _BUILT_FEATURES_CACHE.move_to_end(key)
     return val
 
 
-def _built_features_cache_put(key: tuple, value: tuple[Any, Any, Any]) -> None:
+def _built_features_cache_put(key: tuple, value: tuple[Any, Any, Any, Any]) -> None:
     if key in _BUILT_FEATURES_CACHE:
         _BUILT_FEATURES_CACHE.move_to_end(key)
         _BUILT_FEATURES_CACHE[key] = value
@@ -230,7 +246,7 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
                 feature = parts[2]
                 if feature not in ('gene', 'exon'):
                     continue
-                # GTF 1-based closed → 0-based half-open: subtract
+                # GTF 1-based closed -> 0-based half-open: subtract
                 # 1 from start; end already correct.
                 start  = int(parts[3]) - 1
                 end    = int(parts[4])
@@ -240,9 +256,16 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
                     attrs[m.group(1)] = m.group(2)
                 gene_id   = attrs.get('gene_id', '')
                 gene_name = attrs.get('gene_name', attrs.get('gene_id', ''))
+                # GENCODE uses ``gene_type``; Ensembl uses ``gene_biotype``.
+                # Accept either so the same parser handles both vendor GTFs.
+                # Defaults to "" for files that omit it entirely (the
+                # gene_type_filter path treats "" as "unknown" -> excluded
+                # when a filter is in effect, included when no filter).
+                gene_type = attrs.get('gene_type', attrs.get('gene_biotype', ''))
                 row = {
                     'Chromosome': chrom, 'Start': start, 'End': end,
                     'Strand': strand, 'gene_id': gene_id, 'gene_name': gene_name,
+                    'gene_type': gene_type,
                 }
                 if feature == 'gene':
                     gene_rows.append(row)
@@ -255,7 +278,91 @@ def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]
     _log(f"  GTF streaming complete: {lines_read:,} lines read")
     _log(f"  Extracted {len(gene_rows):,} gene rows, {len(exon_rows):,} exon rows")
 
-    _empty_cols = ['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name']
+    _empty_cols = ['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name', 'gene_type']
+    genes_pd = pd.DataFrame(gene_rows) if gene_rows else pd.DataFrame(columns=_empty_cols)
+    exons_pd = pd.DataFrame(exon_rows) if exon_rows else pd.DataFrame(columns=_empty_cols)
+
+    result = (genes_pd, exons_pd)
+    _gtf_cache_put(cache_key, result)
+    return result
+
+
+def _parse_refgene_streaming(refgene_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]:
+    """Stream-parse a UCSC refGene.txt(.gz) file into (genes_pd, exons_pd).
+
+    Produces the same DataFrame schema as :func:`_parse_gtf_streaming` so
+    every downstream consumer (feature interval builders, TSS map, overlap
+    join, nearest-TSS lookup) works unchanged.
+
+    refGene schema (relevant cols): ``bin, name, chrom, strand, txStart,
+    txEnd, cdsStart, cdsEnd, exonCount, exonStarts, exonEnds, score,
+    name2``. Coords are already 0-based half-open. ``name`` is the RefSeq
+    accession (NM_*/NR_*); ``name2`` is the curated gene symbol. Each
+    transcript becomes one ``genes_pd`` row (``gene_id`` = accession,
+    ``gene_name`` = symbol) and one ``exons_pd`` row per exon. ``gene_type``
+    is derived from the accession prefix: ``NM_`` -> ``protein_coding``,
+    ``NR_`` -> ``non-coding``.
+
+    Cached in the same ``_GTF_CACHE`` keyed with a ``refgene::`` prefix
+    so RefSeq and GTF sources never collide.
+    """
+    import pandas as pd
+
+    cache_key = "refgene::" + str(Path(refgene_path).resolve())
+    cached = _gtf_cache_get(cache_key)
+    if cached is not None:
+        _log(f"  refGene cache hit for {cache_key}")
+        return cached
+
+    gene_rows: list[dict] = []
+    exon_rows: list[dict] = []
+    is_gzip = refgene_path.endswith('.gz')
+    open_fn = gzip.open if is_gzip else open
+
+    lines_read = 0
+    try:
+        with open_fn(refgene_path, 'rt') as f:
+            for line in f:
+                lines_read += 1
+                if not line.strip() or line.startswith('#'):
+                    continue
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 13:
+                    continue
+                acc      = parts[1]
+                chrom    = parts[2]
+                strand   = parts[3]
+                tx_start = int(parts[4])   # refGene is already 0-based half-open
+                tx_end   = int(parts[5])
+                ex_starts = [int(x) for x in parts[9].rstrip(',').split(',') if x]
+                ex_ends   = [int(x) for x in parts[10].rstrip(',').split(',') if x]
+                symbol   = parts[12]
+                gene_type = "protein_coding" if acc.startswith("NM_") else "non-coding"
+
+                # One genes_pd row per transcript: TSS = txStart on + strand,
+                # txEnd on - strand. Multiple transcripts of the same symbol
+                # become multiple entries, which is correct: a gene's
+                # alternative TSSs are real biology and the nearest-TSS
+                # rule should consider each one.
+                gene_rows.append({
+                    'Chromosome': chrom, 'Start': tx_start, 'End': tx_end,
+                    'Strand': strand, 'gene_id': acc, 'gene_name': symbol,
+                    'gene_type': gene_type,
+                })
+                for es, ee in zip(ex_starts, ex_ends):
+                    exon_rows.append({
+                        'Chromosome': chrom, 'Start': es, 'End': ee,
+                        'Strand': strand, 'gene_id': acc, 'gene_name': symbol,
+                        'gene_type': gene_type,
+                    })
+    except Exception as e:
+        _log(f"  ERROR parsing refGene (read {lines_read:,} lines): {e}")
+        raise
+
+    _log(f"  refGene streaming complete: {lines_read:,} transcripts read")
+    _log(f"  Extracted {len(gene_rows):,} gene rows, {len(exon_rows):,} exon rows")
+
+    _empty_cols = ['Chromosome', 'Start', 'End', 'Strand', 'gene_id', 'gene_name', 'gene_type']
     genes_pd = pd.DataFrame(gene_rows) if gene_rows else pd.DataFrame(columns=_empty_cols)
     exons_pd = pd.DataFrame(exon_rows) if exon_rows else pd.DataFrame(columns=_empty_cols)
 
@@ -280,8 +387,16 @@ def _annotate_chromosome_chunk(
     chrom: str,
     chrom_sites: pl.DataFrame,
     chrom_features_df: "pd.DataFrame",
+    multi_annotation: bool = False,
 ) -> "pd.DataFrame":
-    """Run overlap + best-pick for one chromosome. Returns pandas DataFrame."""
+    """Run overlap + best-pick for one chromosome. Returns pandas DataFrame.
+
+    When ``multi_annotation`` is True, also adds two object columns:
+    ``all_genes`` (list[str] per site) and ``all_features`` (list[str] per
+    site). They are aggregated from every overlap row before the best-pick
+    reduction, so a site that lies in one gene's intron AND another gene's
+    promoter window is faithfully represented.
+    """
     import bioframe
     import pandas as pd
 
@@ -296,6 +411,10 @@ def _annotate_chromosome_chunk(
         "gene_name":    np.full(chunk_n, "", dtype=object),
         "feature_type": np.full(chunk_n, "intergenic", dtype=object),
     })
+    if multi_annotation:
+        # Default empty lists for sites with no feature overlaps.
+        result["all_genes"]    = [[] for _ in range(chunk_n)]
+        result["all_features"] = [[] for _ in range(chunk_n)]
 
     if chrom_features_df.empty:
         _log(f"  {chrom}: no features -> all intergenic")
@@ -340,6 +459,38 @@ def _annotate_chromosome_chunk(
         del joined
         gc.collect()
 
+        # ----- annotatr-style multi-annotation aggregation -----
+        # Done BEFORE _pick_best_overlap reduces joined_df, so every gene /
+        # feature that overlaps each site is captured (intronic-host AND
+        # promoter-of-neighbour, etc.). Empty/sentinel values from the
+        # left-join's no-match rows are filtered out so a no-overlap site
+        # stays with the empty-list defaults seeded above.
+        if multi_annotation:
+            feat_col_j = "Feature_b"   if "Feature_b"   in joined_df.columns else "Feature"
+            gnm_col_j  = "gene_name_b" if "gene_name_b" in joined_df.columns else "gene_name"
+            valid = (
+                joined_df[gnm_col_j].notna()
+                & (joined_df[gnm_col_j].astype(str) != "")
+                & (joined_df[gnm_col_j].astype(str) != "-1")
+            )
+            if valid.any():
+                multi = joined_df.loc[valid, ["_row_idx", gnm_col_j, feat_col_j]].copy()
+                multi[gnm_col_j]  = multi[gnm_col_j].astype(str)
+                multi[feat_col_j] = multi[feat_col_j].astype(str)
+                # Sorted unique per row -- stable, dedup'd, deterministic output
+                gene_lists = (
+                    multi.groupby("_row_idx", sort=False)[gnm_col_j]
+                         .apply(lambda s: sorted(set(s)))
+                )
+                feat_lists = (
+                    multi.groupby("_row_idx", sort=False)[feat_col_j]
+                         .apply(lambda s: sorted(set(s)))
+                )
+                for row_idx, glist in gene_lists.items():
+                    result.at[int(row_idx), "all_genes"] = glist
+                for row_idx, flist in feat_lists.items():
+                    result.at[int(row_idx), "all_features"] = flist
+
         _log(f"  {chrom}: picking best overlaps ...")
         best = _pick_best_overlap(joined_df)
         _log(f"  {chrom}: {_df_info('best', best)}")
@@ -379,28 +530,53 @@ def _annotate_chromosome_chunk(
 # Public API
 
 def _build_features_index(
-    annotation_gtf: str,
+    annotation_path: str,
     features: tuple[str, ...],
     promoter_upstream_bp: int,
     promoter_downstream_bp: int,
-) -> tuple[dict[str, Any], Any, Any]:
+    source: str = "gtf",
+    gene_type_filter: tuple[str, ...] | None = None,
+) -> tuple[dict[str, Any], Any, Any, dict[str, tuple[Any, Any, Any]]]:
     """Build (or fetch from cache) the per-chromosome feature index + lookups.
 
-    Returns ``(features_by_chrom, tss_series, strand_lut)``. Caches the
-    bundle in ``_BUILT_FEATURES_CACHE`` keyed on the resolved GTF path,
-    feature tuple, and promoter window. ``annotate_features`` calls this
-    instead of inlining Steps 1-5, so a second invocation against the same
-    GTF skips the 5-6 s of dedup / interval construction / groupby /
-    TSS-and-strand-map building.
+    Parameters
+    ----------
+    annotation_path : str
+        Path to the gene model file. Format determined by ``source``.
+    source : {"gtf", "refgene"}, default "gtf"
+        Annotation file format. ``"gtf"`` parses GENCODE/Ensembl GTFs;
+        ``"refgene"`` parses UCSC ``refGene.txt`` (HOMER's default catalog).
+    gene_type_filter : tuple of str or None, default None
+        If set, only genes whose ``gene_type`` matches one of these strings
+        are used to build feature intervals and the nearest-TSS index.
+        Typical: ``("protein_coding",)`` to drop lincRNAs / pseudogenes /
+        novel ENSG predictions and match HOMER+RefSeq's effective behavior.
+
+    Returns
+    -------
+    (features_by_chrom, tss_series, strand_lut, tss_by_chrom)
+        ``tss_by_chrom[chrom] = (sorted_positions, gene_names, strands)`` --
+        three parallel numpy arrays sorted by TSS position, used for
+        annotatr-style nearest-TSS lookup via bisect.
+
+    Caches the bundle in ``_BUILT_FEATURES_CACHE`` keyed on the resolved
+    path, source, feature tuple, promoter window, and gene-type filter so
+    different combinations don't collide.
     """
     import pandas as pd
 
     feature_key = tuple(sorted(set(features)))
+    gtf_key = (
+        tuple(sorted(set(gene_type_filter)))
+        if gene_type_filter is not None else None
+    )
     cache_key = (
-        str(Path(annotation_gtf).resolve()),
+        str(Path(annotation_path).resolve()),
+        source,
         feature_key,
         int(promoter_upstream_bp),
         int(promoter_downstream_bp),
+        gtf_key,
     )
     cached = _built_features_cache_get(cache_key)
     if cached is not None:
@@ -411,23 +587,32 @@ def _build_features_index(
         return cached
 
     # ------------------------------------------------------------------
-    # Step 1: Parse GTF (uses _GTF_CACHE after first call)
+    # Step 1: Parse annotation source (uses _GTF_CACHE after first call)
     # ------------------------------------------------------------------
-    _log("Step 1/8: stream-parsing GTF (gene and exon rows only) ...")
+    if source == "gtf":
+        _log("Step 1/8: stream-parsing GTF (gene and exon rows only) ...")
+    elif source == "refgene":
+        _log("Step 1/8: stream-parsing UCSC refGene ...")
+    else:
+        raise ValueError(f"Unknown source: {source!r} (expected 'gtf' or 'refgene')")
+
     t0 = time.time()
     try:
-        genes_pd, exons_pd = _parse_gtf_streaming(annotation_gtf)
-        _log(f"  GTF parsed in {time.time()-t0:.1f}s")
+        if source == "gtf":
+            genes_pd, exons_pd = _parse_gtf_streaming(annotation_path)
+        else:
+            genes_pd, exons_pd = _parse_refgene_streaming(annotation_path)
+        _log(f"  parsed in {time.time()-t0:.1f}s")
         _log(f"  {_df_info('genes_pd', genes_pd)}")
         _log(f"  {_df_info('exons_pd (raw)', exons_pd)}")
         gc.collect()
         _log("  Intermediate data freed")
     except Exception:
-        _log(f"FATAL: error parsing GTF:\n{traceback.format_exc()}")
+        _log(f"FATAL: error parsing annotation source:\n{traceback.format_exc()}")
         raise
 
     if "gene_id" not in genes_pd.columns:
-        raise ValueError("GTF missing 'gene_id' attribute column")
+        raise ValueError("Annotation source missing 'gene_id' attribute column")
     if "gene_name" not in genes_pd.columns:
         genes_pd["gene_name"] = genes_pd["gene_id"]
     if "gene_name" not in exons_pd.columns:
@@ -435,6 +620,23 @@ def _build_features_index(
             genes_pd[["gene_id", "gene_name"]].drop_duplicates(),
             on="gene_id", how="left",
         )
+
+    # Apply gene_type filter (if requested). Drops both gene rows and any
+    # exons belonging to those genes, so downstream feature intervals and
+    # the nearest-TSS index only see the kept genes.
+    if gene_type_filter is not None:
+        allow = set(gene_type_filter)
+        n_before = len(genes_pd)
+        if "gene_type" not in genes_pd.columns:
+            _log(f"  WARNING: gene_type_filter={allow} requested but source "
+                 f"didn't expose gene_type; falling through (no filter applied)")
+        else:
+            kept_gene_ids = set(genes_pd.loc[genes_pd["gene_type"].isin(allow), "gene_id"])
+            genes_pd = genes_pd[genes_pd["gene_id"].isin(kept_gene_ids)].reset_index(drop=True)
+            if "gene_id" in exons_pd.columns:
+                exons_pd = exons_pd[exons_pd["gene_id"].isin(kept_gene_ids)].reset_index(drop=True)
+            _log(f"  gene_type filter {allow}: {n_before:,} -> {len(genes_pd):,} genes "
+                 f"({len(genes_pd)/max(n_before,1):.1%} retained)")
 
     # ------------------------------------------------------------------
     # Step 2: Deduplicate exons
@@ -517,8 +719,11 @@ def _build_features_index(
     # Step 5: Build TSS map and strand lookup (both keyed by gene_id;
     # used in Step 8 for TSS-distance + sign).
     # ------------------------------------------------------------------
-    _log("Step 5/8: building TSS map ...")
-    _g = genes_pd[["gene_id", "Start", "End", "Strand"]].drop_duplicates("gene_id")
+    _log("Step 5/8: building TSS map (per-gene_id) and per-chrom TSS arrays ...")
+    _g = (
+        genes_pd[["gene_id", "Chromosome", "Start", "End", "Strand", "gene_name"]]
+        .drop_duplicates("gene_id")
+    )
     tss_values = np.where(
         _g["Strand"].to_numpy() != "-",
         _g["Start"].to_numpy(),
@@ -530,27 +735,140 @@ def _build_features_index(
         index=_g["gene_id"].to_numpy(),
         dtype=object,
     )
-    _log(f"  TSS map built: {len(tss_series):,} genes")
-    del _g, genes_pd, exons_pd
+
+    # Per-chromosome sorted TSS arrays for bisect-based nearest-TSS lookup
+    # (annotatr/HOMER-style). Each entry holds three parallel arrays already
+    # sorted ascending by TSS position so a chunk can do
+    # ``np.searchsorted(positions, center)`` for O(log N) lookup. Built
+    # unconditionally -- the cost is negligible (a sort per chromosome) and
+    # keeping it in the same cache means ``multi_annotation`` toggling
+    # doesn't invalidate the bundle.
+    _g_tss = _g.assign(_tss=tss_values).sort_values(["Chromosome", "_tss"])
+    tss_by_chrom: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for chrom_name, grp in _g_tss.groupby("Chromosome", sort=False):
+        tss_by_chrom[str(chrom_name)] = (
+            grp["_tss"].to_numpy(dtype=np.int64),
+            grp["gene_name"].to_numpy(dtype=object),
+            grp["Strand"].to_numpy(dtype=object),
+        )
+    _log(f"  TSS map built: {len(tss_series):,} genes; "
+         f"per-chrom TSS arrays across {len(tss_by_chrom)} chromosomes")
+    del _g, _g_tss, genes_pd, exons_pd
     gc.collect()
 
-    bundle = (features_by_chrom, tss_series, strand_lut)
+    bundle = (features_by_chrom, tss_series, strand_lut, tss_by_chrom)
     _built_features_cache_put(cache_key, bundle)
     return bundle
 
 
+def _detect_annotation_source(path: str) -> str:
+    """Infer ``"gtf"`` or ``"refgene"`` from a file path.
+
+    Accepts the canonical extensions and a fallback heuristic on the
+    filename. Raises ``ValueError`` with a useful message if neither
+    matches so the caller knows to pass ``source=`` explicitly.
+    """
+    p = path.lower()
+    if p.endswith(".gtf") or p.endswith(".gtf.gz"):
+        return "gtf"
+    if p.endswith(".refgene.txt") or p.endswith(".refgene.txt.gz"):
+        return "refgene"
+    # Loose heuristic: "refgene" anywhere in the basename catches UCSC's
+    # canonical "refGene.txt[.gz]" plus most user-renamed variants.
+    base = Path(path).name.lower()
+    if "refgene" in base:
+        return "refgene"
+    raise ValueError(
+        f"Cannot auto-detect annotation source from path {path!r}. "
+        f"Expected a .gtf[.gz] or refGene.txt[.gz] file, or pass "
+        f"source='gtf'|'refgene' explicitly."
+    )
+
+
 def annotate_features(
     sites: pl.DataFrame,
-    annotation_gtf: str,
-    features: list[str] | tuple[str, ...] = ("promoter", "exon", "intron", "intergenic"),
+    annotation: str,
+    *,
+    source: str = "auto",
+    features: list[str] | tuple[str, ...] = ("promoter", "exon", "intron"),
     promoter_upstream_bp: int = 2000,
     promoter_downstream_bp: int = 200,
+    multi_annotation: bool = True,
+    gene_type_filter: str | list[str] | None = None,
 ) -> pl.DataFrame:
     """Annotate DMC / DMR sites with gene-level genomic features.
 
-    The GTF is parsed once per process and cached; subsequent calls with the
-    same file path skip the 60-90 s streaming step entirely.
+    Parameters
+    ----------
+    sites : polars DataFrame
+        Per-site or per-region table with at least ``chrom`` and either
+        ``pos`` (single-base sites) or ``start`` + ``end`` (regions).
+    annotation : str
+        Path to a gene-model file. Format is auto-detected from the
+        extension: ``.gtf`` / ``.gtf.gz`` -> GENCODE/Ensembl GTF;
+        ``refGene.txt`` / ``refGene.txt.gz`` -> UCSC RefSeq (HOMER's
+        default catalog). Pass ``source=`` to override if your filename
+        doesn't follow the convention.
+    source : {"auto", "gtf", "refgene"}, keyword-only, default "auto"
+        Format override for the annotation file. ``"auto"`` infers from
+        the extension; the explicit values are an escape hatch for
+        unusually-named files.
+    features : sequence of str, keyword-only
+        Feature classes to build overlap intervals for. Sites that don't
+        hit any are reported as ``feature_type="intergenic"`` automatically
+        -- "intergenic" is the fallback, not something you opt into.
+        Default builds promoter / exon / intron.
+    promoter_upstream_bp, promoter_downstream_bp : int, keyword-only
+        Promoter window around each gene's TSS. Default ``(-2000, +200)``
+        matches the conventional "core promoter" definition.
+    multi_annotation : bool, keyword-only, default True
+        If True (default), also adds four annotatr-style columns alongside
+        the single-best pick. Set to False to get only the legacy four-
+        column output (``gene_id``, ``gene_name``, ``feature_type``,
+        ``distance_to_tss``) -- useful for narrow storage or when downstream
+        code asserts on exact column sets. New columns when True:
+
+          - ``nearest_tss_gene`` (Utf8) -- gene whose TSS is closest to the
+            site center (HOMER's rule).
+          - ``nearest_tss_distance`` (Int32) -- signed bp distance from
+            site center to that TSS, flipped for ``-`` strand so positive
+            is downstream in transcription direction.
+          - ``all_overlapping_genes`` (List[Utf8]) -- every gene whose
+            feature interval overlaps the site (one-to-many).
+          - ``all_overlapping_features`` (List[Utf8]) -- every feature type
+            that overlaps (e.g. ``["intron", "promoter"]``).
+    gene_type_filter : str or sequence of str or None, keyword-only
+        If set, only genes whose ``gene_type`` matches are used to build
+        overlap intervals and the nearest-TSS index. Typical:
+        ``"protein_coding"`` to drop lincRNAs / pseudogenes / novel
+        predictions. Works on both GTF (via ``gene_type`` /
+        ``gene_biotype`` attribute) and refGene (NM_* -> protein_coding,
+        NR_* -> non-coding). A bare string is treated as a 1-element list.
+
+    Examples
+    --------
+    >>> # GTF, auto-detected
+    >>> annotate_features(sites, "genes.gtf.gz", gene_type_filter="protein_coding")
+    >>> # UCSC RefSeq (HOMER's default catalog), auto-detected
+    >>> annotate_features(sites, "refGene.txt.gz")
+    >>> # Unusually-named file; explicit override
+    >>> annotate_features(sites, "my_genes.tsv", source="refgene")
     """
+    # Resolve source (auto-detect if needed)
+    if source == "auto":
+        source = _detect_annotation_source(annotation)
+    elif source not in ("gtf", "refgene"):
+        raise ValueError(
+            f"source must be 'auto', 'gtf', or 'refgene'; got {source!r}"
+        )
+
+    # Normalize gene_type_filter to tuple or None
+    if isinstance(gene_type_filter, str):
+        gene_type_filter_norm: tuple[str, ...] | None = (gene_type_filter,)
+    elif gene_type_filter is None:
+        gene_type_filter_norm = None
+    else:
+        gene_type_filter_norm = tuple(gene_type_filter)
     try:
         import bioframe  # noqa: F401  (presence-check; used inside _annotate_chromosome_chunk)
     except ImportError as exc:
@@ -561,26 +879,31 @@ def annotate_features(
     _log("=" * 60)
     _log("annotate_features START")
     _log(f"  sites input: {_df_info('sites', sites)}")
-    _log(f"  GTF: {annotation_gtf}")
+    _log(f"  source: {source} -> {annotation}")
     _log(f"  features requested: {list(features)}")
     _log(f"  promoter window: -{promoter_upstream_bp} / +{promoter_downstream_bp}")
+    _log(f"  multi_annotation: {multi_annotation}")
+    _log(f"  gene_type_filter: {gene_type_filter_norm}")
 
     n = len(sites)
     t_total = time.time()
 
     # ------------------------------------------------------------------
-    # Steps 1-5: GTF parse + dedup + feature intervals + groupby + TSS/strand
-    # maps. All five outputs are pure functions of (GTF path, features tuple,
-    # promoter window) — independent of the input ``sites`` — so we cache the
-    # bundle in _BUILT_FEATURES_CACHE. On a second call inside the same script
-    # (e.g. annotate(md) which annotates DMC then DMR), this shaves ~5 s off
-    # the redundant build.
+    # Steps 1-5: source parse + dedup + feature intervals + groupby +
+    # TSS/strand maps. All five outputs are pure functions of (source path,
+    # source format, feature tuple, promoter window, gene_type filter) --
+    # independent of the input ``sites`` -- so we cache the bundle in
+    # _BUILT_FEATURES_CACHE keyed on all of those. A second call inside the
+    # same script (e.g. annotate(md) which annotates DMC then DMR) hits the
+    # cache and skips the 5-6 s of dedup / interval construction.
     # ------------------------------------------------------------------
-    features_by_chrom, tss_series, strand_lut = _build_features_index(
-        annotation_gtf,
+    features_by_chrom, tss_series, strand_lut, tss_by_chrom = _build_features_index(
+        annotation,
         tuple(features),
         promoter_upstream_bp,
         promoter_downstream_bp,
+        source=source,
+        gene_type_filter=gene_type_filter_norm,
     )
 
     # ------------------------------------------------------------------
@@ -613,7 +936,10 @@ def annotate_features(
 
         t0 = time.time()
         try:
-            part = _annotate_chromosome_chunk(chrom, chrom_sites, chrom_features)
+            part = _annotate_chromosome_chunk(
+                chrom, chrom_sites, chrom_features,
+                multi_annotation=multi_annotation,
+            )
             annot_parts.append(part)
             _log(f"  {chrom}: done in {time.time()-t0:.1f}s")
         except Exception:
@@ -624,6 +950,9 @@ def annotate_features(
                 "gene_name":    np.full(chunk_n, "", dtype=object),
                 "feature_type": np.full(chunk_n, "intergenic", dtype=object),
             })
+            if multi_annotation:
+                part["all_genes"]    = [[] for _ in range(chunk_n)]
+                part["all_features"] = [[] for _ in range(chunk_n)]
             annot_parts.append(part)
 
         gc.collect()
@@ -639,13 +968,16 @@ def annotate_features(
             .reset_index(drop=True)
         )
     else:
-        _log("  WARNING: annot_parts is empty — returning all-intergenic")
+        _log("  WARNING: annot_parts is empty -- returning all-intergenic")
         annot_all = pd.DataFrame({
             "_orig_idx":    np.arange(n, dtype=np.int32),
             "gene_id":      np.full(n, "", dtype=object),
             "gene_name":    np.full(n, "", dtype=object),
             "feature_type": np.full(n, "intergenic", dtype=object),
         })
+        if multi_annotation:
+            annot_all["all_genes"]    = [[] for _ in range(n)]
+            annot_all["all_features"] = [[] for _ in range(n)]
 
     _log(f"  {_df_info('annot_all (reassembled)', annot_all)}")
 
@@ -679,6 +1011,55 @@ def annotate_features(
     dist_to_tss              = (strand_sign * (site_mids - tss_positions)).astype(np.float32)
     dist_to_tss[gene_ids == ""] = np.nan
 
+    # ------------------------------------------------------------------
+    # Multi-annotation extras (annotatr-style): nearest-TSS lookup +
+    # one-to-many gene/feature lists. Only built when requested.
+    # ------------------------------------------------------------------
+    multi_columns: list[pl.Series] = []
+    if multi_annotation:
+        _log("Step 8b/8: computing nearest-TSS (annotatr/HOMER-style) ...")
+        site_chroms = sites["chrom"].to_list()
+        # Reuse site_mids computed just above
+        nearest_genes    = np.full(n, "", dtype=object)
+        nearest_dist     = np.full(n, np.iinfo(np.int32).min, dtype=np.int64)
+        for i in range(n):
+            chrom = site_chroms[i]
+            entry = tss_by_chrom.get(chrom)
+            if entry is None:
+                continue
+            sorted_pos, sorted_names, sorted_strands = entry
+            center = int(site_mids[i])
+            # Two candidates around bisect_left, pick whichever has smaller
+            # |center - tss|. Handles both edges via list indexing guards.
+            idx = int(np.searchsorted(sorted_pos, center, side="left"))
+            cand_idxs = []
+            if idx > 0: cand_idxs.append(idx - 1)
+            if idx < len(sorted_pos): cand_idxs.append(idx)
+            if not cand_idxs:
+                continue
+            best_i = min(cand_idxs, key=lambda k: abs(int(sorted_pos[k]) - center))
+            sign = -1 if sorted_strands[best_i] == "-" else 1
+            nearest_genes[i] = str(sorted_names[best_i])
+            nearest_dist[i]  = sign * (center - int(sorted_pos[best_i]))
+
+        # Clip to int32 range to keep the polars dtype small; sentinel for
+        # chroms missing from the GTF is "" gene + NaN distance.
+        sentinel_min = np.iinfo(np.int32).min
+        missing = nearest_dist == sentinel_min
+        nearest_dist_clip = np.clip(nearest_dist, np.iinfo(np.int32).min + 1,
+                                    np.iinfo(np.int32).max).astype(np.int32)
+        # Polars Int32 doesn't carry NaN -- encode "no TSS found" as int32.min
+        nearest_dist_clip[missing] = np.iinfo(np.int32).min
+
+        multi_columns = [
+            pl.Series("nearest_tss_gene",     nearest_genes.tolist(), dtype=pl.Utf8),
+            pl.Series("nearest_tss_distance", nearest_dist_clip,       dtype=pl.Int32),
+            pl.Series("all_overlapping_genes",
+                      annot_all["all_genes"].tolist(),    dtype=pl.List(pl.Utf8)),
+            pl.Series("all_overlapping_features",
+                      annot_all["all_features"].tolist(), dtype=pl.List(pl.Utf8)),
+        ]
+
     _log(f"annotate_features DONE  total elapsed {time.time()-t_total:.1f}s")
     _log("=" * 60)
 
@@ -687,6 +1068,7 @@ def annotate_features(
         pl.Series("gene_name",       gene_names.tolist(),    dtype=pl.Utf8),
         pl.Series("feature_type",    feature_types.tolist(), dtype=pl.Utf8),
         pl.Series("distance_to_tss", dist_to_tss,            dtype=pl.Float32),
+        *multi_columns,
     ])
 
 
@@ -701,7 +1083,7 @@ def annotate_cpg_islands(
     _log(f"  BED: {cpg_island_bed}")
 
     if len(sites) == 0:
-        _log("  sites is empty — returning early with no cpg_context column")
+        _log("  sites is empty -- returning early with no cpg_context column")
         return sites
 
     try:

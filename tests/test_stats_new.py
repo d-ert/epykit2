@@ -18,14 +18,14 @@ def test_shrink_meth_diff_pulls_low_information_toward_zero():
     """A site with a wide CI (large SE) should be shrunk hard; a site
     with a tight CI should barely move.
 
-    τ² is estimated from the empirical variance of meth_diff across
+    tau^2 is estimated from the empirical variance of meth_diff across
     sites, minus the mean sampling variance. So the test data must
-    have some real between-site variance, otherwise τ²=0 collapses
+    have some real between-site variance, otherwise tau^2=0 collapses
     every estimate to 0 (which is the *correct* EB answer when there's
-    no signal — see test_shrink_meth_diff_handles_no_signal).
+    no signal -- see test_shrink_meth_diff_handles_no_signal).
     """
     rng = np.random.default_rng(13)
-    # 100 sites: a real signal exists (true effects ±0.4), but observed
+    # 100 sites: a real signal exists (true effects +/-0.4), but observed
     # estimates carry sampling noise that's much smaller on tight-CI sites
     # than wide-CI sites.
     n = 100
@@ -44,9 +44,9 @@ def test_shrink_meth_diff_pulls_low_information_toward_zero():
     assert "shrinkage_factor" in out.columns
 
     sf = out.get_column("shrinkage_factor").to_numpy()
-    # τ² should be ~0.13 (var of ±0.4 mixture). Tight SE² ≈ 0.0009, wide
-    # SE² ≈ 0.09. Shrinkage factor tight = 0.13/(0.13+0.0009) ≈ 0.993;
-    # wide = 0.13/(0.13+0.09) ≈ 0.59.
+    # tau^2 should be ~0.13 (var of +/-0.4 mixture). Tight SE^2 ~= 0.0009, wide
+    # SE^2 ~= 0.09. Shrinkage factor tight = 0.13/(0.13+0.0009) ~= 0.993;
+    # wide = 0.13/(0.13+0.09) ~= 0.59.
     mean_tight = float(np.nanmean(sf[: n // 2]))
     mean_wide = float(np.nanmean(sf[n // 2:]))
     assert mean_tight > 0.90, (
@@ -59,12 +59,12 @@ def test_shrink_meth_diff_pulls_low_information_toward_zero():
 
 
 def test_shrink_meth_diff_handles_no_signal():
-    """If all observed Δβ are within sampling noise, τ² collapses to 0
+    """If all observed Deltabeta are within sampling noise, tau^2 collapses to 0
     and every shrunk estimate is exactly 0."""
     rng = np.random.default_rng(0)
     n = 200
     se = np.full(n, 0.10)
-    md = rng.normal(0, 0.10, size=n)  # mean 0, sd matches SE → no real signal
+    md = rng.normal(0, 0.10, size=n)  # mean 0, sd matches SE -> no real signal
     df = pl.DataFrame({
         "meth_diff": md,
         "meth_diff_ci_lo": md - 1.96 * se,
@@ -72,8 +72,8 @@ def test_shrink_meth_diff_handles_no_signal():
     })
     out = shrink_meth_diff(df)
     shrunk = out.get_column("meth_diff_shrunk").to_numpy()
-    # With τ² = max(0, Var(md) − mean(SE²)) ≈ max(0, ~0.01 − ~0.01) ≈ 0
-    # → every shrunk value is 0.
+    # With tau^2 = max(0, Var(md) - mean(SE^2)) ~= max(0, ~0.01 - ~0.01) ~= 0
+    # -> every shrunk value is 0.
     assert np.all(np.abs(shrunk) < 1e-6)
 
 
@@ -90,13 +90,13 @@ def test_shrink_meth_diff_real_dmc_table(synth_md_filtered):
     out = shrink_meth_diff(df)
     n_finite = out.filter(pl.col("meth_diff_shrunk").is_finite()).height
     assert n_finite > 0
-    # On real data, |shrunk| ≤ |raw| at every site (no shrinkage
+    # On real data, |shrunk| <= |raw| at every site (no shrinkage
     # estimator can amplify a signal).
     raw = df.get_column("meth_diff").to_numpy()
     shr = out.get_column("meth_diff_shrunk").to_numpy()
     finite = np.isfinite(raw) & np.isfinite(shr)
     assert np.all(np.abs(shr[finite]) <= np.abs(raw[finite]) + 1e-9), (
-        "shrunk |Δβ| should never exceed raw |Δβ|"
+        "shrunk |Deltabeta| should never exceed raw |Deltabeta|"
     )
 
 
@@ -104,12 +104,12 @@ def test_shrink_meth_diff_real_dmc_table(synth_md_filtered):
 
 
 def test_impute_knn_beta_fills_gaps_in_a_smooth_signal():
-    """A sample with a slowly-varying β profile and a few NaN holes
+    """A sample with a slowly-varying beta profile and a few NaN holes
     should impute back to near the local mean."""
     rng = np.random.default_rng(7)
     n_sites = 100
     positions = (np.arange(n_sites) * 100).astype(np.int64)
-    # Sinusoidal β trace per sample.
+    # Sinusoidal beta trace per sample.
     true_beta = 0.5 + 0.3 * np.sin(np.arange(n_sites) / 6.0)
     beta_full = np.tile(true_beta, (3, 1)) + rng.normal(0, 0.01, (3, n_sites))
     beta_with_holes = beta_full.copy()
@@ -120,7 +120,7 @@ def test_impute_knn_beta_fills_gaps_in_a_smooth_signal():
     # for the local mean differing from the exact point estimate).
     err = np.abs(imputed[0, hole_idx] - true_beta[hole_idx])
     assert (err < 0.1).all(), (
-        f"kNN imputation errors {err} exceed 0.1 — local kNN should "
+        f"kNN imputation errors {err} exceed 0.1 -- local kNN should "
         "recover a smoothly-varying signal."
     )
     # Sample 0's non-hole sites are untouched.
@@ -136,12 +136,12 @@ def test_impute_knn_beta_respects_max_distance(capsys):
     positions = np.array([0, 100, 50_000_000, 50_000_100], dtype=np.int64)
     beta = np.array([[0.1, np.nan, 0.8, 0.9]], dtype=np.float64)
     imp = impute_knn_beta(positions, beta, k=2, max_distance_bp=1_000)
-    # Only position 0 is within 1 kb of position 100 → imputes from that.
+    # Only position 0 is within 1 kb of position 100 -> imputes from that.
     assert not np.isnan(imp[0, 1])
     # Now flip: try to impute position 0 with NaN, with neighbours far away.
     beta = np.array([[np.nan, np.nan, 0.8, 0.9]], dtype=np.float64)
     imp = impute_knn_beta(positions, beta, k=2, max_distance_bp=1_000)
-    # No covered neighbour within 1 kb of position 0 → stays NaN.
+    # No covered neighbour within 1 kb of position 0 -> stays NaN.
     assert np.isnan(imp[0, 0])
 
 
@@ -166,7 +166,7 @@ def test_impute_knn_anndata_per_chromosome_smoke(tmp_path):
     positions = np.concatenate([
         np.arange(50) * 100, np.arange(50) * 100,
     ]).astype(np.int64)
-    # Truth: sinusoidal β; introduce NaN holes per sample.
+    # Truth: sinusoidal beta; introduce NaN holes per sample.
     truth = 0.5 + 0.3 * np.sin(np.arange(100) / 5.0)
     X = np.tile(truth, (3, 1)) + rng.normal(0, 0.01, (3, 100))
     X[0, [10, 11, 60, 75]] = np.nan
@@ -189,7 +189,7 @@ def test_impute_knn_anndata_per_chromosome_smoke(tmp_path):
 
 def test_age_clock_recovers_known_age_from_synthetic_data(synth_md_filtered):
     """Build a tiny synthetic clock from the synth fixture: assign each
-    sample a 'true age' linearly from a handful of CpG β values, then
+    sample a 'true age' linearly from a handful of CpG beta values, then
     confirm the runner recovers it."""
     md = synth_md_filtered
     # Pick 10 CpGs from the store via the existing common-sites helper.
@@ -202,7 +202,7 @@ def test_age_clock_recovers_known_age_from_synthetic_data(synth_md_filtered):
         .head(20)
         .with_columns(pl.col("pos").cast(pl.Int64))
     )
-    # Build a coefficient table — give each CpG a known linear weight.
+    # Build a coefficient table -- give each CpG a known linear weight.
     cpg_ids = [f"cg{i:04d}" for i in range(sites.height)]
     coefficients = pl.DataFrame({
         "cpg_id": cpg_ids,
@@ -217,8 +217,8 @@ def test_age_clock_recovers_known_age_from_synthetic_data(synth_md_filtered):
     )
     assert "synth_clock" in md.obs.columns
     ages = md.obs.get_column("synth_clock").to_numpy()
-    # The clock is a linear combination of β values, so all samples
-    # should land in [-∞, +∞] but for sanity, on real β values with
+    # The clock is a linear combination of beta values, so all samples
+    # should land in [-inf, +inf] but for sanity, on real beta values with
     # all-positive coefficients we expect every age to be > 0 and
     # bounded by sum(coef) = 20.
     assert np.all((ages >= 0) & (ages <= 20)), (
@@ -228,13 +228,13 @@ def test_age_clock_recovers_known_age_from_synthetic_data(synth_md_filtered):
 
 
 def test_age_clock_horvath_transform_branches():
-    """The horvath transform piecewise: negative linear → exp-based,
-    positive linear → linear-scale."""
+    """The horvath transform piecewise: negative linear -> exp-based,
+    positive linear -> linear-scale."""
     from epykit.clocks import age_clock as _age_clock_fn  # noqa: F401
     # Direct math check on the transform formula without running on data.
     lin_neg = -0.5
     lin_pos = 1.0
-    transformed_neg = np.exp(lin_neg) - 1.0      # ≈ -0.393
+    transformed_neg = np.exp(lin_neg) - 1.0      # ~= -0.393
     transformed_pos = lin_pos * 21.0 + 20.0      # = 41.0
     assert abs(transformed_neg - (-0.39346934)) < 1e-6
     assert transformed_pos == 41.0
@@ -258,7 +258,7 @@ def test_deconvolve_runs_and_returns_long_format(synth_md_filtered):
     )
     cpg_ids = [f"cg{i:04d}" for i in range(sites.height)]
     rng = np.random.default_rng(11)
-    # Fake reference: 3 cell types with deliberately different β profiles
+    # Fake reference: 3 cell types with deliberately different beta profiles
     # so NNLS has signal to use.
     n = sites.height
     ref = pl.DataFrame({
@@ -272,7 +272,7 @@ def test_deconvolve_runs_and_returns_long_format(synth_md_filtered):
     )
     ep.tl.deconvolve(md, ref, manifest)
     long = md.uns["deconvolution"]
-    # Long format: 3 cell types × n_samples rows.
+    # Long format: 3 cell types x n_samples rows.
     assert long.height == len(samples) * 3
     # Per-sample proportions sum to ~1 (or are all NaN if no coverage).
     for sample in samples:

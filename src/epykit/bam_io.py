@@ -1,27 +1,27 @@
 """BAM ingestion for read-level methylation analyses.
 
 This module is the shared input layer for analyses that need read-level
-methylation information — currently :mod:`epykit.asm` and
+methylation information -- currently :mod:`epykit.asm` and
 :mod:`epykit.entropy`. It does **not** replace the Bismark / MethylDackel
-``.cov`` → Parquet flow that drives ordinary DMC / DMR analyses;
+``.cov`` -> Parquet flow that drives ordinary DMC / DMR analyses;
 ``read_bismark`` and ``read_methyldackel`` remain unchanged.
 
 Two BAM dialects are supported:
 
-  * ``"bismark"`` — methylation calls live in the per-base ``XM`` tag.
+  * ``"bismark"`` -- methylation calls live in the per-base ``XM`` tag.
     The character codes are: ``Z`` methylated CpG, ``z`` unmethylated
     CpG, ``X``/``x`` methylated/unmethylated CHG, ``H``/``h`` CHH,
     ``.`` no call. See Bismark's docs.
-  * ``"methyldackel"`` — the SAM standard ``MM`` (modified-base
+  * ``"methyldackel"`` -- the SAM standard ``MM`` (modified-base
     positions) and ``ML`` (likelihood) tags. ``MM:Z:C+m,...`` flags
     methylated C positions on the forward strand.
 
-Both produce the same long-form output (one row per read × covered
+Both produce the same long-form output (one row per read x covered
 CpG): ``(read_id, chrom, pos, methylation_status, base_qual, mapq,
 mate_pair_id, strand, allele_base)``. Downstream code is dialect-agnostic.
 
 pysam is an optional dependency. Install with
-``pip install 'epykit[bam]'`` (Linux/macOS only — pysam has no Windows
+``pip install 'epykit[bam]'`` (Linux/macOS only -- pysam has no Windows
 wheel).
 """
 
@@ -59,7 +59,7 @@ def _require_pysam():
         raise ImportError(
             "pysam is required for BAM ingestion. "
             "Install with: pip install 'epykit[bam]' "
-            "(Linux/macOS only; pysam has no Windows wheel — "
+            "(Linux/macOS only; pysam has no Windows wheel -- "
             "use 'epykit[methylkit]' for the tabix-only feature set on Windows)."
         ) from exc
     return pysam
@@ -232,7 +232,7 @@ def _extract_methyldackel(read, *, min_baseq: int) -> list[dict[str, object]]:
     if not mm:
         return []
 
-    # MM format: "C+m,N1,N2,...;" — N_i = number of C residues to skip.
+    # MM format: "C+m,N1,N2,...;" -- N_i = number of C residues to skip.
     # We support the simple "C+m" prefix (5mC on the forward strand). For
     # robustness, scan the first specifier and bail out on anything else.
     spec, _, body = mm.partition(",")
@@ -275,7 +275,7 @@ def _extract_methyldackel(read, *, min_baseq: int) -> list[dict[str, object]]:
     if len(ml) < len(target_query_idx):
         return []
 
-    # Map query indices → ref positions via the aligned-pairs table.
+    # Map query indices -> ref positions via the aligned-pairs table.
     aligned = dict(read.get_aligned_pairs(matches_only=True))
 
     out: list[dict[str, object]] = []

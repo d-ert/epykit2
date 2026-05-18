@@ -2,10 +2,10 @@
 
 When the binomial GLM in ``_glm.irls_binomial_batch`` hits a site where one
 covered sample's linear predictor saturates the eta clip bound (logistic
-"separation"), the per-sample Pearson denominator ``n · mu · (1 - mu)``
-collapses to ``n · _PROP_CLIP``. Without the saturation guard the per-site
+"separation"), the per-sample Pearson denominator ``n * mu * (1 - mu)``
+collapses to ``n * _PROP_CLIP``. Without the saturation guard the per-site
 Pearson chi-square blows up to ~10^7 at those samples and drives the
-chrom-pooled dispersion estimate from O(1) to O(10^6) — exactly the bug
+chrom-pooled dispersion estimate from O(1) to O(10^6) -- exactly the bug
 reported on real data (LR phi=2.5, GLM phi=1.35M on the same tiles).
 
 These tests construct a tiny mixed batch of well-fitted and separated
@@ -45,7 +45,7 @@ def _make_design_treatment_donor() -> np.ndarray:
 
 
 def test_well_fitted_site_produces_sane_pearson():
-    """Site with moderate methylation in both groups — no separation."""
+    """Site with moderate methylation in both groups -- no separation."""
     X = _make_design_treatment_donor()
     # 50% methylation in controls, 60% in treated. n=20 reads per sample.
     meth = np.array([[10, 10, 10, 12, 12, 12]], dtype=np.int32)

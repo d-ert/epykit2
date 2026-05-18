@@ -8,10 +8,10 @@ full design against a reduced design with the treatment column removed.
 
 The implementation is a single-pass batched IRLS:
 
-    eta_ij  = X_j · beta_i              # linear predictor at site i, sample j
+    eta_ij  = X_j * beta_i              # linear predictor at site i, sample j
     mu_ij   = sigmoid(eta_ij)
-    w_ij    = n_ij · mu_ij · (1 - mu_ij) # binomial GLM weight (cov = trials)
-    z_ij    = eta_ij + (y_ij/n_ij - mu_ij) / (mu_ij · (1 - mu_ij))
+    w_ij    = n_ij * mu_ij * (1 - mu_ij) # binomial GLM weight (cov = trials)
+    z_ij    = eta_ij + (y_ij/n_ij - mu_ij) / (mu_ij * (1 - mu_ij))
     beta_i  = (X' W_i X)^{-1} X' W_i z_i
 
 At each iteration we build a (n_sites, p, p) batch of normal equations via
@@ -76,7 +76,7 @@ def build_design(
         that ``treatment_col`` is present and produces a reduced design
         with that column dropped. When False (used by the multi-group /
         contrast path in :func:`tl.dmc`), the reduced design is set to
-        ``None`` and ``coef_idx`` becomes ``-1`` — the caller is expected
+        ``None`` and ``coef_idx`` becomes ``-1`` -- the caller is expected
         to use :func:`wald_test` against a contrast matrix instead of a
         full-vs-reduced deviance test.
     return_design_info
@@ -209,7 +209,7 @@ def irls_dispatch(
 ):
     """Dispatch IRLS to the CPU (default) or GPU backend.
 
-    ``backend="cpu"`` calls :func:`irls_binomial_batch` directly — the
+    ``backend="cpu"`` calls :func:`irls_binomial_batch` directly -- the
     historical, default path. ``backend="gpu"`` imports
     :mod:`epykit._glm_gpu` lazily and routes through CuPy. Both return
     the same shapes and dtypes; downstream code is GPU-agnostic.
@@ -241,7 +241,7 @@ def irls_binomial_batch(
 
     Fits one independent GLM per row (= per site / tile) where the response
     is ``meth_ij`` successes out of ``cov_ij`` trials at sample j, modelled
-    as ``logit(mu_ij) = X_j · beta_i``.
+    as ``logit(mu_ij) = X_j * beta_i``.
 
     Parameters
     ----------
@@ -270,7 +270,7 @@ def irls_binomial_batch(
     sample's eta reached the +/-30 clip bound) are NaN'd in ``deviance``,
     ``pearson_chi2``, ``beta`` and ``se_beta``. This is required for a
     sane Pearson dispersion: without it the Pearson denominator
-    ``n · mu · (1 - mu)`` collapses to ``n · _PROP_CLIP`` at saturated
+    ``n * mu * (1 - mu)`` collapses to ``n * _PROP_CLIP`` at saturated
     samples and per-site chi-sq blows up by ~6 OOM.
     """
     n_sites, n_samples = meth.shape
@@ -305,7 +305,7 @@ def irls_binomial_batch(
         mu = np.clip(mu, _PROP_CLIP, 1.0 - _PROP_CLIP)
         var = mu * (1.0 - mu)
 
-        # Working weights: w = n · mu · (1 - mu). Zero where no coverage.
+        # Working weights: w = n * mu * (1 - mu). Zero where no coverage.
         w = np.where(has_cov, cov_f * var, 0.0)
         # Working response: z = eta + (y/n - mu) / var.
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -329,8 +329,8 @@ def irls_binomial_batch(
     # Detect logistic-regression separation: a covered sample whose linear
     # predictor reached the eta clip bound means the IRLS could not fit a
     # finite mu there (one stratum is fully methylated / unmethylated). At
-    # those samples the Pearson denominator collapses to n · _PROP_CLIP and
-    # (y - n·mu)² / (n · _PROP_CLIP) blows up by ~6 orders of magnitude,
+    # those samples the Pearson denominator collapses to n * _PROP_CLIP and
+    # (y - n*mu)^2 / (n * _PROP_CLIP) blows up by ~6 orders of magnitude,
     # poisoning the chrom-pooled dispersion estimator. Mark separated sites
     # as degenerate so they (a) drop out of compute_dispersion_phi's
     # `usable` mask and (b) carry NaN p-values downstream instead of
@@ -346,7 +346,7 @@ def irls_binomial_batch(
     mu = np.clip(mu, _PROP_CLIP, 1.0 - _PROP_CLIP)
     var = mu * (1.0 - mu)
 
-    # Binomial deviance: 2 · Σ_j [y log(y/(n μ)) + (n-y) log((n-y)/(n(1-μ)))]
+    # Binomial deviance: 2 * Sigma_j [y log(y/(n mu)) + (n-y) log((n-y)/(n(1-mu)))]
     # with the convention 0 log 0 = 0. Zero-coverage samples contribute 0.
     y = meth_f
     n = cov_f
@@ -410,7 +410,7 @@ def irls_binomial_batch(
     # Sites with no usable data are degenerate. Sites where the GLM
     # separated (any covered sample's eta hit the clip bound) are also
     # marked degenerate: the fitted mu there is at the boundary, the
-    # Pearson denominator collapses to n·_PROP_CLIP, and per-site chi-sq
+    # Pearson denominator collapses to n*_PROP_CLIP, and per-site chi-sq
     # blows up by ~6 OOM (driving chrom-pooled phi from O(1) to O(10^6)
     # and producing nonsensical p-values).
     degenerate = (n_eff < 2) | site_separated
@@ -578,7 +578,7 @@ def reference_pvalues(
 
     ``reference="adaptive"`` (default) switches per-site between
     ``F(1, df_resid)`` where ``phi_eff > 1`` (real overdispersion signal)
-    and ``chi2(1)`` where ``phi_eff`` was clamped to 1 — the right
+    and ``chi2(1)`` where ``phi_eff`` was clamped to 1 -- the right
     behaviour for quasi-binomial GLMs whose dispersion estimate is noisy
     at small samples. ``"F"`` and ``"chi2"`` force a single reference
     distribution regardless of per-site dispersion.
@@ -602,7 +602,7 @@ def reference_pvalues(
     return sp_stats.chi2.sf(stat, df=1)
 
 
-# Contrast / Wald-test helpers — used by tl.dmc(formula=..., contrast=...)
+# Contrast / Wald-test helpers -- used by tl.dmc(formula=..., contrast=...)
 
 def resolve_contrast(
     contrast,
@@ -613,17 +613,17 @@ def resolve_contrast(
 
     Accepted forms:
 
-    * ``contrast=str`` naming a single column in ``term_names`` — produces a
-      1×p contrast vector selecting that coefficient (e.g. ``"age"`` for a
+    * ``contrast=str`` naming a single column in ``term_names`` -- produces a
+      1xp contrast vector selecting that coefficient (e.g. ``"age"`` for a
       continuous covariate primary effect).
-    * ``contrast=str`` naming a factor (no exact column match) — every term
+    * ``contrast=str`` naming a factor (no exact column match) -- every term
       whose name starts with ``"<factor>["`` is included (patsy treatment-
-      coded dummies). Returns a k×p contrast for a joint F-test.
+      coded dummies). Returns a kxp contrast for a joint F-test.
     * ``contrast=str`` containing ``"="`` or arithmetic operators (``+``,
-      ``-``, ``*``) — passed to patsy ``DesignInfo.linear_constraint`` for
+      ``-``, ``*``) -- passed to patsy ``DesignInfo.linear_constraint`` for
       named linear contrasts like ``"group[T.KO] - group[T.WT]"``.
       Requires ``design_info`` to be supplied.
-    * ``contrast=np.ndarray`` shape (k, p) — used verbatim.
+    * ``contrast=np.ndarray`` shape (k, p) -- used verbatim.
 
     Returns ``(C, label)`` where ``label`` describes the contrast for
     provenance.
@@ -642,14 +642,14 @@ def resolve_contrast(
             f"contrast must be str or np.ndarray; got {type(contrast).__name__}"
         )
 
-    # Exact column match — single-row contrast selecting that coefficient
+    # Exact column match -- single-row contrast selecting that coefficient
     if contrast in term_names:
         col = term_names.index(contrast)
         C = np.zeros((1, p), dtype=np.float64)
         C[0, col] = 1.0
         return C, contrast
 
-    # Linear-constraint expression — delegate to patsy
+    # Linear-constraint expression -- delegate to patsy
     expr_chars = set("=+-*")
     if any(c in contrast for c in expr_chars) and design_info is not None:
         try:
@@ -667,7 +667,7 @@ def resolve_contrast(
             )
         return C, contrast
 
-    # Factor name — collect every term beginning with "<factor>["
+    # Factor name -- collect every term beginning with "<factor>["
     factor_terms = [
         (i, t) for i, t in enumerate(term_names)
         if t.startswith(f"{contrast}[") or t == f"C({contrast})"
@@ -694,7 +694,7 @@ def wald_test(
     df_resid: Optional[np.ndarray] = None,
     reference: str = "adaptive",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-site Wald / joint-F test of H0: C·beta_i = 0.
+    """Per-site Wald / joint-F test of H0: C*beta_i = 0.
 
     Parameters
     ----------
@@ -703,30 +703,30 @@ def wald_test(
     C               (k, p)                   contrast matrix
     phi_eff         (n_sites,) or None       per-site dispersion to scale
                                              cov_beta by (quasi-binomial).
-                                             None → no scaling (binomial).
+                                             None -> no scaling (binomial).
     df_resid        (n_sites,) or None       per-site residual df for the F
-                                             reference distribution. None →
-                                             chi² reference.
-    reference       {"adaptive","F","chi2"}  How to convert stat → p-value.
+                                             reference distribution. None ->
+                                             chi^2 reference.
+    reference       {"adaptive","F","chi2"}  How to convert stat -> p-value.
                                              ``"adaptive"`` switches per-site:
-                                             F where phi_eff>1, chi² where
+                                             F where phi_eff>1, chi^2 where
                                              phi_eff was clamped. ``"chi2"``
-                                             forces chi². ``"F"`` forces F.
+                                             forces chi^2. ``"F"`` forces F.
 
     Returns
     -------
-    stat            (n_sites,)               F-statistic / k (or chi²/k);
-                                             reduces to Wald-z² at k=1.
+    stat            (n_sites,)               F-statistic / k (or chi^2/k);
+                                             reduces to Wald-z^2 at k=1.
     pvalue          (n_sites,)               two-sided p-value
     k               int                      contrast rank (df1)
 
     Implementation notes
     --------------------
-    For a single-row contrast (k=1), Wald² = (Cβ)²/Var(Cβ) is chi²(1) under
+    For a single-row contrast (k=1), Wald^2 = (Cbeta)^2/Var(Cbeta) is chi^2(1) under
     H0. For multi-row contrasts (k>1), the joint Wald statistic is
-    (Cβ)ᵀ[CΣCᵀ]⁻¹(Cβ); divided by k it follows F(k, df_resid). When phi_eff
+    (Cbeta)T[CSigmaCT]^-^1(Cbeta); divided by k it follows F(k, df_resid). When phi_eff
     is supplied, cov_beta is scaled by phi (quasi-binomial). When df_resid
-    is None we use chi²(k)/k as the reference.
+    is None we use chi^2(k)/k as the reference.
     """
     from scipy import stats as sp_stats
 
@@ -744,10 +744,10 @@ def wald_test(
             f"cov_beta shape {cov_beta.shape} != (n_sites={n_sites}, p={p}, p={p})"
         )
 
-    # Cβ — shape (n_sites, k)
+    # Cbeta -- shape (n_sites, k)
     Cb = beta @ C.T
 
-    # C Σ Cᵀ — shape (n_sites, k, k). When phi_eff is supplied we scale here.
+    # C Sigma CT -- shape (n_sites, k, k). When phi_eff is supplied we scale here.
     if phi_eff is not None:
         scale = np.asarray(phi_eff, dtype=np.float64)
         cov_scaled = cov_beta * scale[:, None, None]
@@ -778,7 +778,7 @@ def wald_test(
                 except np.linalg.LinAlgError:
                     pass
 
-    # Reference distribution → p-value
+    # Reference distribution -> p-value
     if df_resid is None or reference == "chi2":
         pvalue = sp_stats.chi2.sf(stat, df=k)
     elif reference == "F":
@@ -802,27 +802,27 @@ def delta_method_meth_diff_ci(
     ref_eta: Optional[np.ndarray] = None,
     alpha: float = 0.05,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Delta-method CI on the meth-scale difference Δβ from a logit-scale Wald CI.
+    """Delta-method CI on the meth-scale difference Deltabeta from a logit-scale Wald CI.
 
-    For a single binary-treatment coefficient, Δη = coef and the meth-scale
-    difference is Δβ ≈ expit(η_ref + coef) - expit(η_ref). At the reference
-    fitted mean η_ref, the local Jacobian of the inverse link is
-    ``dβ/dη = expit(η)·(1 - expit(η))``. The Wald CI on coef is mapped to
-    the β scale by ``Δβ ± z · |J(η_ref)| · SE(coef)``, clamped to [-1, 1].
+    For a single binary-treatment coefficient, Deltaeta = coef and the meth-scale
+    difference is Deltabeta ~= expit(eta_ref + coef) - expit(eta_ref). At the reference
+    fitted mean eta_ref, the local Jacobian of the inverse link is
+    ``dbeta/deta = expit(eta)*(1 - expit(eta))``. The Wald CI on coef is mapped to
+    the beta scale by ``Deltabeta +/- z * |J(eta_ref)| * SE(coef)``, clamped to [-1, 1].
 
     Parameters
     ----------
     coef       (n_sites,) treatment coefficient on logit scale
     coef_se    (n_sites,) Wald SE of that coefficient
     ref_eta    (n_sites,) reference linear predictor (e.g. control-group
-               fitted η). When None we use ``eta_ref = 0``, the maximum-
+               fitted eta). When None we use ``eta_ref = 0``, the maximum-
                Jacobian point ``J(0) = 0.25``; this is the most conservative
                (widest) bound.
-    alpha      Significance level (default 0.05 → 95% CI).
+    alpha      Significance level (default 0.05 -> 95% CI).
 
     Returns
     -------
-    (ci_lo, ci_hi) — float64 arrays of shape (n_sites,), clamped to [-1, 1].
+    (ci_lo, ci_hi) -- float64 arrays of shape (n_sites,), clamped to [-1, 1].
     """
     from scipy import stats as sp_stats
     z = float(sp_stats.norm.isf(alpha / 2.0))
@@ -837,9 +837,9 @@ def delta_method_meth_diff_ci(
         with np.errstate(over="ignore", under="ignore"):
             p_ref = 1.0 / (1.0 + np.exp(-np.clip(ref_eta, -30.0, 30.0)))
         jac = p_ref * (1.0 - p_ref)
-    # meth-scale Δβ at the reference (single binary coefficient case): use
-    # expit(η+coef) - expit(η) for the central estimate (more accurate than
-    # the linearisation), but use jac · coef_se for the half-width.
+    # meth-scale Deltabeta at the reference (single binary coefficient case): use
+    # expit(eta+coef) - expit(eta) for the central estimate (more accurate than
+    # the linearisation), but use jac * coef_se for the half-width.
     if ref_eta is None:
         eta_ref = np.zeros_like(coef)
     else:
@@ -861,9 +861,9 @@ def welch_meth_diff_ci(
     var_mean_ctrl: np.ndarray,
     alpha: float = 0.05,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Normal CI on Δβ from per-group Welford accumulators.
+    """Normal CI on Deltabeta from per-group Welford accumulators.
 
-    ``var_mean_*`` is the variance OF THE MEAN (= s² / n), so the SE of the
+    ``var_mean_*`` is the variance OF THE MEAN (= s^2 / n), so the SE of the
     difference is ``sqrt(var_mean_case + var_mean_ctrl)``. CI clamped to
     [-1, 1].
     """
@@ -883,7 +883,7 @@ def newcombe_diff_ci(
     cov_b: np.ndarray,
     alpha: float = 0.05,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Newcombe (1998) hybrid Wilson-score CI for π_a − π_b on POOLED counts.
+    """Newcombe (1998) hybrid Wilson-score CI for pi_a - pi_b on POOLED counts.
 
     Used by the binomial-pool tests (lr, score, fisher, cmh) where no per-
     replicate variance is accumulated. Uses Wilson-score CIs on each

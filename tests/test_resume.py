@@ -36,7 +36,7 @@ from epykit._cache import (
 
 
 def test_input_signature_is_stable(tmp_path):
-    """Same inputs → same hash. Different params → different hash."""
+    """Same inputs -> same hash. Different params -> different hash."""
     sig_a = input_signature("foo", {"k": 1, "v": "x"})
     sig_b = input_signature("foo", {"v": "x", "k": 1})  # dict order shouldn't matter
     sig_c = input_signature("foo", {"k": 2, "v": "x"})
@@ -45,7 +45,7 @@ def test_input_signature_is_stable(tmp_path):
 
 
 def test_manifest_round_trip(tmp_path):
-    """append → find → read round-trips a stage entry intact."""
+    """append -> find -> read round-trips a stage entry intact."""
     manifest_append(
         tmp_path, "dmc_lr",
         params={"test": "lr", "dispersion": "site"},
@@ -114,7 +114,7 @@ def test_dmc_resume_skips_recomputation(synth_md_filtered):
         assembly="synth",
         store_dir=md._analysis_root,
     ) if False else None  # the fixture doesn't expose samplesheet path cleanly
-    # Simpler: rerun on the same md — the manifest still applies.
+    # Simpler: rerun on the same md -- the manifest still applies.
     ep.tl.dmc(md, test="lr", resumable=True)
     assert md.uns["dmc"].get("resumed") is True
 
@@ -136,7 +136,7 @@ def test_dmc_resume_invalidated_when_params_change(synth_md_filtered):
     ep.tl.dmc(md, test="lr", resumable=True)
     assert md.uns["dmc"].get("resumed") is not True
 
-    # Different test name → different stage key (dmc_score vs dmc_lr) →
+    # Different test name -> different stage key (dmc_score vs dmc_lr) ->
     # cache miss, fresh computation.
     ep.tl.dmc(md, test="score", resumable=True)
     assert md.uns["dmc"].get("resumed") is not True
@@ -153,7 +153,7 @@ def test_resume_from_loads_dmc_into_varm(synth_md_filtered):
     cached_rows = len(md.varm["dmc_lr"])
 
     # Build a fresh MethylData pointing at the same analysis root and
-    # call resume_from — it should restore varm without recomputing.
+    # call resume_from -- it should restore varm without recomputing.
     from epykit.methyldata import MethylData
     md2 = MethylData(
         obs=md.obs,

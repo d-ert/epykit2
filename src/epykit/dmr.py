@@ -6,7 +6,7 @@ Two algorithms:
 ...)``
     Tile aggregation: sums (N_meth, coverage) across CpGs per sample
     within each fixed-size tile, then runs a full DMC test on the
-    tile-level counts. Recommended path — read-pooled tile tests have
+    tile-level counts. Recommended path -- read-pooled tile tests have
     dramatically more power than per-CpG p-value combination at typical
     WGBS coverage.
 
@@ -18,7 +18,7 @@ Two algorithms:
     meth_diff rather than a raw site tally.
 
 ``smooth_methylation_gaussian`` is a coverage-weighted Gaussian-kernel
-smoother — see its own docstring.
+smoother -- see its own docstring.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def _dmr_sliding_cache_key(
 
     Combines the DMC store's input signature with the DMR parameters so
     a rerun with identical arguments reads from cache. ``step_bp`` is
-    deliberately omitted — the new two-pointer sweep ignores it.
+    deliberately omitted -- the new two-pointer sweep ignores it.
     """
     base_sig = store.manifest.get("input_sig", "")
     h = hashlib.sha256()
@@ -62,6 +62,33 @@ def _dmr_sliding_cache_key(
     h.update(b"|minsig="); h.update(str(int(min_sites_significant)).encode())
     h.update(b"|alpha=");   h.update(f"{float(alpha):.10g}".encode())
     h.update(b"|delta=");   h.update(f"{float(min_abs_meth_diff):.10g}".encode())
+    h.update(b"|pcol=");    h.update(p_col.encode())
+    return h.hexdigest()
+
+
+def _dmr_chain_merge_cache_key(
+    store: DMCStore,
+    alpha: float,
+    min_abs_meth_diff: float,
+    dis_merge_bp: int,
+    min_cpgs: int,
+    pct_sig: float,
+    minlen_bp: int,
+    p_col: str,
+) -> str:
+    """SHA-256 fingerprint of chain-merge DMR inputs (DSS callDMR semantics).
+
+    Mirrors :func:`_dmr_sliding_cache_key` for the chain-merge caller.
+    """
+    base_sig = store.manifest.get("input_sig", "")
+    h = hashlib.sha256()
+    h.update(b"|base=");    h.update(base_sig.encode())
+    h.update(b"|alpha=");   h.update(f"{float(alpha):.10g}".encode())
+    h.update(b"|delta=");   h.update(f"{float(min_abs_meth_diff):.10g}".encode())
+    h.update(b"|dismerge="); h.update(str(int(dis_merge_bp)).encode())
+    h.update(b"|mincp=");   h.update(str(int(min_cpgs)).encode())
+    h.update(b"|pctsig=");  h.update(f"{float(pct_sig):.10g}".encode())
+    h.update(b"|minlen=");  h.update(str(int(minlen_bp)).encode())
     h.update(b"|pcol=");    h.update(p_col.encode())
     return h.hexdigest()
 
@@ -102,7 +129,7 @@ _SMOOTH_EMPTY_SCHEMA = {
 }
 
 # cap merged DMR size to prevent biologically implausible mega-DMRs.
-# Mammalian DMRs are typically 200 bp – 5 kb; 10 kb is a generous ceiling.
+# Mammalian DMRs are typically 200 bp - 5 kb; 10 kb is a generous ceiling.
 _MAX_DMR_BP: int = 10_000
 
 # a window's direction is called "mixed" when the fraction of
@@ -110,7 +137,7 @@ _MAX_DMR_BP: int = 10_000
 _MIXED_DIRECTION_THRESHOLD: float = 0.6
 
 
-# Internal helpers — DMC input streaming for sliding-window DMR
+# Internal helpers -- DMC input streaming for sliding-window DMR
 
 def _dmc_store_columns(store: DMCStore) -> set[str]:
     """Return the column set present in the store's per-chrom parquets.
@@ -155,7 +182,7 @@ def _iter_dataframe_chroms(
         yield chrom, df.filter(pl.col("chrom") == chrom).sort("pos")
 
 
-# Internal helpers — p-value combination
+# Internal helpers -- p-value combination
 
 def _stouffer_combine_signed(
     pvals: np.ndarray,
@@ -165,19 +192,19 @@ def _stouffer_combine_signed(
     """Combine per-CpG two-sided p-values via signed Stouffer's Z.
 
     Each CpG contributes a signed Z-score:
-        z_i = sign(meth_diff_i) · Φ⁻¹(1 - p_i / 2)
+        z_i = sign(meth_diff_i) * Phi^-^1(1 - p_i / 2)
     so that hyper-methylated CpGs contribute positive Z and hypo-methylated
     CpGs contribute negative Z. The combined statistic is
-        Z = Σ w_i · z_i  /  √(Σ w_i²)
+        Z = Sigma w_i * z_i  /  sqrt(Sigma w_i^2)
     which is two-sided-tested. When all CpGs in a window agree in direction
-    the |Z| grows as √k and the combined p-value gets correspondingly
+    the |Z| grows as sqrtk and the combined p-value gets correspondingly
     small; when directions are mixed, contributions cancel and the
     combined p-value stays large.
 
     this replaces the previous Brown's method implementation, which
     required a correlation matrix of the per-CpG test statistics. The old
-    code estimated it from genomic distances between CpGs — a proxy for the
-    correlation of methylation STATES, not of the test statistics — which
+    code estimated it from genomic distances between CpGs -- a proxy for the
+    correlation of methylation STATES, not of the test statistics -- which
     systematically over-inflated the variance correction f and weakened
     combined p-values regardless of how strong the per-CpG signal was.
     Stouffer's Z is robust to mild positive correlation between tests
@@ -189,7 +216,7 @@ def _stouffer_combine_signed(
     pvals : np.ndarray
         Two-sided p-values for each CpG in the window.
     meth_diffs : np.ndarray
-        Signed per-CpG effect sizes (mean_beta_case − mean_beta_ctrl).
+        Signed per-CpG effect sizes (mean_beta_case - mean_beta_ctrl).
         Used only for direction; magnitude is ignored.
     weights : np.ndarray, optional
         Per-CpG weights (e.g. coverage). Defaults to equal weights.
@@ -212,9 +239,9 @@ def _stouffer_combine_signed(
     p_valid    = np.clip(pvals[valid], np.finfo(float).tiny, 1.0 - 1e-15)
     diff_valid = meth_diffs[valid]
 
-    # Magnitude Z from two-sided p-value: |z| = Φ⁻¹(1 - p/2)
+    # Magnitude Z from two-sided p-value: |z| = Phi^-^1(1 - p/2)
     z_mag = sp_stats.norm.isf(p_valid / 2.0)
-    # Signed contribution: hyper (+) vs hypo (-). meth_diff == 0 → no
+    # Signed contribution: hyper (+) vs hypo (-). meth_diff == 0 -> no
     # contribution (sign = 0), which is correct: zero-effect CpGs neither
     # add nor subtract evidence.
     z_signed = np.sign(diff_valid) * z_mag
@@ -347,7 +374,7 @@ def _recompute_dmr_stats(
     }
 
 
-# Public API — sliding-window DMR calling (works from a DMC table)
+# Public API -- sliding-window DMR calling (works from a DMC table)
 
 def call_dmr_sliding_window(
     dmc_results: Union[pl.DataFrame, DMCStore, str, Path],
@@ -363,13 +390,13 @@ def call_dmr_sliding_window(
     This method takes a precomputed DMC table and combines per-CpG p-values
     region-by-region with signed Stouffer's Z. It is fast and reuses an
     existing DMC call, but has lower power than the tile-based path
-    (`call_dmr_tile_based`) because it cannot pool reads — windows whose
+    (`call_dmr_tile_based`) because it cannot pool reads -- windows whose
     individual CpGs aren't significant won't gather enough sig sites to
     pass the `min_sites_significant` gate.
 
     Memory scaling
     --------------
-    The implementation uses a two-pointer CpG-anchored sweep — each
+    The implementation uses a two-pointer CpG-anchored sweep -- each
     chromosome's peak memory scales with the number of CpGs on that
     chromosome (a few hundred MB for full human autosomes), independent
     of genomic span. The earlier bp-grid enumeration would have
@@ -384,14 +411,14 @@ def call_dmr_sliding_window(
     dmc_results : pl.DataFrame | DMCStore | str | Path
         DMC results to process. Accepts:
 
-        * ``pl.DataFrame`` — in-memory table (legacy path); held in
+        * ``pl.DataFrame`` -- in-memory table (legacy path); held in
           memory for the whole DMR pass.
-        * ``DMCStore`` — handle to a persistent per-chrom parquet
+        * ``DMCStore`` -- handle to a persistent per-chrom parquet
           directory (returned by
           ``process_chromosomes_dmc(..., return_store=True)``).
           Chromosomes are streamed from disk; peak memory is
           O(largest chromosome).
-        * ``str`` / ``Path`` — path to a populated DMC store
+        * ``str`` / ``Path`` -- path to a populated DMC store
           directory; opened via :meth:`DMCStore.open`.
 
         Required columns: chrom, pos, meth_diff, pvalue.
@@ -424,7 +451,7 @@ def call_dmr_sliding_window(
 
     if step_bp > window_bp:
         raise ValueError(
-            f"step_bp ({step_bp}) must be ≤ window_bp ({window_bp})"
+            f"step_bp ({step_bp}) must be <= window_bp ({window_bp})"
         )
 
     # DMR cache: when the input is a DMCStore with a known input_sig,
@@ -467,7 +494,7 @@ def call_dmr_sliding_window(
 
     logger.info(
         "call_dmr_sliding_window: window=%d bp, step=%d bp, "
-        "min_cpgs=%d, min_sig=%d, alpha=%.3f, min_|Δβ|=%.2f, p_col=%s",
+        "min_cpgs=%d, min_sig=%d, alpha=%.3f, min_|Deltabeta|=%.2f, p_col=%s",
         window_bp, step_bp, min_cpgs, min_sites_significant,
         alpha, min_abs_meth_diff, p_col,
     )
@@ -502,7 +529,7 @@ def call_dmr_sliding_window(
         # ``[positions[i], positions[i] + window_bp)``; we maintain a
         # running right pointer j and a rolling significant-CpG count.
         # ``step_bp`` is accepted for backward compatibility but is no
-        # longer meaningful — every CpG anchors a candidate, and the
+        # longer meaningful -- every CpG anchors a candidate, and the
         # downstream merge collapses redundancy without any change in
         # the final DMR set.
         # ---------------------------------------------------------------
@@ -519,7 +546,7 @@ def call_dmr_sliding_window(
             while j < n_pos and positions[j] < limit:
                 n_sig_running += int(is_sig_int[j])
                 j += 1
-            # window [i, j) — all CpGs in [positions[i], positions[i]+window_bp)
+            # window [i, j) -- all CpGs in [positions[i], positions[i]+window_bp)
             n_cpgs_win = j - i
             if n_cpgs_win >= min_cpgs and n_sig_running >= min_sites_significant:
                 cand_starts.append(int(positions[i]))
@@ -537,7 +564,7 @@ def call_dmr_sliding_window(
         chrom_dmrs = 0
 
         # _recompute_dmr_stats can still use a prefix-sum array for O(1)
-        # range counts in the final pass — that's per-merged-span (a
+        # range counts in the final pass -- that's per-merged-span (a
         # small number) so it doesn't break the O(n_CpGs) budget.
         cum_sig = np.empty(n_pos + 1, dtype=np.int32)
         cum_sig[0] = 0
@@ -555,7 +582,7 @@ def call_dmr_sliding_window(
                 chrom_dmrs += 1
 
         logger.info(
-            "  %s: %d candidate span(s) → %d DMR(s)",
+            "  %s: %d candidate span(s) -> %d DMR(s)",
             chrom, len(merged_spans), chrom_dmrs,
         )
         # Free per-chrom buffers before next iteration. Critical when
@@ -603,7 +630,348 @@ def call_dmr_sliding_window(
     return dmr_df
 
 
-# Public API — tile-based DMR calling
+# Public API -- chain-and-merge DMR calling (DSS callDMR semantics)
+
+DMR_PRESETS: dict[str, dict] = {
+    # "strict": very confident DMRs only. Use when downstream uses cannot
+    # tolerate false positives (e.g. follow-up validation experiments).
+    # Higher alpha bar, larger effect-size floor, more CpGs required.
+    "strict": dict(
+        alpha=1e-6, min_abs_meth_diff=0.20, dis_merge_bp=100,
+        min_cpgs=5, pct_sig=0.5, minlen_bp=100,
+    ),
+    # "default": balanced preset for general WGBS analyses. alpha=1e-4 is
+    # one order looser than DSS callDMR's default (1e-5) -- empirically
+    # this captures real-but-moderate signal that DSS's strict gate rejects
+    # without crashing PPV. The 10% per-CpG effect-size floor is kept
+    # (matches DSS delta=0.1) so individual measurement noise can't anchor
+    # chains. Recommended starting point for most users; use 'strict' for
+    # validation-ready DMRs (DSS-strict alpha) or 'permissive' for
+    # exploratory / recall-oriented analyses.
+    "default": dict(
+        alpha=1e-4, min_abs_meth_diff=0.10, dis_merge_bp=100,
+        min_cpgs=3, pct_sig=0.5, minlen_bp=50,
+    ),
+    # "permissive": recall-oriented. Loosens alpha and the gap rule, drops
+    # the effect-size floor halfway. Useful for exploratory analyses, gene-
+    # set enrichment, or comparisons where false negatives are costlier
+    # than false positives. Expect noticeably lower PPV.
+    "permissive": dict(
+        alpha=1e-4, min_abs_meth_diff=0.05, dis_merge_bp=200,
+        min_cpgs=3, pct_sig=0.5, minlen_bp=50,
+    ),
+}
+
+
+def call_dmr_chain_merge(
+    dmc_results: Union[pl.DataFrame, DMCStore, str, Path],
+    *,
+    preset: str | None = None,
+    alpha: float = 0.05,
+    min_abs_meth_diff: float = 0.1,
+    dis_merge_bp: int = 100,
+    min_cpgs: int = 3,
+    pct_sig: float = 0.5,
+    minlen_bp: int = 50,
+    use_q_for_sig: bool = False,
+) -> pl.DataFrame:
+    """Call DMRs by chaining contiguous significant CpGs and merging gaps.
+
+    Reimplements DSS's ``callDMR`` semantics on top of an epykit DMC
+    table:
+
+      1. Mark significant CpGs:
+         ``(pvalue < alpha) AND (|meth_diff| >= min_abs_meth_diff)``.
+         When ``use_q_for_sig=True`` and a ``qvalue`` column is present,
+         the q-value drives the significance gate instead.
+      2. Walk sorted positions per chromosome. A new sig CpG joins the
+         current chain when its distance to the *previous significant*
+         CpG is <= ``dis_merge_bp``; otherwise it starts a new chain.
+      3. A chain's span is ``[first_sig_pos, last_sig_pos + 1)``.
+      4. Apply filters: span length >= ``minlen_bp``; total CpGs in span
+         (sig + non-sig) >= ``min_cpgs``; fraction significant >=
+         ``pct_sig``.
+      5. Combine the per-CpG p-values in the surviving span via signed
+         Stouffer's Z (reused from ``call_dmr_sliding_window``); classify
+         direction (``hyper`` / ``hypo`` / ``mixed``) from the mean
+         ``meth_diff`` and per-site sign tally.
+      6. BH-correct the surviving combined p-values genome-wide.
+
+    Geometrically this is more permissive than ``call_dmr_sliding_window``
+    for sparse-cluster signal: two sig CpGs 140 bp apart cannot fit in a
+    100 bp anchored window, but they chain in DSS at ``dis_merge_bp=100``
+    because their gap is <= 100 bp from one sig CpG to the next.
+
+    Tuning guidance
+    ---------------
+    If recall is too low for your use case, **loosen ``dis_merge_bp``
+    first** (e.g. 100 -> 200). It's the single highest-leverage knob:
+    CpG-poor intergenic and intronic regions need wider gap-merging just
+    to recover real DMRs whose CpGs are spread out. Loosening
+    ``dis_merge_bp`` typically gains 5-10 pp of recall for only ~6 pp of
+    PPV cost -- a genuine Pareto improvement, unlike loosening ``alpha``
+    (which crashes PPV by 15-20 pp for only 2-4 pp of recall on most
+    datasets we've benchmarked).
+
+    The ``pct_sig`` knob is **effectively dead at strict ``alpha``** (e.g.
+    1e-5 to 1e-4): the few CpGs that pass cluster tightly enough that
+    >50% of any candidate's CpGs are already significant, so the 0.5
+    threshold never bites. Don't bother tuning it unless you've also
+    loosened ``alpha`` substantially.
+
+    For common scenarios prefer the ``preset=`` bundles instead of
+    hand-tuning: ``"strict"`` (validation-ready DMRs), ``"default"``
+    (DSS-equivalent, recommended), ``"permissive"`` (exploratory / recall-
+    oriented).
+
+    Parameters
+    ----------
+    dmc_results
+        DMC results -- same input contract as
+        :func:`call_dmr_sliding_window` (DataFrame, DMCStore, or path).
+    preset : {"strict", "default", "permissive"}, optional
+        Apply a named parameter bundle from :data:`DMR_PRESETS`. Any
+        explicit kwarg passed alongside ``preset`` overrides the bundled
+        value (so you can pick a preset and tweak one knob).
+    alpha
+        Significance threshold for ``pvalue`` (or ``qvalue`` when
+        ``use_q_for_sig=True``).
+    min_abs_meth_diff
+        Minimum ``|meth_diff|`` for a CpG to count as significant.
+        Default ``0.1`` matches the convention in the methylation
+        literature (DSS, methylKit, BSmooth all report DMRs with at
+        least 10% methylation difference).
+    dis_merge_bp
+        Maximum distance (in bp) between consecutive significant CpGs
+        for them to belong to the same chain. DSS default: 100. See the
+        tuning guidance above -- this is the first knob to loosen if
+        recall is too low.
+    min_cpgs
+        Minimum total CpGs (sig + non-sig) inside a chain's span. DSS
+        default: 3.
+    pct_sig
+        Minimum fraction of CpGs in the span that must be significant.
+        DSS default: 0.5. Note: this knob is effectively dead at strict
+        ``alpha`` values.
+    minlen_bp
+        Minimum span length in base pairs. DSS default: 50.
+    use_q_for_sig
+        If True and ``qvalue`` is present, use it for the significance
+        gate.
+
+    Returns
+    -------
+    pl.DataFrame
+        Same schema as :func:`call_dmr_sliding_window`:
+        ``chrom, start, end, n_cpgs, n_significant, mean_meth_diff,
+        combined_pvalue, combined_qvalue, dmr_type``.
+    """
+    # Resolve preset bundle. Caller-provided kwargs override bundled values
+    # by tracking which params arrived at their default values vs explicit.
+    # Easiest way: re-bind locals from the preset only if they match the
+    # signature defaults (signaling "user didn't set this").
+    if preset is not None:
+        if preset not in DMR_PRESETS:
+            raise ValueError(
+                f"Unknown preset {preset!r}. Choose from {list(DMR_PRESETS)}."
+            )
+        bundle = DMR_PRESETS[preset]
+        # Default sentinels match the signature defaults above.
+        _SIG_DEFAULTS = dict(
+            alpha=0.05, min_abs_meth_diff=0.1, dis_merge_bp=100,
+            min_cpgs=3, pct_sig=0.5, minlen_bp=50,
+        )
+        if alpha == _SIG_DEFAULTS["alpha"]:                       alpha = bundle["alpha"]
+        if min_abs_meth_diff == _SIG_DEFAULTS["min_abs_meth_diff"]: min_abs_meth_diff = bundle["min_abs_meth_diff"]
+        if dis_merge_bp == _SIG_DEFAULTS["dis_merge_bp"]:         dis_merge_bp = bundle["dis_merge_bp"]
+        if min_cpgs == _SIG_DEFAULTS["min_cpgs"]:                 min_cpgs = bundle["min_cpgs"]
+        if pct_sig == _SIG_DEFAULTS["pct_sig"]:                   pct_sig = bundle["pct_sig"]
+        if minlen_bp == _SIG_DEFAULTS["minlen_bp"]:               minlen_bp = bundle["minlen_bp"]
+    if isinstance(dmc_results, (str, Path)):
+        dmc_results = DMCStore.open(dmc_results)
+
+    # Cache lookup (mirror of the sliding-window cache).
+    dmr_cache_path: Path | None = None
+    if isinstance(dmc_results, DMCStore) and dmc_results.manifest.get("input_sig"):
+        available_cols = _dmc_store_columns(dmc_results)
+        sig_col = "qvalue" if (use_q_for_sig and "qvalue" in available_cols) else "pvalue"
+        key = _dmr_chain_merge_cache_key(
+            dmc_results,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+            dis_merge_bp=dis_merge_bp,
+            min_cpgs=min_cpgs,
+            pct_sig=pct_sig,
+            minlen_bp=minlen_bp,
+            p_col=sig_col,
+        )
+        dmr_cache_path = dmc_results.path / f".dmr_chain_merge_{key[:16]}.parquet"
+        if dmr_cache_path.exists():
+            cached = pl.read_parquet(str(dmr_cache_path))
+            logger.info(
+                "DMR chain-merge cache hit at %s (%d DMR(s)); skipping recompute.",
+                dmr_cache_path.name, len(cached),
+            )
+            return cached
+
+    if isinstance(dmc_results, DMCStore):
+        available_cols = _dmc_store_columns(dmc_results)
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing = required - available_cols
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        sig_col = "qvalue" if (use_q_for_sig and "qvalue" in available_cols) else "pvalue"
+        chrom_iter = _iter_dmc_store_chroms(dmc_results, sig_col)
+    else:
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing = required - set(dmc_results.columns)
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        sig_col = "qvalue" if (use_q_for_sig and "qvalue" in dmc_results.columns) else "pvalue"
+        chrom_iter = _iter_dataframe_chroms(dmc_results, sig_col)
+
+    logger.info(
+        "call_dmr_chain_merge: alpha=%.3g, min_|Deltabeta|=%.2f, dis_merge=%d bp, "
+        "min_cpgs=%d, pct_sig=%.2f, minlen=%d bp, sig_col=%s",
+        alpha, min_abs_meth_diff, dis_merge_bp,
+        min_cpgs, pct_sig, minlen_bp, sig_col,
+    )
+
+    all_records: list[dict] = []
+
+    for chrom, chrom_df in chrom_iter:
+        if len(chrom_df) == 0:
+            continue
+
+        positions  = chrom_df["pos"].to_numpy()
+        meth_diffs = chrom_df["meth_diff"].to_numpy(allow_copy=True).astype(np.float32)
+        # pvals is always the raw pvalue column (used by Stouffer's Z).
+        pvals = chrom_df["pvalue"].to_numpy(allow_copy=True).astype(np.float64)
+        # sig_vals is what we threshold against alpha -- either pvalue or qvalue.
+        sig_vals = chrom_df[sig_col].to_numpy(allow_copy=True).astype(np.float64)
+
+        is_sig = (
+            (~np.isnan(sig_vals))
+            & (sig_vals < alpha)
+            & (~np.isnan(meth_diffs))
+            & (np.abs(meth_diffs) >= min_abs_meth_diff)
+        )
+        sig_idx = np.flatnonzero(is_sig)
+        if sig_idx.size == 0:
+            del chrom_df, positions, meth_diffs, pvals, sig_vals, is_sig, sig_idx
+            gc.collect()
+            continue
+
+        # Chain consecutive sig CpGs whose pairwise gap <= dis_merge_bp.
+        # The chain is a list of (first_sig_idx, last_sig_idx) pairs.
+        sig_pos = positions[sig_idx]
+        gaps = np.diff(sig_pos)
+        # Boundary indices: positions where a new chain begins (gap > dis_merge_bp).
+        break_after = np.flatnonzero(gaps > dis_merge_bp)
+        # Convert to chain boundaries over the sig_idx array.
+        chain_lo = np.concatenate([[0], break_after + 1])
+        chain_hi = np.concatenate([break_after, [sig_idx.size - 1]])
+
+        # Prefix-sum on is_sig for O(1) significant-count lookups.
+        is_sig_int = is_sig.astype(np.int32, copy=False)
+        cum_sig = np.empty(positions.size + 1, dtype=np.int32)
+        cum_sig[0] = 0
+        np.cumsum(is_sig_int, out=cum_sig[1:])
+
+        chrom_dmrs = 0
+        for lo, hi in zip(chain_lo, chain_hi):
+            i_first = int(sig_idx[lo])
+            i_last  = int(sig_idx[hi])
+            start_pos = int(positions[i_first])
+            # End is exclusive in epykit's schema; +1 to include i_last.
+            end_pos = int(positions[i_last]) + 1
+            if (end_pos - start_pos) < minlen_bp:
+                continue
+
+            # All CpGs (sig + non-sig) inside [start_pos, end_pos).
+            i_span_lo = int(np.searchsorted(positions, start_pos, side="left"))
+            i_span_hi = int(np.searchsorted(positions, end_pos, side="left"))
+            n_cpgs_span = i_span_hi - i_span_lo
+            if n_cpgs_span < min_cpgs:
+                continue
+            n_sig_span = int(cum_sig[i_span_hi] - cum_sig[i_span_lo])
+            if n_sig_span / max(n_cpgs_span, 1) < pct_sig:
+                continue
+
+            span_pvals = pvals[i_span_lo:i_span_hi]
+            span_diffs = meth_diffs[i_span_lo:i_span_hi]
+
+            valid_diffs = span_diffs[~np.isnan(span_diffs)]
+            if len(valid_diffs) == 0:
+                continue
+            n_hyper = int((valid_diffs > 0).sum())
+            n_hypo  = int((valid_diffs < 0).sum())
+
+            combined_p = _stouffer_combine_signed(span_pvals, span_diffs)
+            if np.isnan(combined_p):
+                continue
+
+            mean_diff = float(np.nanmean(span_diffs))
+            dmr_type  = _classify_direction(mean_diff, n_hyper, n_hypo)
+
+            all_records.append({
+                "chrom":           chrom,
+                "start":           start_pos,
+                "end":             end_pos,
+                "n_cpgs":          n_cpgs_span,
+                "n_significant":   n_sig_span,
+                "mean_meth_diff":  float(np.float32(mean_diff)),
+                "combined_pvalue": float(combined_p),
+                "dmr_type":        dmr_type,
+            })
+            chrom_dmrs += 1
+
+        logger.info(
+            "  %s: %d sig CpG(s) -> %d chain(s) -> %d DMR(s)",
+            chrom, int(sig_idx.size), len(chain_lo), chrom_dmrs,
+        )
+        del chrom_df, positions, meth_diffs, pvals, sig_vals
+        del is_sig, is_sig_int, sig_idx, sig_pos, cum_sig
+        gc.collect()
+
+    if not all_records:
+        logger.warning("No DMRs found with current filters")
+        empty = pl.DataFrame(schema=_DMR_EMPTY_SCHEMA)
+        if dmr_cache_path is not None:
+            empty.write_parquet(str(dmr_cache_path))
+        return empty
+
+    dmr_df = (
+        pl.DataFrame(all_records)
+        .with_columns([
+            pl.col("start").cast(pl.Int32),
+            pl.col("end").cast(pl.Int32),
+            pl.col("n_cpgs").cast(pl.Int32),
+            pl.col("n_significant").cast(pl.Int32),
+            pl.col("mean_meth_diff").cast(pl.Float32),
+        ])
+        .sort(["chrom", "start"])
+    )
+
+    # BH correction (mirrors call_dmr_sliding_window) so downstream
+    # filters can operate on q-values consistently.
+    from .dmc import apply_multiple_testing_correction
+
+    dmr_df = apply_multiple_testing_correction(
+        dmr_df,
+        method="fdr_bh",
+        pvalue_col="combined_pvalue",
+        qvalue_col="combined_qvalue",
+    )
+    if dmr_cache_path is not None:
+        dmr_df.write_parquet(str(dmr_cache_path))
+        logger.info(
+            "DMR chain-merge result cached at %s", dmr_cache_path.name,
+        )
+    return dmr_df
+
+
+# Public API -- tile-based DMR calling
 
 def _aggregate_sample_to_tiles(
     src_part_file: Path,
@@ -707,7 +1075,7 @@ def call_dmr_tile_based(
         Tile width in bp (default 1000). Adjacent tiles do not overlap.
     test : str
         Statistical test for tile-level counts. Defaults to ``"logit_t"``
-        — Welch t on logit(beta), a robust fallback at the tile level
+        -- Welch t on logit(beta), a robust fallback at the tile level
         where counts are large.
     chromosomes : list[str], optional
         Chromosomes to process. Auto-detected when None.
@@ -761,7 +1129,7 @@ def call_dmr_tile_based(
 
     logger.info(
         "call_dmr_tile_based: tile=%d bp, test=%s, n_case=%d, n_control=%d, "
-        "min_cpgs/tile=%d, alpha=%.3f, min_|Δβ|=%.2f, unite=%s",
+        "min_cpgs/tile=%d, alpha=%.3f, min_|Deltabeta|=%.2f, unite=%s",
         tile_size_bp, test, len(samples_case), len(samples_control),
         min_cpgs_per_tile, alpha, min_abs_meth_diff, unite,
     )
@@ -875,7 +1243,7 @@ def call_dmr_tile_based(
             out_cols.append(extra)
     dmr_df = dmr_df.select(out_cols).sort(["chrom", "start"])
 
-    logger.info("Tile-based DMR: %s tiles → %s significant DMRs",
+    logger.info("Tile-based DMR: %s tiles -> %s significant DMRs",
                 f"{len(tile_dmc):,}", f"{len(dmr_df):,}")
 
     gc.collect()
@@ -928,7 +1296,7 @@ def empirical_fdr_for_dmr(
         ``observed_dmr`` with added columns ``empirical_pvalue`` and
         ``empirical_qvalue``. The full null pool (per-DMR raw pvalues from
         every permutation) is cached on ``observed_dmr.attrs`` only if the
-        caller upstream wires it — this function just returns the
+        caller upstream wires it -- this function just returns the
         annotated table.
     """
     if len(observed_dmr) == 0:
@@ -1040,7 +1408,7 @@ def _bsmooth_make_njit():
         degree:    int,
         min_cpgs_for_smooth: int,
     ) -> np.ndarray:
-        """Local-polynomial smoother — one chromosome, one sample.
+        """Local-polynomial smoother -- one chromosome, one sample.
 
         Per site i:
           * adaptive half-window h_i = max(distance to ns-th nearest CpG, h_min)
@@ -1142,7 +1510,7 @@ def _bsmooth_make_njit():
                     + s2 * (s1 * s3 - s2 * s2)
                 )
                 if det == 0.0 or not np.isfinite(det):
-                    out[i] = t0 / s0   # singular → weighted mean fallback
+                    out[i] = t0 / s0   # singular -> weighted mean fallback
                     continue
                 num = (
                     t0 * (s2 * s4 - s3 * s3)
@@ -1191,7 +1559,7 @@ def smooth_methylation_bsmooth(
         Sparse regions widen to capture ``ns`` CpGs; dense regions are
         capped below by ``h_bp`` so the kernel never collapses to
         immediate neighbors.
-      * **Tricube distance weights × coverage**:
+      * **Tricube distance weights x coverage**:
         ``w_j = (1 - (|x_j - x_i| / h_i)^3)^3 * N_j``.
       * **Polynomial degree** (``1`` or ``2``; default ``2`` matches BSmooth).
         Quadratic captures local curvature; linear is a faster fallback.
@@ -1306,7 +1674,7 @@ def smooth_methylation_bsmooth(
     return pl.concat(records)
 
 
-# Public API — fast Gaussian smoothing (replaces statsmodels LOESS)
+# Public API -- fast Gaussian smoothing (replaces statsmodels LOESS)
 
 def smooth_methylation_gaussian(
     methylstore_path: str,
@@ -1327,7 +1695,7 @@ def smooth_methylation_gaussian(
     grid, applies a coverage-weighted Gaussian filter
     (``scipy.ndimage.gaussian_filter1d``), then interpolates back to the
     original CpG positions. This is O(G) where G is the grid size,
-    versus O(n²) for LOESS — typically 100-500× faster on WGBS-scale data.
+    versus O(n^2) for LOESS -- typically 100-500x faster on WGBS-scale data.
     """
     try:
         from scipy.ndimage import gaussian_filter1d

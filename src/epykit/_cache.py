@@ -11,7 +11,7 @@ Two related but distinct cache layers live here:
   2. **Top-level pipeline manifest** (``.epykit_manifest.json`` at the
      analysis root). New in 0.4.0. Tracks completed *pipeline stages*
      across the whole analysis (raw, filtered, united, smoothed, dmc_lr,
-     dmr_tile, …) with their params + input signatures + sidecar paths.
+     dmr_tile, ...) with their params + input signatures + sidecar paths.
      This is what powers the formal ``ep.pp.resume(md)`` /
      ``MethylData.resume_from(stage=...)`` API.
 
@@ -169,7 +169,7 @@ def upstream_sample_signature(input_sample_dir: Path) -> dict[str, Any]:
     """Fingerprint of an upstream sample directory in a partitioned store.
 
     Prefers any existing pipeline manifest inside the dir (raw / filtered /
-    normalized) — its content already captures the upstream lineage cheaply.
+    normalized) -- its content already captures the upstream lineage cheaply.
     Falls back to the on-disk chrom partition listing if no manifest exists.
     """
     for name in (

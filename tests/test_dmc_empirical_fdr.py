@@ -12,8 +12,8 @@ from tests.fixtures.synth import SimConfig, generate
 
 @pytest.fixture(scope="module")
 def small_md(tmp_path_factory):
-    """A small fixture for the permutation test — n_perm is expensive, so
-    keep n_sites modest. 2 chromosomes × 400 CpGs = 800 candidate sites is
+    """A small fixture for the permutation test -- n_perm is expensive, so
+    keep n_sites modest. 2 chromosomes x 400 CpGs = 800 candidate sites is
     enough to exercise the empirical FDR pipeline without blowing the test
     budget."""
     cfg = SimConfig(

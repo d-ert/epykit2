@@ -1,4 +1,4 @@
-"""Bismark .cov → partitioned Parquet converter.
+"""Bismark .cov -> partitioned Parquet converter.
 
 Coordinate system: ``start`` is treated as **0-based** (BED-format), which
 is what ``bismark2bedGraph`` and nf-core/methylseq emit. The 1-based
@@ -159,7 +159,7 @@ def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
       - - strand at position N+1 (G position on reverse strand)
     
     This function merges them by:
-      1. Shifting - strand positions back by 1 (N+1 → N)
+      1. Shifting - strand positions back by 1 (N+1 -> N)
       2. Grouping by (chrom, pos) and summing counts
       3. Setting all merged sites to + strand
     
@@ -181,7 +181,7 @@ def _merge_cpg_pairs(df: pl.DataFrame) -> pl.DataFrame:
         # No - strand data, already merged or only + strand present
         return df
     
-    # Shift - strand positions to + strand coordinate (N+1 → N)
+    # Shift - strand positions to + strand coordinate (N+1 -> N)
     minus = minus.with_columns(
         (pl.col("pos") - 1).alias("pos")
     )
@@ -232,7 +232,7 @@ def _infer_strand(df: pl.DataFrame, reference_fasta: str) -> pl.Series:
     """Infer strand from reference sequence for each CpG position.
 
     A cytosine on the + strand sits at position `start` in the reference.
-    Its complement on the − strand is at `start + 1`. Bismark merged .cov
+    Its complement on the - strand is at `start + 1`. Bismark merged .cov
     coordinates are 0-based start, 1-based end (BED-like).
 
     Requires pyfaidx:  pip install pyfaidx
@@ -248,7 +248,7 @@ def _infer_strand(df: pl.DataFrame, reference_fasta: str) -> pl.Series:
     -------
     pl.Series (Utf8)
         "+" where the reference base at `start` is C (or c),
-        "-" where it is G (complement C on the − strand),
+        "-" where it is G (complement C on the - strand),
         "*" for anything else (non-CpG context or N base).
     """
     try:

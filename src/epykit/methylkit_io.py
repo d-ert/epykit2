@@ -93,7 +93,7 @@ def to_methylkit_tabix(
 
     Returns the output directory. A manifest file
     ``epykit_to_methylkit.json`` is written alongside the per-sample
-    ``.txt.gz`` files mapping ``sample → file → treatment_assignment``
+    ``.txt.gz`` files mapping ``sample -> file -> treatment_assignment``
     (when ``md.obs["treatment"]`` exists).
 
     Tabix indexing is attempted via ``pysam`` and silently skipped on

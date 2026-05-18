@@ -1,4 +1,4 @@
-"""Differentially Variable Regions — density-based aggregation."""
+"""Differentially Variable Regions -- density-based aggregation."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from epykit.dvc import call_dvr_density
 def _toy_dvc_table() -> pl.DataFrame:
     """Build a small DVC table with a clear DVC-dense region on chr1.
 
-    chr1: positions 0..49 — every 5th CpG is a DVC (10/50 = 20% locally).
-    chr1: positions 1000..1049 — 1 DVC out of 50 (background-like).
+    chr1: positions 0..49 -- every 5th CpG is a DVC (10/50 = 20% locally).
+    chr1: positions 1000..1049 -- 1 DVC out of 50 (background-like).
     chr2: 100 CpGs, 0 DVCs (pure null).
     """
     rows = []
@@ -60,12 +60,12 @@ def test_call_dvr_density_finds_enriched_tile():
     row = enriched.row(0, named=True)
     assert row["n_cpgs"] == 50
     assert row["n_dvc"] == 10
-    # 10/50 = 20%, genome-wide background = 11/200 ≈ 5.5%. Should clear
+    # 10/50 = 20%, genome-wide background = 11/200 ~= 5.5%. Should clear
     # BH-q < 0.05.
     assert row["is_dvr"], (
         f"Enriched tile should be flagged DVR but isn't: q={row['qvalue']}"
     )
-    # var_log_ratio is +1.0 on DVCs in this tile → dvr_type 'var_up'.
+    # var_log_ratio is +1.0 on DVCs in this tile -> dvr_type 'var_up'.
     assert row["dvr_type"] == "var_up"
 
 
@@ -84,7 +84,7 @@ def test_call_dvr_density_no_dvcs():
         "var_log_ratio": [0.0] * 10, "is_dvc": [False] * 10,
     })
     dvr = call_dvr_density(dvc, tile_size_bp=100, min_cpgs_per_tile=5)
-    # No is_dvr should be True since p0 = 0 → every tile p-value = 1.
+    # No is_dvr should be True since p0 = 0 -> every tile p-value = 1.
     if dvr.height > 0:
         assert not dvr.get_column("is_dvr").any()
 
@@ -96,7 +96,7 @@ def test_call_dvr_density_rejects_missing_columns():
 
 
 def test_tl_dvr_orchestrator(synth_md_filtered):
-    """End-to-end: tl.dvc → tl.dvr → md.uns['dvr'] populated."""
+    """End-to-end: tl.dvc -> tl.dvr -> md.uns['dvr'] populated."""
     ep.tl.dvc(synth_md_filtered)
     assert "dvc" in synth_md_filtered.varm
     ep.tl.dvr(synth_md_filtered, tile_size_bp=1000, min_cpgs_per_tile=3)
@@ -107,7 +107,7 @@ def test_tl_dvr_orchestrator(synth_md_filtered):
     assert params["method"] == "density"
     assert params["tile_size_bp"] == 1000
     # The synth fixture isn't designed to produce DVCs (no variance-shift
-    # seeds), so we don't require is_dvr.any() — just that the call ran.
+    # seeds), so we don't require is_dvr.any() -- just that the call ran.
 
 
 def test_tl_dvr_errors_without_dvc(synth_md_filtered):

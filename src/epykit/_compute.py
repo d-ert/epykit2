@@ -8,14 +8,14 @@ half of that pattern so the existing engines can opt into distributed
 execution without rewriting their per-chrom math.
 
 Default ``backend="sequential"`` is bit-identical to the prior in-line
-loop — the dispatcher just invokes the handler one chrom at a time on
+loop -- the dispatcher just invokes the handler one chrom at a time on
 the calling process. ``backend="dask"`` and ``backend="ray"`` are
 optional (extras ``[distributed]`` / ``[ray]``) and submit one task per
 chromosome to a worker pool.
 
 The handler contract is intentionally minimal: a callable that takes a
 single ``chrom: str`` argument and returns either a ``pl.DataFrame``
-(the result for that chrom) or ``None`` (skip — no rows, no warning).
+(the result for that chrom) or ``None`` (skip -- no rows, no warning).
 Per-engine state (store path, sample lists, knobs) is captured by
 closure or :func:`functools.partial`; both work under
 ``cloudpickle`` which Dask and Ray use by default.
@@ -144,7 +144,7 @@ def _run_dask(
             )
 
         # Submit one future per chromosome. `pure=False` so Dask doesn't
-        # de-duplicate by hash — handler closures often look identical
+        # de-duplicate by hash -- handler closures often look identical
         # to Dask's task hasher even though they target different chroms.
         futures = [
             client.submit(handler, chrom, pure=False, key=f"{label}-{chrom}")

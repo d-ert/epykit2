@@ -1,4 +1,4 @@
-"""MethylDackel .bedGraph → partitioned Parquet converter.
+"""MethylDackel .bedGraph -> partitioned Parquet converter.
 
 MethylDackel's ``extract`` subcommand emits ``.bedGraph`` files in the same
 6-column layout as Bismark's ``.cov`` files

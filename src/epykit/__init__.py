@@ -1,8 +1,8 @@
-"""epykit: Parquet methylation pipeline (Bismark ingestion → DMR annotation)
+"""epykit: Parquet methylation pipeline (Bismark ingestion -> DMR annotation)
 
 This package provides a complete WGBS analysis pipeline:
 
-  - convert:   Bismark .cov → partitioned Parquet methylstore
+  - convert:   Bismark .cov -> partitioned Parquet methylstore
   - filter:    QC / coverage filtering / site intersection
   - dmc:       Differential methylation calling per CpG. Default test is
                ``lr`` (quasi-binomial likelihood-ratio with McCullagh-
@@ -18,7 +18,7 @@ Logging convention
 ------------------
 Library modules (everything under ``epykit.*`` except ``epykit.cli``) emit
 progress and diagnostics through the standard :mod:`logging` module via
-``logger = logging.getLogger(__name__)`` — they never call :func:`print`.
+``logger = logging.getLogger(__name__)`` -- they never call :func:`print`.
 The CLI entry point (``epykit.cli``) reserves :func:`print` for the
 final user-facing result lines on stdout; structured progress logs flow
 through the same logging hierarchy and are controlled via ``-v`` / ``-q``.
@@ -55,6 +55,8 @@ from .dmc import (
     shrink_meth_diff,
 )
 from .dmr import (
+    DMR_PRESETS,
+    call_dmr_chain_merge,
     call_dmr_sliding_window,
     smooth_methylation_gaussian,
     smooth_methylation_bsmooth,
@@ -111,6 +113,8 @@ __all__ = [
     "DMCStore",
     # DMR engines
     "call_dmr_sliding_window",
+    "call_dmr_chain_merge",
+    "DMR_PRESETS",
     "smooth_methylation_gaussian",
     "smooth_methylation_bsmooth",
     # DVC / DVR engines

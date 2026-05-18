@@ -5,7 +5,7 @@ The 0.4.0 chrom-loop refactor introduced a backend dispatcher in
 
   1. ``backend="sequential"`` produces results bit-identical to the
      pre-0.4 in-line loop (the prior tests in test_accuracy.py /
-     test_dmc_ci_and_rename.py / test_dvc.py already cover this — if
+     test_dmc_ci_and_rename.py / test_dvc.py already cover this -- if
      they pass, the sequential path didn't regress).
   2. ``backend="dask"`` produces results numerically identical to the
      sequential path on the same fixture (just sliced across workers).

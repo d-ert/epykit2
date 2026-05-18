@@ -46,7 +46,7 @@ def test_karyogram_only_significant(synth_md_filtered):
         bin_size_bp=100_000,
     )
     # Should render without erroring (some DMCs in the fixture are
-    # significant — see test_accuracy).
+    # significant -- see test_accuracy).
     assert len(ax.get_yticklabels()) > 0
 
 
@@ -102,7 +102,7 @@ def test_dmr_overlap_too_many_sets_errors():
         ep.pl.dmr_overlap(sets)
 
 
-# gene_body_metaplot (smoke test only — needs a tiny GTF)
+# gene_body_metaplot (smoke test only -- needs a tiny GTF)
 
 
 def _write_tiny_gtf(path: Path) -> None:
@@ -131,4 +131,4 @@ def test_gene_body_metaplot_runs(synth_md_filtered, tmp_path):
     # Three labeled regions: -flank, TSS, gene body, TES, +flank.
     labels = [t.get_text() for t in ax.get_xticklabels()]
     assert "TSS" in labels and "TES" in labels
-    assert ax.get_ylabel() == "Mean β"
+    assert ax.get_ylabel() == "Mean beta"

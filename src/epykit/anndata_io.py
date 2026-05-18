@@ -2,24 +2,24 @@
 
 A MethylData object is conceptually shaped exactly like an AnnData:
 
-    obs       = md.obs                 (n_samples × covariate-columns)
-    var       = (chrom, pos)           (n_sites × 2)
-    X         = β  or  N_meth  or  coverage   (n_samples × n_sites)
+    obs       = md.obs                 (n_samples x covariate-columns)
+    var       = (chrom, pos)           (n_sites x 2)
+    X         = beta  or  N_meth  or  coverage   (n_samples x n_sites)
     layers    = {"beta", "coverage", "N_meth", "N_unmeth"}
 
 Memory strategy
 ---------------
-A dense ``(n_samples × n_sites)`` matrix on real WGBS is enormous — 8
-samples × 28 M CpGs × 4 bytes (float32) ≈ 900 MB per layer. The naive
+A dense ``(n_samples x n_sites)`` matrix on real WGBS is enormous -- 8
+samples x 28 M CpGs x 4 bytes (float32) ~= 900 MB per layer. The naive
 "pivot the long-form DataFrame" approach holds the source rows, the
-pivot, and the densified matrix simultaneously, which is typically 3-4×
+pivot, and the densified matrix simultaneously, which is typically 3-4x
 the final array size and OOMs on real datasets.
 
 To stay in the same ballpark as the final array, ``to_anndata`` runs
 streamed, per-sample, per-chromosome:
 
 1. Scan only ``(chrom, pos)`` lazily across the store to build the
-   sorted site index and a ``(chrom, pos) → row_idx`` lookup. This step
+   sorted site index and a ``(chrom, pos) -> row_idx`` lookup. This step
    uses a few hundred MB at WGBS scale.
 2. Allocate ``X`` as a single ``float32`` array of shape
    ``(n_samples, n_sites)``.
@@ -29,7 +29,7 @@ streamed, per-sample, per-chromosome:
 
 Additional layers (``populate_layers=True``) cost one extra dense array
 per layer plus one extra streaming pass; default is **only the requested
-layer**, so a user who just wants β does not pay 4× memory.
+layer**, so a user who just wants beta does not pay 4x memory.
 
 A ``pp.unite`` is required before calling: with a united site set every
 sample shares the same axis, the dense layout is sane, and the streaming
@@ -57,7 +57,7 @@ def _site_index(store: str, *, unite_type: str):
 
     Runs **one chromosome at a time** and reduces per-sample position
     arrays in numpy. Peak transient memory is roughly
-    ``n_samples × max_chrom_sites × 8 B`` (≈ 240 MB for chr1 on 6 samples),
+    ``n_samples x max_chrom_sites x 8 B`` (~= 240 MB for chr1 on 6 samples),
     far below the multi-GB dedup-hashtable spike of a single-shot
     ``scan_parquet(...).unique()`` across the whole store.
 
@@ -75,7 +75,7 @@ def _site_index(store: str, *, unite_type: str):
     var : pl.DataFrame
         Sorted (chrom, pos) DataFrame, length ``n_sites``.
     chrom_index : dict[str, tuple[int, np.ndarray]]
-        ``{chrom: (start_idx, positions_int64)}`` — the slice
+        ``{chrom: (start_idx, positions_int64)}`` -- the slice
         ``var[start_idx:start_idx + len(positions_int64)]`` is the
         chromosome's contiguous block. Empty chromosomes are dropped.
     """
@@ -94,7 +94,7 @@ def _site_index(store: str, *, unite_type: str):
 
     # Union of chromosome names seen across any sample. For 'intersect' we
     # still walk this union and let the per-chrom reduction short-circuit
-    # to empty when a sample is missing the chrom — matches DMC's
+    # to empty when a sample is missing the chrom -- matches DMC's
     # per-chrom join semantics.
     chrom_set: set[str] = set()
     for s_dir in sample_dirs:
@@ -102,7 +102,7 @@ def _site_index(store: str, *, unite_type: str):
             if d.is_dir():
                 chrom_set.add(d.name.split("=", 1)[1])
     # Lex sort matches polars' Utf8 .sort("chrom") (chr1, chr10, chr11, ...,
-    # chr2, ...) — preserved for compatibility with prior output ordering.
+    # chr2, ...) -- preserved for compatibility with prior output ordering.
     chroms_sorted = sorted(chrom_set)
 
     logger.info(
@@ -233,18 +233,18 @@ def _fill_layer(
     chrom_index: dict[str, tuple[int, "object"]],
     dtype,
 ):
-    """Stream sample × chromosome, filling a (n_samples × n_sites) array.
+    """Stream sample x chromosome, filling a (n_samples x n_sites) array.
 
     For each (sample, chromosome) we read just that partition file, then
     use ``np.searchsorted`` against the chromosome's pre-built position
-    array to compute the destination column indices in O(n_rows · log n_chrom).
-    No Python-side dict is ever built — the only persistent index
+    array to compute the destination column indices in O(n_rows * log n_chrom).
+    No Python-side dict is ever built -- the only persistent index
     structures are the per-chromosome int64 position arrays.
     """
     import numpy as np
 
     np_dtype = np.dtype(dtype)
-    # Map numpy float dtype → polars float dtype so the value column is
+    # Map numpy float dtype -> polars float dtype so the value column is
     # pinned end-to-end. Anything other than float32/float64 is rejected
     # by to_anndata() above, so this mapping is exhaustive.
     if np_dtype == np.float32:
@@ -288,7 +288,7 @@ def _fill_layer(
             local_idx = np.searchsorted(var_positions, sample_positions)
             # Guard against positions that fall off the end of the array
             # (would happen on a *union* store where a sample contributes
-            # a CpG that no other sample has — searchsorted returns
+            # a CpG that no other sample has -- searchsorted returns
             # len(arr)). Bounds-check first, then equality-check.
             in_range = local_idx < len(var_positions)
             local_idx_safe = np.where(in_range, local_idx, 0)
@@ -311,7 +311,7 @@ def to_anndata(
     """Materialise a MethylData as an AnnData object.
 
     Memory-conscious by default: only the layer you asked for is dense.
-    On a typical 8-sample × 28 M-CpG run this produces a ~900 MB
+    On a typical 8-sample x 28 M-CpG run this produces a ~900 MB
     ``adata.X`` and nothing else, vs. ~3.5 GB of intermediate state under
     the previous pivot-based implementation. Pass
     ``populate_layers=True`` to also fill ``adata.layers["coverage"]``,
@@ -326,7 +326,7 @@ def to_anndata(
         Which value to put in ``adata.X``. Default "beta".
     populate_layers : bool
         If True, also fill ``adata.layers`` with every layer in
-        :data:`_VALID_LAYERS`. Default **False** — the old default of
+        :data:`_VALID_LAYERS`. Default **False** -- the old default of
         True densified four matrices and was the most common cause of
         OOMs on real WGBS. Layer matrices share the site index so an
         extra pass per layer is cheap on disk but doubles dense RAM.
@@ -341,13 +341,13 @@ def to_anndata(
     Returns
     -------
     anndata.AnnData
-        Shape ``(n_samples, n_sites)`` matching ``md.obs`` × the united
+        Shape ``(n_samples, n_sites)`` matching ``md.obs`` x the united
         site axis.
     """
     if use_smoothed:
         raise NotImplementedError(
-            "to_anndata(use_smoothed=True) not implemented yet — the smoothed "
-            "store has a per-sample β grid, not raw counts."
+            "to_anndata(use_smoothed=True) not implemented yet -- the smoothed "
+            "store has a per-sample beta grid, not raw counts."
         )
 
     try:
@@ -363,7 +363,7 @@ def to_anndata(
             "to_anndata() requires a united methylstore so all samples share "
             "the same site axis. Run ep.pp.unite(md, type='intersect') first "
             "(or type='union' if you want every site that appears in any "
-            "sample — note the densification cost)."
+            "sample -- note the densification cost)."
         )
 
     if layer not in _VALID_LAYERS:
@@ -386,7 +386,7 @@ def to_anndata(
     n_sites = len(var)
     dense_gib = len(samples) * n_sites * np_dtype.itemsize / (1024 ** 3)
     logger.info(
-        "to_anndata: %d sample(s) × %d site(s) — estimated dense size %.2f GiB per layer",
+        "to_anndata: %d sample(s) x %d site(s) -- estimated dense size %.2f GiB per layer",
         len(samples), n_sites, dense_gib,
     )
     # Loud warning if the user is about to allocate something huge. 4 GiB
@@ -405,7 +405,7 @@ def to_anndata(
 
     obs_pd = md.obs.to_pandas().set_index("sample_id")
 
-    # Build var via Arrow → pandas in one shot (no Python-level 42M-element
+    # Build var via Arrow -> pandas in one shot (no Python-level 42M-element
     # lists). The "{chrom}:{pos}" index is built vectorised on pandas
     # Series rather than with a Python list comprehension, which on real
     # WGBS removes several GB of transient Python object overhead.

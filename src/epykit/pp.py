@@ -82,17 +82,17 @@ def normalize_coverage(md: MethylData, method: str = "median") -> None:
 
     Computes a per-sample scaling factor so that each sample's central
     coverage statistic (median by default, or mean) matches a common
-    target — the median (or mean) of the per-sample summaries. Read
+    target -- the median (or mean) of the per-sample summaries. Read
     counts are scaled and re-integerised, then ``md.store`` is repointed
     at a new ``.cache/normalized`` (or ``<store>_normalized``) partition.
 
     This prevents deeper-sequenced samples from dominating pooled-count
     tile / region tests downstream. The per-CpG score test in
     ``ep.tl.dmc`` is much less sensitive to coverage imbalance, but
-    ``ep.tl.dmr(method='tile')`` is — running normalisation between
+    ``ep.tl.dmr(method='tile')`` is -- running normalisation between
     coverage filtering and tile aggregation removes that bias.
 
-    Call order: ``filter_coverage`` → ``normalize_coverage`` → ``unite``.
+    Call order: ``filter_coverage`` -> ``normalize_coverage`` -> ``unite``.
 
     Parameters
     ----------
@@ -100,7 +100,7 @@ def normalize_coverage(md: MethylData, method: str = "median") -> None:
         Object whose store has been ``filter_coverage``'d.
     method : {"median", "mean"}
         Central statistic to align. ``"median"`` is the robust default
-        — robust to extreme-coverage tails.
+        -- robust to extreme-coverage tails.
 
     Raises
     ------
@@ -114,7 +114,7 @@ def normalize_coverage(md: MethylData, method: str = "median") -> None:
     if md._united:
         logger.warning(
             "normalize_coverage called after unite(); the recommended order "
-            "is filter → normalize → unite. Re-running unite() is a no-op "
+            "is filter -> normalize -> unite. Re-running unite() is a no-op "
             "but downstream stats reflect the normalised store."
         )
 
@@ -146,7 +146,7 @@ def unite(md: MethylData, type: str = "union") -> None:
     This does **not** materialise the full intersection/union into memory.
     ``ep.tl.dmc`` passes ``unite=True/False`` directly to
     ``process_chromosomes_dmc``, which performs the per-chromosome join
-    lazily and in O(n_sites) memory — identical to the old procedural API.
+    lazily and in O(n_sites) memory -- identical to the old procedural API.
     Eagerly computing the full intersection here (previously stored in
     ``md.uns["site_intersect"]``) caused an OOM on whole-genome data because
     it loaded all 338 M+ rows into RAM at once.
@@ -154,7 +154,7 @@ def unite(md: MethylData, type: str = "union") -> None:
     if type not in {"intersect", "union"}:
         raise ValueError("type must be 'intersect' or 'union'")
 
-    # _united is a derived property — recording in uns is enough.
+    # _united is a derived property -- recording in uns is enough.
     md.uns["unite"] = {"type": type}
     _append_store_history(md, "united", md.store, None)
 
@@ -242,7 +242,7 @@ def aggregate_regions(
         Object whose store will be re-aggregated.
     regions_bed : str
         Path to a BED file (3/4/6/12 columns). Coordinates 0-based,
-        half-open — same convention as the methylstore.
+        half-open -- same convention as the methylstore.
     region_id_col : str, optional
         Name of the BED column to use as the region identifier. Defaults
         to ``name`` (column 4) if present, otherwise to
@@ -422,12 +422,12 @@ def smooth(
 
     Two backends:
 
-    * ``method="gaussian"`` (default) — coverage-weighted Gaussian kernel
+    * ``method="gaussian"`` (default) -- coverage-weighted Gaussian kernel
       on a regularised grid. Fast (O(G) per chrom), documented as a
       BSmooth approximation.
-    * ``method="bsmooth"`` — spec-faithful BSmooth (Hansen et al. 2012):
+    * ``method="bsmooth"`` -- spec-faithful BSmooth (Hansen et al. 2012):
       local weighted-polynomial regression with adaptive bandwidth
-      (``max(distance to ns-th CpG, h_bp)``), tricube × coverage weights,
+      (``max(distance to ns-th CpG, h_bp)``), tricube x coverage weights,
       degree-2 fit by default. Slower than Gaussian but matches the
       Bioconductor ``bsseq``/DSS reference behaviour. Compiled via numba.
 

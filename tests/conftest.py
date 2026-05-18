@@ -1,7 +1,7 @@
 """Shared pytest fixtures and accuracy helpers for the epykit test suite.
 
 The synthetic dataset is built once per pytest session (medium size: 8
-samples × 5 chromosomes × ~10 000 CpGs, ~500 scattered DMCs and 10 seeded
+samples x 5 chromosomes x ~10 000 CpGs, ~500 scattered DMCs and 10 seeded
 DMRs) and reused by every test that needs read data. Per-test isolation is
 preserved by giving each test its own fresh ``MethylData`` instance pointing
 at the same on-disk methylstore.
@@ -43,7 +43,7 @@ class SynthBundle:
 @pytest.fixture(scope="session")
 def synth_bundle(tmp_path_factory) -> SynthBundle:
     """Generate the Bismark .cov fixture once per session."""
-    cfg = SimConfig()  # default = medium fixture (8 × 5 × 2000 = 10k sites)
+    cfg = SimConfig()  # default = medium fixture (8 x 5 x 2000 = 10k sites)
     out_dir = tmp_path_factory.mktemp("synth")
     result = generate(cfg, out_dir)
     truth = pl.read_parquet(result["truth"])
@@ -147,7 +147,7 @@ def meth_diff_bias(
     dmc_df: pl.DataFrame,
     truth: pl.DataFrame,
 ) -> tuple[float, float]:
-    """Mean signed bias and mean absolute error of recovered Δβ on true DMCs.
+    """Mean signed bias and mean absolute error of recovered Deltabeta on true DMCs.
 
     Returns (mean(estimated - true), mean(|estimated - true|)).
     """
@@ -208,7 +208,7 @@ def dmr_recovery(
     )
 
     # For each seeded DMR, ask if any called DMR overlaps it on the same
-    # chromosome. We loop in Python — n_dmrs ≤ 20 in tests so this is fine.
+    # chromosome. We loop in Python -- n_dmrs <= 20 in tests so this is fine.
     recovered = 0
     sig_rows = sig_dmrs.to_dicts()
     for seed in seed_intervals.to_dicts():

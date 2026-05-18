@@ -88,9 +88,9 @@ def karyogram(
         Must have a DMC table on ``md.dmc``.
     value : str
         Column in the DMC table to summarise. Common choices:
-        ``"meth_diff"`` (signed Δβ; RdBu_r colormap reads as
-        hypo/hyper), ``"mean_beta_case"`` (absolute β in treatment),
-        ``"-log10_qvalue"`` (significance density — autocomputed when
+        ``"meth_diff"`` (signed Deltabeta; RdBu_r colormap reads as
+        hypo/hyper), ``"mean_beta_case"`` (absolute beta in treatment),
+        ``"-log10_qvalue"`` (significance density -- autocomputed when
         the column is absent but ``qvalue`` is present).
     bin_size_bp : int
         Tile size along the chromosome axis. Default 1 Mb.
@@ -108,14 +108,14 @@ def karyogram(
         of finite values.
     only_significant : bool
         If True, drop sites with ``qvalue >= alpha`` before binning so
-        only DMC density (or signed Δβ of DMCs) drives the colour.
+        only DMC density (or signed Deltabeta of DMCs) drives the colour.
     alpha : float
         q-value threshold when ``only_significant=True``. Default 0.05.
     """
     dmc = md.dmc
     if dmc is None:
         raise ValueError(
-            "md.dmc is None — run ep.tl.dmc(md) before plotting a karyogram."
+            "md.dmc is None -- run ep.tl.dmc(md) before plotting a karyogram."
         )
     if only_significant:
         if "qvalue" not in dmc.columns:
@@ -186,7 +186,7 @@ def karyogram(
         b = int(row["_bin"])
         grid[i, b] = float(row["_val"]) if row["_val"] is not None else np.nan
 
-    # Colour limits. For signed Δβ-style metrics, symmetric around 0.
+    # Colour limits. For signed Deltabeta-style metrics, symmetric around 0.
     if vmin is None or vmax is None:
         finite = grid[np.isfinite(grid)]
         if finite.size == 0:

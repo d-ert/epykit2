@@ -24,7 +24,7 @@ import polars as pl
 logger = logging.getLogger(__name__)
 
 # Thresholds used by coverage_uniformity for flagging
-_MIN_GENOME_COVERAGE_FRACTION = 0.80   # 80 % of CpGs at ≥1×
+_MIN_GENOME_COVERAGE_FRACTION = 0.80   # 80 % of CpGs at >=1x
 _CONVERSION_WARNING_THRESHOLD  = 0.005  # 0.5 % CHH methylation
 
 # chromosome aliases used by qc.sex_check. Both UCSC ("chrX")
@@ -44,7 +44,7 @@ def bisulfite_conversion_rate(
     Under complete bisulfite conversion, non-CpG cytosines (CHH context) are
     converted to uracil and read as thymine.  Residual CHH methylation
     therefore reflects incomplete conversion.  Conversion efficiency is
-    estimated as 1 − mean(CHH β).
+    estimated as 1 - mean(CHH beta).
 
     A value below 99.5 % (i.e. >0.5 % residual CHH methylation) should be
     flagged as a potential quality issue.
@@ -59,7 +59,7 @@ def bisulfite_conversion_rate(
         it, but it is **not** used to rescale read counts before testing.
         This matches the default behaviour of ``methylKit`` and the
         ``bsseq`` family (``read.bismark`` etc.), which leave count-level
-        correction to the user. For a well-converted library (≥99.5 %)
+        correction to the user. For a well-converted library (>=99.5 %)
         the correction is statistically negligible; for a poorly
         converted one the right action is usually to re-prep the
         library, not to paper over the issue with a multiplicative
@@ -256,7 +256,7 @@ def global_methylation_report(
         if n_outliers:
             logger.warning(
                 "global_methylation_report: %d outlier sample(s) detected "
-                "in context %s (MAD threshold 3σ)",
+                "in context %s (MAD threshold 3sigma)",
                 n_outliers, ctx,
             )
 
@@ -273,7 +273,7 @@ def coverage_uniformity(
     """Compute per-chromosome coverage breadth statistics for one sample.
 
     Reports the fraction of CpG sites covered at each threshold depth and
-    flags chromosomes (and the sample overall) when coverage breadth at 1×
+    flags chromosomes (and the sample overall) when coverage breadth at 1x
     falls below 80 %.
 
     Parameters
@@ -342,7 +342,7 @@ def coverage_uniformity(
 
         if row["low_coverage_flag"]:
             logger.warning(
-                "Sample '%s', %s: only %.1f %% of sites covered at ≥1× "
+                "Sample '%s', %s: only %.1f %% of sites covered at >=1x "
                 "(threshold: %.0f %%)",
                 sample, chrom, frac_1x * 100,
                 _MIN_GENOME_COVERAGE_FRACTION * 100,
@@ -403,12 +403,12 @@ def sex_check(
     min_coverage: int = 5,
     expected_sex: dict[str, str] | None = None,
 ) -> pl.DataFrame:
-    """Infer sample sex from mean β on the X chromosome .
+    """Infer sample sex from mean beta on the X chromosome .
 
-    Female samples carry one inactivated X and have mean(β) ≈ 0.4 - 0.5
-    on the X chromosome; male samples have mean(β) ≈ 0.05 - 0.10. We
-    classify each sample by kmeans-2 on the per-sample mean-chrX-β values
-    (lower cluster → male, upper cluster → female). When fewer than two
+    Female samples carry one inactivated X and have mean(beta) ~= 0.4 - 0.5
+    on the X chromosome; male samples have mean(beta) ~= 0.05 - 0.10. We
+    classify each sample by kmeans-2 on the per-sample mean-chrX-beta values
+    (lower cluster -> male, upper cluster -> female). When fewer than two
     samples are usable the call falls back to a fixed threshold of 0.25.
 
     Parameters
@@ -508,12 +508,12 @@ def contamination_estimate(
     *,
     min_coverage: int = 10,
 ) -> float:
-    """Estimate sample contamination from the β distribution shape.
+    """Estimate sample contamination from the beta distribution shape.
 
-    Clean WGBS samples have a strongly bimodal β distribution: most CpGs
-    are either fully methylated (β ≈ 1) or unmethylated (β ≈ 0).
+    Clean WGBS samples have a strongly bimodal beta distribution: most CpGs
+    are either fully methylated (beta ~= 1) or unmethylated (beta ~= 0).
     Cross-sample contamination produces an excess of intermediate values
-    (0.2 < β < 0.8) — the score is the fraction of well-covered CpGs in
+    (0.2 < beta < 0.8) -- the score is the fraction of well-covered CpGs in
     that band.
 
     this is the lightweight "boundary-mass" version. A fuller
@@ -570,11 +570,11 @@ def sample_correlation(
     min_coverage: int = 10,
     chromosomes: list[str] | None = None,
 ) -> pl.DataFrame:
-    """Pairwise sample-vs-sample β correlation matrix .
+    """Pairwise sample-vs-sample beta correlation matrix .
 
-    Builds the per-sample β vector over the intersection of CpGs covered
+    Builds the per-sample beta vector over the intersection of CpGs covered
     at ``min_coverage`` in every sample, then returns the
-    ``(n_samples × n_samples)`` correlation matrix as a long-form
+    ``(n_samples x n_samples)`` correlation matrix as a long-form
     DataFrame.
 
     Parameters
@@ -673,24 +673,24 @@ def power(
 ) -> float | int:
     """Methylation-specific power / sample-size calculator .
 
-    Models β at each replicate as a mixture of binomial sampling noise
-    (variance ``β(1-β)/coverage`` per replicate per CpG) plus between-
-    replicate biological variance ``replicate_sd²``. Under that model
+    Models beta at each replicate as a mixture of binomial sampling noise
+    (variance ``beta(1-beta)/coverage`` per replicate per CpG) plus between-
+    replicate biological variance ``replicate_sd^2``. Under that model
     the two-sample z-test power is
 
         sd_diff = sqrt(2 * (baseline_beta * (1 - baseline_beta) / coverage
                             + replicate_sd**2) / n_per_group)
         z       = meth_diff / sd_diff
-        power   = Phi(z - z_alpha)    (two-sided -> z_alpha = z_{α/2})
+        power   = Phi(z - z_alpha)    (two-sided -> z_alpha = z_{alpha/2})
 
     When ``n_per_group`` is supplied (default mode), returns the implied
     power. When ``power=...`` is supplied instead, returns the smallest
-    ``n_per_group`` (integer, ≥ 2) achieving that target power.
+    ``n_per_group`` (integer, >= 2) achieving that target power.
 
     Parameters
     ----------
     meth_diff : float
-        Expected effect size Δβ (e.g. 0.10 = 10 percentage points).
+        Expected effect size Deltabeta (e.g. 0.10 = 10 percentage points).
     coverage : float
         Mean per-CpG coverage.
     n_per_group : int, optional

@@ -10,7 +10,7 @@ def coverage_histogram(md: MethylData, bins: int = 100, ax=None, figsize=(6, 4),
     
     For large datasets, samples every Kth site to avoid OOM.
     """
-    # Count total sites — pl.count() removed in Polars ≥0.20; use pl.len()
+    # Count total sites -- pl.count() removed in Polars >=0.20; use pl.len()
     total_sites = (
         pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
         .select(pl.len())
@@ -135,7 +135,7 @@ def mbias_plot(
     (they'll be parsed inline).
 
     The plot shows percent methylation against read position, one line
-    per sample × read (``R1`` / ``R2``). Standard interpretation: a flat
+    per sample x read (``R1`` / ``R2``). Standard interpretation: a flat
     plateau in the middle of the read with deflections at either end
     indicates the safe trim region. A consistently sloped line is a sign
     of incomplete bisulfite conversion or fill-in artefacts at PBAT /

@@ -85,7 +85,7 @@ def test_runs_of_state_translates_positions():
     path = np.array([0, 1, 1, 0])
     positions = np.array([100, 200, 300, 400], dtype=np.int32)
     runs = runs_of_state(path, target_state=1, positions=positions)
-    # [200, 301) — end is +1 past the last in-run position
+    # [200, 301) -- end is +1 past the last in-run position
     assert runs == [(200, 301, 2)]
 
 
@@ -94,6 +94,6 @@ def test_segment_handles_nan_observations():
     obs = np.array([0.1, np.nan, 0.1, 0.9, 0.9, np.nan, 0.9])
     out = segment(obs, n_states=2, state_means=np.array([0.1, 0.9]))
     # Valid-output sanity: NaN positions are assigned a state (any state),
-    # and the surrounding β=0.1 / β=0.9 segments still recover.
+    # and the surrounding beta=0.1 / beta=0.9 segments still recover.
     assert out.shape == (7,)
     assert out.dtype == np.int32

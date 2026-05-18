@@ -5,7 +5,7 @@ Three-state HMM on the per-CpG ``meth_diff`` signal:
   - State 1: no change
   - State 2: hyper (meth_diff > 0)
 
-Models spatial correlation between adjacent CpGs explicitly — fixes a
+Models spatial correlation between adjacent CpGs explicitly -- fixes a
 known weakness of the tile / sliding-window engines (they treat
 adjacent CpGs as independent). Operates on the existing per-CpG DMC
 table (``md.varm["dmc_lr"]`` etc.); does NOT need a re-run of the DMC
@@ -58,7 +58,7 @@ def call_dmr_hmm(
         and (optionally) ``pvalue`` / ``qvalue`` columns. Schema-
         compatible with the output of ``ep.tl.dmc``.
     self_loop
-        Sticky-chain transition prior. Higher → broader regions.
+        Sticky-chain transition prior. Higher -> broader regions.
     min_cpgs, min_abs_meth_diff, alpha
         Per-region filters applied AFTER segmentation:
         - region n_cpgs >= min_cpgs

@@ -104,7 +104,7 @@ def test_cli_end_to_end_dmc_pipeline(tmp_path, synth_bundle):
     read paths, but ``epykit dmc`` runs DMC against the methylstore that
     the session fixture has already filled.
 
-    This is slow (~30 s) because it walks every chromosome — gated behind
+    This is slow (~30 s) because it walks every chromosome -- gated behind
     the ``slow`` marker.
     """
     # Build a fresh methylstore via the Python API; the CLI dmc command

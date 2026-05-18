@@ -10,14 +10,14 @@ Why a hand roll instead of pomegranate / hmmlearn?
     minor versions; pinning it would create a heavy + brittle dep.
   - hmmlearn is well-maintained but its discrete-output HMM only
     supports multinomial emissions; we want Bernoulli per CpG with
-    an explicit β prior, which is cleaner to express directly.
+    an explicit beta prior, which is cleaner to express directly.
   - The math here is ~150 LoC of numpy and runs in milliseconds on
     typical chrom-sized inputs.
 
 The exposed API is a single :func:`segment` function. It runs forward-
 backward (log-space) to compute posterior state probabilities, then
 Viterbi to produce a hard MAP state assignment. Inputs are float
-observations (β) and integer state counts; outputs are int state
+observations (beta) and integer state counts; outputs are int state
 labels (and optionally the posterior matrix).
 """
 
@@ -74,8 +74,8 @@ def _bernoulli_emission_logprob(
 ) -> np.ndarray:
     """Bernoulli log-likelihood matrix.
 
-    observations : (n_sites,) float in [0, 1]   (β, possibly NaN)
-    state_means  : (n_states,) float in (0, 1)  (one β per state)
+    observations : (n_sites,) float in [0, 1]   (beta, possibly NaN)
+    state_means  : (n_states,) float in (0, 1)  (one beta per state)
     Returns (n_sites, n_states) log-likelihoods. Sites with NaN
     observations get equal log-prob across states (= log(1/n_states))
     so they don't bias the path.
@@ -87,7 +87,7 @@ def _bernoulli_emission_logprob(
         obs[:, None] * np.log(sm[None, :])
         + (1.0 - obs)[:, None] * np.log(1.0 - sm[None, :])
     )
-    # NaN observations → uniform.
+    # NaN observations -> uniform.
     nan_mask = ~np.isfinite(observations)
     if nan_mask.any():
         logp[nan_mask, :] = -np.log(len(state_means))
@@ -131,12 +131,12 @@ def segment(
     emission: str = "bernoulli",
     emission_sd: float = 0.1,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Forward-backward + Viterbi segmentation of a per-site β signal.
+    """Forward-backward + Viterbi segmentation of a per-site beta signal.
 
     Parameters
     ----------
     observations
-        Per-site β in ``[0, 1]``. NaNs are allowed (treated as uniform
+        Per-site beta in ``[0, 1]``. NaNs are allowed (treated as uniform
         emission).
     n_states
         Number of HMM states. ``state_means`` (if given) must have the
@@ -157,7 +157,7 @@ def segment(
     Returns
     -------
     np.ndarray
-        Integer state labels (length n_sites) — the Viterbi MAP path.
+        Integer state labels (length n_sites) -- the Viterbi MAP path.
     """
     obs = np.asarray(observations, dtype=np.float64)
     n_sites = len(obs)

@@ -43,8 +43,8 @@ def volcano(
     n_hyper = int(hyper.sum())
     n_hypo = int(hypo.sum())
     ax.set_title(f"DMC volcano  |  hyper={n_hyper:,}  hypo={n_hypo:,}")
-    ax.set_xlabel("Methylation difference (treatment − control)")
-    ax.set_ylabel(f"−log₁₀({p_col})")
+    ax.set_xlabel("Methylation difference (treatment - control)")
+    ax.set_ylabel(f"-log_1_0({p_col})")
 
     if save:
         _save_fig(md, fig, save)
@@ -63,7 +63,7 @@ def ma_plot(
     """MA plot: mean beta vs methylation difference.
 
     x-axis: mean methylation across treatment and control
-    y-axis: methylation difference (treatment − control)
+    y-axis: methylation difference (treatment - control)
     color: hypermethylated (red), hypomethylated (blue), not significant (grey)
     """
     dmc = md.dmc
@@ -97,7 +97,7 @@ def ma_plot(
     n_hypo = int(hypo.sum())
     ax.set_title(f"MA plot  |  hyper={n_hyper:,}  hypo={n_hypo:,}")
     ax.set_xlabel("Mean methylation")
-    ax.set_ylabel("Methylation difference (treatment − control)")
+    ax.set_ylabel("Methylation difference (treatment - control)")
 
     if save:
         _save_fig(md, fig, save)
@@ -115,7 +115,7 @@ def manhattan(
     """Manhattan plot: genome-wide significance.
 
     x-axis: chromosome position
-    y-axis: −log₁₀(p-value)
+    y-axis: -log_1_0(p-value)
     color: alternates by chromosome
     """
     dmc = md.dmc
@@ -160,9 +160,9 @@ def manhattan(
         chrom_offsets[chrom] = (cumulative_pos, cumulative_pos + positions.max())
         cumulative_pos += positions.max() + 1e7  # add gap between chromosomes
 
-    ax.axhline(-np.log10(alpha), color="red", lw=1, ls="--", label=f"α={alpha}")
+    ax.axhline(-np.log10(alpha), color="red", lw=1, ls="--", label=f"alpha={alpha}")
     ax.set_xlabel("Chromosome")
-    ax.set_ylabel(f"−log₁₀({p_col})")
+    ax.set_ylabel(f"-log_1_0({p_col})")
     ax.set_title("Manhattan plot")
     ax.legend()
 

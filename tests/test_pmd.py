@@ -1,6 +1,6 @@
 """Tests for the PMD caller.
 
-The synth fixture's β values aren't designed to seed a megabase PMD,
+The synth fixture's beta values aren't designed to seed a megabase PMD,
 so we build a minimal in-memory store on the fly: 5000 CpGs across one
 chrom, with a 1 Mb hypomethylated stretch in the middle. The PMD
 caller should recover that region within 50 kb of the planted boundaries.
@@ -69,8 +69,8 @@ def test_pmd_recovers_planted_region(tmp_path):
 
 
 def test_pmd_no_calls_when_no_signal(tmp_path):
-    """All-high-β chrom should produce zero PMDs."""
-    # Build a store where every CpG is at high β.
+    """All-high-beta chrom should produce zero PMDs."""
+    # Build a store where every CpG is at high beta.
     store = tmp_path / "flat_store"
     sample_dir = store / "sample=S1" / "chrom=chr_flat"
     sample_dir.mkdir(parents=True, exist_ok=True)
@@ -89,4 +89,4 @@ def test_pmd_no_calls_when_no_signal(tmp_path):
     }).write_parquet(str(sample_dir / "part-0.parquet"))
 
     df = call_pmd_one_sample(store, "S1", min_pmd_bp=500_000)
-    assert df.height == 0, f"expected no PMDs on all-high-β chrom; got {df}"
+    assert df.height == 0, f"expected no PMDs on all-high-beta chrom; got {df}"

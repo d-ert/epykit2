@@ -13,9 +13,9 @@ disordered window (uniform over all patterns) has normalised entropy
 ~1.
 
 Higher entropy reflects mixed methylation states across the reads at a
-locus — a signature of stochastic methylation, age-related drift, or
-intra-tumour heterogeneity. Mean β alone misses this; two reads with
-patterns ``1100`` and ``0011`` have mean β = 0.5 but max entropy.
+locus -- a signature of stochastic methylation, age-related drift, or
+intra-tumour heterogeneity. Mean beta alone misses this; two reads with
+patterns ``1100`` and ``0011`` have mean beta = 0.5 but max entropy.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def call_entropy(
     Parameters
     ----------
     bam
-        ``{sample_id → bam_path}``. BAMs must be coordinate-sorted and
+        ``{sample_id -> bam_path}``. BAMs must be coordinate-sorted and
         indexed.
     window_cpgs
         Number of consecutive CpGs in each entropy window. Must be in
@@ -135,7 +135,7 @@ def _entropy_one_sample(
         if len(cpg_positions) < window_cpgs:
             continue
 
-        # Index reads → (pos, methylation) calls for quick lookup.
+        # Index reads -> (pos, methylation) calls for quick lookup.
         read_calls: dict[str, dict[int, int]] = {}
         for row in chrom_grp.iter_rows(named=True):
             rid = row["read_id"]

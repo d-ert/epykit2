@@ -18,14 +18,14 @@ def _build_hmr_store(tmp_path: Path) -> Path:
     """Build a synthetic store with:
        - a dense HMR (50 CpGs in 500 bp) at pos 5000-5500
        - a sparse LMR (4 CpGs spread across 2000 bp) at pos 50000-52000
-       - high-β filler everywhere else.
+       - high-beta filler everywhere else.
     """
     store = tmp_path / "hmr_store"
     sample_dir = store / "sample=S1" / "chrom=chr_hmr"
     sample_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(7)
-    # Filler: 200 evenly-spaced high-β CpGs across the chrom, EXCLUDING
+    # Filler: 200 evenly-spaced high-beta CpGs across the chrom, EXCLUDING
     # the planted hypo regions so they aren't contaminated. Leave a
     # clear gap on either side of the LMR so the HMM can transition.
     filler_lo = np.linspace(100, 4000, 50).astype(np.int32)
@@ -90,7 +90,7 @@ def test_hmr_distinguishes_lmr_by_density(tmp_path):
 
 
 def test_hmr_no_calls_on_high_beta_only(tmp_path):
-    """All-high-β store yields zero HMRs/LMRs."""
+    """All-high-beta store yields zero HMRs/LMRs."""
     store = tmp_path / "flat"
     sd = store / "sample=S1" / "chrom=chr_flat"
     sd.mkdir(parents=True, exist_ok=True)

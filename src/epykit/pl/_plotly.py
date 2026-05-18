@@ -67,8 +67,8 @@ def volcano_plotly(md: MethylData, *, alpha: float = 0.05, min_abs_diff: float =
     fig.add_vline(x=-min_abs_diff, line=dict(color="grey", dash="dash", width=1))
     fig.update_layout(
         title="DMC volcano",
-        xaxis_title="Methylation difference (treatment − control)",
-        yaxis_title=f"−log₁₀({p_col})",
+        xaxis_title="Methylation difference (treatment - control)",
+        yaxis_title=f"-log_1_0({p_col})",
         template="simple_white",
         height=420,
     )
@@ -114,7 +114,7 @@ def ma_plot_plotly(md: MethylData, *, alpha: float = 0.05, min_abs_diff: float =
     fig.update_layout(
         title="MA plot",
         xaxis_title="Mean methylation",
-        yaxis_title="Methylation difference (treatment − control)",
+        yaxis_title="Methylation difference (treatment - control)",
         template="simple_white",
         height=420,
     )
@@ -163,7 +163,7 @@ def manhattan_plotly(md: MethylData, *, alpha: float = 0.05):
     fig.update_layout(
         title="Manhattan plot",
         xaxis=dict(tickvals=ticks_pos, ticktext=ticks_label, title="Chromosome"),
-        yaxis_title=f"−log₁₀({p_col})",
+        yaxis_title=f"-log_1_0({p_col})",
         template="simple_white",
         height=320,
     )
@@ -424,9 +424,9 @@ def tss_metaplot_plotly(md: MethylData, gtf_path: str, *, window_bp: int = 2000,
             ))
     fig.add_vline(x=0, line=dict(color="black", dash="dash", width=1))
     fig.update_layout(
-        title=f"TSS metaplot (±{window_bp} bp)",
+        title=f"TSS metaplot (+/-{window_bp} bp)",
         xaxis_title="Distance from TSS (bp)",
-        yaxis_title="Mean β",
+        yaxis_title="Mean beta",
         template="simple_white",
         height=380,
     )

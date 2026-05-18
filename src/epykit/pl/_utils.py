@@ -21,7 +21,7 @@ def _get_ax(ax=None, figsize=(6, 4)) -> Tuple[Figure, object]:
 def _save_fig(md, fig: Figure, name: str, out_dir: str | None = None) -> str:
     out = Path(out_dir or "figures")
     path = out / f"{name}.png"
-    # Create the *full* parent directory, not just `out` — `name` may itself
+    # Create the *full* parent directory, not just `out` -- `name` may itself
     # contain path separators (e.g. save="subdir/figname"), and without this
     # the savefig call fails with FileNotFoundError on the intermediate dir.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -38,7 +38,7 @@ def _save_fig(md, fig: Figure, name: str, out_dir: str | None = None) -> str:
 
 
 def build_sample_site_matrix(md, n_sites: int = 10_000) -> tuple[np.ndarray, list[str]]:
-    """Build a (n_samples × n_sites) β matrix for embedding-style plots.
+    """Build a (n_samples x n_sites) beta matrix for embedding-style plots.
 
     Shared between :func:`pca` and :func:`umap`. Picks a random subsample
     of the intersection of CpGs covered in every sample so the matrix

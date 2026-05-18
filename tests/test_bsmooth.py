@@ -1,10 +1,10 @@
 """BSmooth-style local-polynomial smoother tests.
 
 Contract:
-  1. Constant input → constant output (within float tolerance).
-  2. Linear ramp → recovered closely (degree-2 polynomial nests linear).
+  1. Constant input -> constant output (within float tolerance).
+  2. Linear ramp -> recovered closely (degree-2 polynomial nests linear).
   3. Adaptive bandwidth: a sparse-CpG region uses a wider bp window than
-     a dense region. We don't test the exact bandwidth — we test that
+     a dense region. We don't test the exact bandwidth -- we test that
      output stays finite and bounded there.
   4. Edge sites get smoothed (not NaN'd) when enough neighbors are in range.
   5. End-to-end: ep.pp.smooth(md, method="bsmooth") writes the sidecar.
@@ -72,7 +72,7 @@ def test_bsmooth_linear_ramp_recovered():
 
 
 def test_bsmooth_returns_raw_beta_with_too_few_neighbors():
-    """Sites whose window has < min_cpgs_for_smooth valid neighbors → raw beta."""
+    """Sites whose window has < min_cpgs_for_smooth valid neighbors -> raw beta."""
     # Three CpGs spaced 10 kb apart; with h_min=1000 each site sees only
     # itself, so the smoothed value must equal beta_raw.
     positions = np.array([1000.0, 11000.0, 21000.0])
@@ -110,10 +110,10 @@ def test_bsmooth_high_coverage_dominates():
     # need min_cpgs_for_smooth=3, ns small enough that all 3 are picked up
     smoother = _bsmooth_make_njit()
     out = smoother(positions, meth, cov, 3, 5000.0, 1, 3)
-    # weighted mean of beta with weights w∝cov × tricube would be:
-    # w_left ≈ 5 * tri(0.2)  w_center ≈ 500 * tri(0)  w_right ≈ 5 * tri(0.2)
-    # tri(0) = 1, tri(0.2) = (1-0.008)^3 ≈ 0.976
-    # so center weight dominates → out[1] should be very close to 1.
+    # weighted mean of beta with weights w~cov x tricube would be:
+    # w_left ~= 5 * tri(0.2)  w_center ~= 500 * tri(0)  w_right ~= 5 * tri(0.2)
+    # tri(0) = 1, tri(0.2) = (1-0.008)^3 ~= 0.976
+    # so center weight dominates -> out[1] should be very close to 1.
     assert out[1] > 0.95, f"center smoothed = {out[1]}, expected > 0.95"
 
 

@@ -1,6 +1,6 @@
-"""Partially methylated domains (PMD) caller — single-sample, megabase-scale.
+"""Partially methylated domains (PMD) caller -- single-sample, megabase-scale.
 
-Two-state HMM over coverage-weighted, smoothed β per chromosome:
+Two-state HMM over coverage-weighted, smoothed beta per chromosome:
   - State 0: PMD (low / partially methylated)
   - State 1: non-PMD (highly methylated euchromatin)
 
@@ -8,14 +8,14 @@ Per-sample, NOT per-group. Output lands in ``md.uns["pmd"]`` with one
 row per called PMD: ``(sample_id, chrom, start, end, length_bp, mean_beta, n_cpgs)``.
 
 Why HMM over hard thresholding?
-  Naive threshold-on-smoothed-β (β < 0.7 → PMD) gives jagged
+  Naive threshold-on-smoothed-beta (beta < 0.7 -> PMD) gives jagged
   boundaries and breaks under coverage drop-outs. The 2-state HMM with
   a sticky transition prior smooths the assignment without
   oversmoothing the underlying signal.
 
 This caller routes through the shared
 :func:`epykit._compute.run_chrom_pipeline`, so it benefits from the
-0.4 distributed backend automatically — call with ``backend="dask"`` to
+0.4 distributed backend automatically -- call with ``backend="dask"`` to
 parallelise across chromosomes.
 """
 
@@ -55,9 +55,9 @@ def _gaussian_smooth_beta(
     """Coverage-weighted Gaussian smoother.
 
     Vectorised with an O(n_cpgs * window) inner loop using positional
-    binary search to avoid the full O(n²) kernel. For PMD work
+    binary search to avoid the full O(n^2) kernel. For PMD work
     (bandwidth ~10 kb, CpG density ~1 per 100 bp) the effective window
-    is ~100 CpGs — tractable.
+    is ~100 CpGs -- tractable.
     """
     n = len(positions)
     out = np.full(n, np.nan, dtype=np.float64)
@@ -119,7 +119,7 @@ def call_pmd_one_sample(
         viterbi = segment(
             beta_smooth, n_states=2, state_means=state_means, self_loop=self_loop,
         )
-        # State 0 is the PMD (low β) state.
+        # State 0 is the PMD (low beta) state.
         runs = runs_of_state(viterbi, target_state=0, positions=positions)
         rows: list[dict[str, object]] = []
         for run_start, run_end, run_len_sites in runs:

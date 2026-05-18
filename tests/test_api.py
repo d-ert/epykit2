@@ -57,7 +57,7 @@ def test_state_is_raw_before_any_preprocessing(synth_md):
 
     Note: ``read_bismark`` itself records a ``"raw"`` step in
     ``_store_history`` so callers can audit where the methylstore came
-    from. The state list will therefore contain at most ``["raw"]`` — but
+    from. The state list will therefore contain at most ``["raw"]`` -- but
     none of the preprocessing markers (filtered / united / smoothed) should
     be present yet.
     """
@@ -88,7 +88,7 @@ def test_state_after_unite(synth_md):
 def test_state_persists_through_save_load_round_trip(synth_md, tmp_path):
     """A filtered + united MethylData saved and reloaded retains its
     derived state. Save/load are symmetric for paths with directory
-    components — the previous test workaround helper is no longer needed.
+    components -- the previous test workaround helper is no longer needed.
     """
     import epykit as ep
 
@@ -110,7 +110,7 @@ def test_state_persists_through_save_load_round_trip(synth_md, tmp_path):
 
 
 def test_save_load_round_trip_preserves_obs_varm_uns(synth_md, tmp_path):
-    """Save → load must preserve obs, varm, and primitive uns values."""
+    """Save -> load must preserve obs, varm, and primitive uns values."""
     import epykit as ep
 
     # Populate uns and varm.
@@ -250,7 +250,7 @@ def test_samples_treatment_kwarg_does_not_warn(synth_md_filtered):
 
 def test_passing_both_aliases_raises_typeerror(synth_md_filtered):
     """It's a programmer error to pass both ``samples_case`` and
-    ``samples_treatment`` — refuse the call."""
+    ``samples_treatment`` -- refuse the call."""
     from epykit.dmc import process_chromosomes_dmc
 
     with warnings.catch_warnings():

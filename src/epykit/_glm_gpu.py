@@ -2,7 +2,7 @@
 
 This module mirrors :func:`epykit._glm.irls_binomial_batch` but runs the
 matrix maths on a CUDA device through ``cupy``. The two implementations
-must stay numerically identical — :func:`tests.test_glm_gpu` enforces a
+must stay numerically identical -- :func:`tests.test_glm_gpu` enforces a
 1e-6 tolerance on the synth fixture, and the same algorithmic structure
 is preserved line-by-line below so reviewers can diff the two files.
 
@@ -91,12 +91,12 @@ def irls_binomial_batch_gpu(
     """GPU port of :func:`epykit._glm.irls_binomial_batch`.
 
     Same algorithm, same outputs (numpy arrays). All maths is done on
-    device; numpy ↔ cupy transfers happen at the boundary.
+    device; numpy <-> cupy transfers happen at the boundary.
 
     Parameters
     ----------
     meth, cov : (n_sites, n_samples)
-        Methylated / total read counts. Must be numpy arrays — they get
+        Methylated / total read counts. Must be numpy arrays -- they get
         promoted to float64 and transferred to GPU.
     X : (n_samples, p)
         Shared design matrix.

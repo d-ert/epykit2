@@ -83,7 +83,7 @@ def _genome_wide_quantile(
 def _apply_blacklist(df: pl.DataFrame, blacklist_bed: str) -> pl.DataFrame:
     """Remove CpG sites that overlap any region in the blacklist BED file.
 
-    Uses bioframe for vectorised interval overlap — one operation regardless
+    Uses bioframe for vectorised interval overlap -- one operation regardless
     of how many regions are in the blacklist.
 
     PERF-1 fix: replaces the old per-region .filter() loop that built a chain
@@ -187,7 +187,7 @@ def get_coverage_quantile(
     sample : str
         Sample identifier
     quantile : float
-        Quantile to compute (0.0–1.0); default 0.999
+        Quantile to compute (0.0-1.0); default 0.999
 
     Returns
     -------
@@ -272,7 +272,7 @@ def filter_sites(
             shutil.rmtree(out_sample_dir)
         out_sample_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- PERF-2: pass 1 — coverage column only, genome-wide quantile ---
+        # --- PERF-2: pass 1 -- coverage column only, genome-wide quantile ---
         max_cov = _genome_wide_quantile(sample_dir, max_coverage_quantile)
         logger.info("  Max coverage quantile (%s): %s", max_coverage_quantile, max_cov)
 
@@ -281,7 +281,7 @@ def filter_sites(
             logger.warning("  no chrom=* dirs found for %s; skipping", samp)
             continue
 
-        # --- PERF-2: pass 2 — per-chromosome read → filter → write ---
+        # --- PERF-2: pass 2 -- per-chromosome read -> filter -> write ---
         for chrom_dir in chrom_dirs:
             chrom = chrom_dir.name.removeprefix("chrom=")
 
@@ -351,7 +351,7 @@ def normalize_coverage_store(
 
     Each row's ``N_meth`` and ``N_unmeth (= coverage - N_meth)`` are then
     scaled by ``s_i`` and rounded to int. ``coverage`` is rebuilt as
-    ``N_meth + N_unmeth`` so the equality holds exactly after rounding —
+    ``N_meth + N_unmeth`` so the equality holds exactly after rounding --
     downstream Polars joins rely on this strict invariant.
 
     Coverage normalisation should run between ``filter_coverage`` and
@@ -522,7 +522,7 @@ def intersect_sites(
     """Find CpG sites present in all specified samples.
 
     PERF-3 fix: replaced the N-1 sequential inner-join chain with a single
-    lazy scan → group_by → count approach.  All samples are processed in one
+    lazy scan -> group_by -> count approach.  All samples are processed in one
     pass; a site is retained only when its per-sample count equals len(samples).
 
     Parameters
@@ -537,7 +537,7 @@ def intersect_sites(
     Returns
     -------
     pl.DataFrame
-        Columns: chrom, pos, strand — sites present in every listed sample
+        Columns: chrom, pos, strand -- sites present in every listed sample
     """
     if not samples:
         raise ValueError("Must provide at least one sample")

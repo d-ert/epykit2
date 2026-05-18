@@ -23,7 +23,7 @@ def test_to_anndata_shape_default(synth_md_filtered):
     adata = synth_md_filtered.to_anndata(layer="beta")
     assert adata.shape[0] == synth_md_filtered.n_samples
     assert adata.shape[1] > 0
-    # No extra layers by default — keeps OOM at bay on real WGBS
+    # No extra layers by default -- keeps OOM at bay on real WGBS
     assert list(adata.layers.keys()) == []
     # Provenance keys
     assert adata.uns.get("epykit_assembly") == synth_md_filtered.assembly
@@ -48,6 +48,6 @@ def test_to_anndata_beta_in_unit_interval(synth_md_filtered):
     arr = np.asarray(adata.X)
     finite = arr[np.isfinite(arr)]
     if len(finite) == 0:
-        pytest.skip("no finite β values")
+        pytest.skip("no finite beta values")
     assert finite.min() >= 0.0
     assert finite.max() <= 1.0

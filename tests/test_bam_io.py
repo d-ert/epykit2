@@ -6,7 +6,7 @@ calls (Bismark XM tags) and verify that
 calls we planted. Pysam is optional; tests cleanly skip when it isn't
 installed.
 
-We deliberately avoid mocking pysam — building a real (tiny) BAM
+We deliberately avoid mocking pysam -- building a real (tiny) BAM
 exercises the same code path as real Bismark output and catches any
 bugs in tag parsing / aligned-pair iteration.
 """
@@ -32,7 +32,7 @@ def synth_bismark_bam(tmp_path: Path) -> Path:
     Two reads on ``chr_test``:
       - Read A: starts at pos 100, length 10, XM = "z.z.zZ.Z.z"
         (5 CpG-style calls: 0, 0, 0, 1, 0 at offsets 0, 2, 4, 5, 9).
-        Wait — re-check: XM has one letter per query base; "z.z.zZ.Z.z"
+        Wait -- re-check: XM has one letter per query base; "z.z.zZ.Z.z"
         means bases at indices 0,2,4,5,7,9 are CpG calls. We'll
         treat indices 0/2/4/9 as unmethylated, 5/7 as methylated.
       - Read B: same start, but methylated where read A is unmethylated.
@@ -83,7 +83,7 @@ def test_read_bismark_xm_recovers_planted_calls(synth_bismark_bam):
     assert df["pos"].max() <= 109
 
     # Read A: methylated at the offsets that were "Z" (uppercase) in
-    # "z.z.zZ.Z.z" — that's indices 5 (Z) and 7 (Z).
+    # "z.z.zZ.Z.z" -- that's indices 5 (Z) and 7 (Z).
     # Read B: methylated at indices 0, 2, 4, 6, 9.
     read_a = df.filter(df["read_id"] == "read_A")
     read_b = df.filter(df["read_id"] == "read_B")
@@ -93,7 +93,7 @@ def test_read_bismark_xm_recovers_planted_calls(synth_bismark_bam):
     assert (
         read_a["methylation_status"].to_list()
         != read_b["methylation_status"].to_list()
-    ), "reads encoded opposite methylation — extractor lost the difference"
+    ), "reads encoded opposite methylation -- extractor lost the difference"
 
 
 def test_read_methylation_calls_respects_min_baseq(synth_bismark_bam):
@@ -106,7 +106,7 @@ def test_read_methylation_calls_respects_min_baseq(synth_bismark_bam):
 
 def test_read_methylation_calls_respects_min_mapq(synth_bismark_bam):
     """min_mapq filter drops below-threshold reads."""
-    # Fixture has mapq=60. min_mapq=100 → no reads survive.
+    # Fixture has mapq=60. min_mapq=100 -> no reads survive.
     df = read_methylation_calls(synth_bismark_bam, caller="bismark", min_mapq=100)
     assert df.height == 0
 

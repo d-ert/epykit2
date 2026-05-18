@@ -3,7 +3,7 @@
 DMC results scale linearly with genome size: ~22M CpG rows for a full
 human WGBS dataset. The historical pattern of staging each chromosome
 to a temp parquet and then ``pl.concat`` ing all 174 files into one
-in-memory DataFrame breaks at the genome scale — the eager concat
+in-memory DataFrame breaks at the genome scale -- the eager concat
 holds the list of per-chrom frames *and* the assembled output
 simultaneously, and downstream consumers (BH correction, DMR sweep)
 duplicate that table again.
@@ -140,7 +140,7 @@ class DMCStore:
     ) -> pl.DataFrame:
         """Eagerly assemble all chromosomes into one DataFrame.
 
-        Use sparingly on genome-scale stores — this is the operation
+        Use sparingly on genome-scale stores -- this is the operation
         that DMC's old assembly step performed and the one this class
         exists to avoid. Provided for back-compat with callers that
         truly need the full table (e.g. ``cli.py``'s
@@ -150,7 +150,7 @@ class DMCStore:
         so the returned DataFrame is drop-in compatible with code that
         joins on ``chrom`` (Polars rejects Enum-vs-Utf8 join keys). Pass
         ``preserve_enum_dtypes=True`` if you want the Enum dtype
-        preserved — saves ~10× memory on the chrom column but breaks
+        preserved -- saves ~10x memory on the chrom column but breaks
         joins with Utf8-keyed tables.
         """
         chroms = self.chroms()

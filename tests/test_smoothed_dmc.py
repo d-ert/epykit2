@@ -147,7 +147,7 @@ def test_pseudo_count_store_uses_smoothed_beta(tmp_path):
     build_smoothed_pseudo_count_store(raw_store, smooth_store, ["S"], out_store)
 
     pseudo = pl.read_parquet(str(out_store / "sample=S" / "chrom=chrX" / "part-0.parquet"))
-    # round(0.50 * 10) = 5 → N_meth = 5, N_unmeth = 5, coverage = 10
+    # round(0.50 * 10) = 5 -> N_meth = 5, N_unmeth = 5, coverage = 10
     assert pseudo["N_meth"].to_list() == [5, 5, 5, 5]
     assert pseudo["N_unmeth"].to_list() == [5, 5, 5, 5]
     assert pseudo["coverage"].to_list() == [10, 10, 10, 10]
@@ -182,8 +182,8 @@ def test_pseudo_count_store_falls_back_to_raw_on_nan(tmp_path):
 
     build_smoothed_pseudo_count_store(raw_store, smooth_store, ["S"], out_store)
     pseudo = pl.read_parquet(str(out_store / "sample=S" / "chrom=chr1" / "part-0.parquet"))
-    # Site 1: round(0.50 * 10) = 5  → pseudo (5, 5)
-    # Site 2: NaN smooth → fallback to raw (7, 3)
+    # Site 1: round(0.50 * 10) = 5  -> pseudo (5, 5)
+    # Site 2: NaN smooth -> fallback to raw (7, 3)
     assert pseudo["N_meth"].to_list() == [5, 7]
     assert pseudo["N_unmeth"].to_list() == [5, 3]
 

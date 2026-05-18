@@ -12,13 +12,13 @@ The transform is per (sample, chrom, CpG):
     N_unmeth_smooth  = coverage_smooth - N_meth_smooth
 
 Sites whose ``beta_smooth`` is NaN (i.e. the smoother couldn't fit a
-local polynomial — too few neighbours) fall back to the original
+local polynomial -- too few neighbours) fall back to the original
 ``N_meth`` / ``coverage`` from the raw store. This is intentional: we
 never silently drop signal, and the smoother's own ``min_cpgs_for_smooth``
 fallback to raw beta means most NaN cases are already handled upstream.
 
 This module exists as a small focused unit so the DMC code path stays
-clean — ``process_chromosomes_dmc`` just takes a different
+clean -- ``process_chromosomes_dmc`` just takes a different
 ``methylstore_path`` and runs normally.
 """
 
@@ -56,7 +56,7 @@ def build_smoothed_pseudo_count_store(
         ``md.obs.sample_id``.
     out_dir
         Output root. Will be created if missing. Existing contents are
-        not cleared — callers are responsible for using a fresh
+        not cleared -- callers are responsible for using a fresh
         :class:`tempfile.TemporaryDirectory`.
     """
     raw_store = Path(raw_store)
@@ -109,7 +109,7 @@ def build_smoothed_pseudo_count_store(
                 raw_n_meth = joined["N_meth"].to_numpy().astype(np.int64)
                 beta = joined["beta_smooth"].to_numpy().astype(np.float64)
 
-                # Where beta_smooth is NaN (rare — smoother fell back to
+                # Where beta_smooth is NaN (rare -- smoother fell back to
                 # raw beta for those sites anyway, but defensive), keep
                 # the raw N_meth / N_unmeth.
                 valid = np.isfinite(beta)

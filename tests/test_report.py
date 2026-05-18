@@ -66,7 +66,7 @@ def test_report_full_pipeline(synth_md_filtered, tmp_path):
 
 
 def test_report_skips_unrun_sections(synth_md_filtered, tmp_path):
-    """No DMC / DMR yet — every analysis section should render a `not run`
+    """No DMC / DMR yet -- every analysis section should render a `not run`
     notice instead of crashing."""
     import epykit as ep
 

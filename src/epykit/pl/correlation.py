@@ -73,7 +73,7 @@ def sample_correlation(
     ax.set_yticks(range(n))
     ax.set_xticklabels(labels, rotation=90, fontsize=8)
     ax.set_yticklabels(labels, fontsize=8)
-    fig.colorbar(im, ax=ax, label=f"{method} ρ")
+    fig.colorbar(im, ax=ax, label=f"{method} rho")
     ax.set_title("Sample correlation")
     if save:
         _save_fig(md, fig, save)

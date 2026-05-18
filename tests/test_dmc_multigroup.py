@@ -1,7 +1,7 @@
 """Multi-group / continuous-covariate contrasts via tl.dmc.
 
 These tests pin down statistical recovery on the multi-group and continuous-
-covariate fixture extensions — not just column presence — so a regression in
+covariate fixture extensions -- not just column presence -- so a regression in
 the joint F-test or in the Wald-on-continuous-coef path fails loudly.
 """
 
@@ -16,10 +16,10 @@ from tests.fixtures.synth import SimConfig, generate
 
 
 # Calibrated against the fixture. The multi-group joint F-test (3 groups,
-# 4 reps each, effect step 0.20 ⇒ Δβ_max≈0.40 across levels) is well-
+# 4 reps each, effect step 0.20 => Deltabeta_max~=0.40 across levels) is well-
 # powered; the continuous-covariate fixture is weaker (4 vs 4 samples, age
-# slope 0.5pp Δβ/year, ages drawn U(20,80), so the per-sample effective
-# Δβ varies with the realised age sample — 8 samples leaves a noisy slope
+# slope 0.5pp Deltabeta/year, ages drawn U(20,80), so the per-sample effective
+# Deltabeta varies with the realised age sample -- 8 samples leaves a noisy slope
 # estimate). The continuous test therefore checks structural correctness
 # (engine runs, finite p-values, FDR not catastrophic) rather than power.
 MULTIGROUP_POWER_MIN = 0.30
@@ -94,7 +94,7 @@ def test_multigroup_factor_joint_test(multigroup_md):
     assert df is not None
     assert "f_stat" in df.columns
     assert "df1" in df.columns
-    assert df.get_column("df1")[0] >= 2  # 3 levels → df1 == 2
+    assert df.get_column("df1")[0] >= 2  # 3 levels -> df1 == 2
     level_cols = [c for c in df.columns if c.startswith("mean_beta_")]
     assert len(level_cols) >= 3
     assert "qvalue" in df.columns
@@ -132,15 +132,15 @@ def test_multigroup_factor_joint_test(multigroup_md):
 
 
 def test_continuous_covariate_primary(continuous_md):
-    """Continuous covariate as primary effect — structural correctness check
+    """Continuous covariate as primary effect -- structural correctness check
     on the Wald-on-age path.
 
-    The fixture (4 vs 4 samples, 200 age-DMCs at 0.5pp Δβ/year, ages drawn
+    The fixture (4 vs 4 samples, 200 age-DMCs at 0.5pp Deltabeta/year, ages drawn
     U(20,80)) is under-powered for an absolute power floor: a small but
     real slope at n=8 leaves wide SEs, and ~30 % of sites separate on the
-    binomial GLM because low-coverage sites hit β=0/1 boundaries. So we
-    test what *should* hold structurally — engine ran, finite p-values,
-    FDR not catastrophic on the q<0.05 calls — rather than recovery rate.
+    binomial GLM because low-coverage sites hit beta=0/1 boundaries. So we
+    test what *should* hold structurally -- engine ran, finite p-values,
+    FDR not catastrophic on the q<0.05 calls -- rather than recovery rate.
     Strengthening the fixture (or testing power at a tighter alpha) is on
     the 0.3 roadmap.
     """
@@ -167,7 +167,7 @@ def test_continuous_covariate_primary(continuous_md):
 
     # FDR: among called sites, any that's not a seeded effect of any kind
     # is a false positive. With ~5% nominal alpha and BH correction the
-    # observed FDR should stay below ~0.5 even with weak signal — anything
+    # observed FDR should stay below ~0.5 even with weak signal -- anything
     # at or above 0.8 would indicate a calibration bug.
     called = joined.filter(pl.col("qvalue") < 0.05)
     if called.height > 0:
@@ -179,7 +179,7 @@ def test_continuous_covariate_primary(continuous_md):
         fdr = fp / called.height
         assert fdr < 0.80, (
             f"Continuous-covariate FDR catastrophically high: "
-            f"{fp}/{called.height} = {fdr:.3f} (≥0.80 suggests broken "
+            f"{fp}/{called.height} = {fdr:.3f} (>=0.80 suggests broken "
             "q-value calibration, not just low power)"
         )
 
@@ -189,7 +189,7 @@ def test_named_contrast_single_row(multigroup_md):
     p-value column) or fails with a clean ValueError. Anything else (crash,
     silent NaN-only output) is a regression.
 
-    Note: this is the "tough resolution path" — we don't pin the result,
+    Note: this is the "tough resolution path" -- we don't pin the result,
     just guarantee no unexpected exception type slips through.
     """
     md, _truth, _cfg = multigroup_md
@@ -211,4 +211,4 @@ def test_named_contrast_single_row(multigroup_md):
     assert "pvalue" in df.columns, "contrast resolved but pvalue column missing"
     # Should have produced *some* finite p-values on a fixture this size.
     finite_p = df.filter(pl.col("pvalue").is_finite()).height
-    assert finite_p > 0, "all p-values NaN — contrast silently failed"
+    assert finite_p > 0, "all p-values NaN -- contrast silently failed"

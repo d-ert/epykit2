@@ -7,7 +7,7 @@ The contract:
   2. ``query_regions`` is row-wise equivalent to looping ``query_region``
      over each row of the input frame.
   3. ``query_sites`` returns only rows at the exact requested
-     (chrom, pos) — never bystanders from the partition.
+     (chrom, pos) -- never bystanders from the partition.
   4. Querying a chromosome / sample that doesn't exist returns an empty
      frame, not an error.
 """

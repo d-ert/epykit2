@@ -1,8 +1,8 @@
 """DMR / DMC set-overlap visualisations.
 
-UpSet-style plot for comparing 2–6 DMR (or DMC) sets across contrasts or
-methods. The implementation is matplotlib-only — no upsetplot dependency —
-because the typical methylation use case is 2–5 sets where a hand-rolled
+UpSet-style plot for comparing 2-6 DMR (or DMC) sets across contrasts or
+methods. The implementation is matplotlib-only -- no upsetplot dependency --
+because the typical methylation use case is 2-5 sets where a hand-rolled
 UpSet matrix is small and avoids dragging in a transitive pandas-version
 constraint from upsetplot's lower bounds.
 
@@ -56,7 +56,7 @@ def dmr_overlap(
     save: str | None = None,
     md=None,
 ):
-    """Plot the intersection structure of 2–6 DMR sets.
+    """Plot the intersection structure of 2-6 DMR sets.
 
     For 2 sets, draws a 2-circle Venn (overlap proportional to actual
     intersection size). For 3+ sets, draws an UpSet plot:
@@ -69,13 +69,13 @@ def dmr_overlap(
     ``key_cols`` controls how rows are compared. For DMR tables the
     default ``(chrom, start, end)`` matches identical tile coordinates;
     pass ``("chrom", "pos")`` to compare DMC tables instead. For "any
-    DMR that overlaps another by ≥1 bp" semantics, pre-merge your tables
+    DMR that overlaps another by >=1 bp" semantics, pre-merge your tables
     on intervals (e.g. via bioframe) and pass a unique merged-region ID.
 
     Parameters
     ----------
     sets : dict[str, pl.DataFrame]
-        Label → DMR / DMC table. 2 ≤ len(sets) ≤ 6.
+        Label -> DMR / DMC table. 2 <= len(sets) <= 6.
     key_cols : tuple[str, ...]
         Columns that together identify "the same DMR" across tables.
     min_size : int
@@ -138,7 +138,7 @@ def _venn2(labels, set_keys, *, ax, figsize, save, md):
     ax.set_ylim(-1.4, 1.5)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title(f"Overlap: {a} vs {b}  (|A∩B|={both:,})")
+    ax.set_title(f"Overlap: {a} vs {b}  (|A & B|={both:,})")
 
     if save and md is not None:
         _save_fig(md, fig, save)
@@ -160,7 +160,7 @@ def _upset(labels, set_keys, *, min_size, sort_by, ax, figsize, save, md):
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
-    # Build the combo → size table.
+    # Build the combo -> size table.
     combos = _powerset_nonempty(labels)
     combo_sizes: dict[tuple[str, ...], int] = {}
     for combo in combos:
@@ -173,7 +173,7 @@ def _upset(labels, set_keys, *, min_size, sort_by, ax, figsize, save, md):
 
     if not combo_sizes:
         raise ValueError(
-            f"No intersection has ≥{min_size} elements; nothing to plot."
+            f"No intersection has >={min_size} elements; nothing to plot."
         )
 
     if sort_by == "size":
@@ -259,7 +259,7 @@ def _upset_single_ax(labels, set_keys, *, min_size, sort_by, ax, save, md):
         if size >= min_size:
             combo_sizes[combo] = size
     if not combo_sizes:
-        raise ValueError(f"No intersection has ≥{min_size} elements.")
+        raise ValueError(f"No intersection has >={min_size} elements.")
     if sort_by == "size":
         ordered = sorted(combo_sizes.items(), key=lambda kv: -kv[1])
     else:
@@ -269,7 +269,7 @@ def _upset_single_ax(labels, set_keys, *, min_size, sort_by, ax, save, md):
     ax.bar(xs, sizes, color="tab:blue", edgecolor="black", linewidth=0.5)
     ax.set_xticks(xs)
     ax.set_xticklabels(
-        ["∩".join(c) for c, _ in ordered], rotation=45, ha="right", fontsize=8,
+        [" & ".join(c) for c, _ in ordered], rotation=45, ha="right", fontsize=8,
     )
     ax.set_ylabel("Intersection size")
     ax.set_title("DMR overlap")

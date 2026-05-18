@@ -1,7 +1,7 @@
-"""Per-sample β strip-plot panels for the top DMRs.
+"""Per-sample beta strip-plot panels for the top DMRs.
 
 For each of the top ``n`` DMRs (ranked by qvalue, pvalue, or any column
-on the DMR table), this function queries the per-sample β within the
+on the DMR table), this function queries the per-sample beta within the
 DMR's coordinates and renders a strip/box plot grouped by
 ``md.obs[group_by]``.
 """
@@ -15,7 +15,7 @@ from .._style import PALETTE
 from ._utils import _save_fig
 
 
-_MAX_PANELS = 25  # hard cap; see plan §6 implementation notes
+_MAX_PANELS = 25  # hard cap; see plan Sec.6 implementation notes
 
 
 def dmr_boxplot(
@@ -27,7 +27,7 @@ def dmr_boxplot(
     figsize=None,
     save: str | None = None,
 ):
-    """Strip-plot of per-sample β across the top ``n`` DMRs.
+    """Strip-plot of per-sample beta across the top ``n`` DMRs.
 
     Parameters
     ----------
@@ -106,9 +106,9 @@ def dmr_boxplot(
         ax.set_xticks(list(x_positions.values()))
         ax.set_xticklabels(unique_groups, fontsize=8)
         ax.set_ylim(0.0, 1.0)
-        ax.set_ylabel("β" if i % cols == 0 else "")
+        ax.set_ylabel("beta" if i % cols == 0 else "")
         q = row.get(rank_col)
-        q_str = f"{q:.2g}" if isinstance(q, (int, float)) and np.isfinite(q) else "—"
+        q_str = f"{q:.2g}" if isinstance(q, (int, float)) and np.isfinite(q) else "--"
         ax.set_title(
             f"{chrom}:{start:,}-{end:,}\n{rank_col}={q_str}",
             fontsize=8,

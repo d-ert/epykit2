@@ -5,12 +5,12 @@ effect-size bias for every DMC backend and both DMR engines against a
 ground truth where we *know* which CpGs and which regions are differential.
 
 Why thresholds rather than tight equality? The synthetic data has finite
-sample size (8 samples × 5 chr × 2 000 CpGs) and stochastic noise. We pick
+sample size (8 samples x 5 chr x 2 000 CpGs) and stochastic noise. We pick
 thresholds that:
 
   - any minimally-working implementation would clear easily, AND
   - any of the suspected bugs from the prior audit (dispersion df off by
-    one, logit-t variance unbounded near β=0/1, NaN-after-BH sort) would
+    one, logit-t variance unbounded near beta=0/1, NaN-after-BH sort) would
     almost certainly fail.
 
 Each test exercises one backend so a regression points at the right place.
@@ -32,13 +32,13 @@ from tests.conftest import (
 
 
 # Power / FDR thresholds. Calibrated against the medium fixture
-# (4 vs 4 samples, Δβ=0.40, cov~20, replicate_sd=0.03, ~75 k post-filter
+# (4 vs 4 samples, Deltabeta=0.40, cov~20, replicate_sd=0.03, ~75 k post-filter
 # CpGs, BH on 500 true DMCs).
 #
-# Observed power on the calibration run was LR ≈ 0.60, score ≈ 0.58,
-# fisher ≈ 0.45. At 4-vs-4 with df_resid ≈ 6 in the F(1, df_resid)
+# Observed power on the calibration run was LR ~= 0.60, score ~= 0.58,
+# fisher ~= 0.45. At 4-vs-4 with df_resid ~= 6 in the F(1, df_resid)
 # reference distribution, the achievable BH-q<0.05 power on 75 k tests
-# tops out roughly there — bumping the fixture knobs further would risk
+# tops out roughly there -- bumping the fixture knobs further would risk
 # making the test trivially easy.
 #
 # Thresholds are set ~5-10 % below observed to tolerate any future
@@ -87,7 +87,7 @@ def test_dmc_score_power_and_fdr(synth_md_filtered, synth_bundle: SynthBundle):
 
 
 def test_dmc_logit_t_power_and_fdr(synth_md_filtered, synth_bundle: SynthBundle):
-    """Welch t on logit(β) is the most variance-stabilising fallback.
+    """Welch t on logit(beta) is the most variance-stabilising fallback.
     Power is intentionally lower than LR/score but FDR should stay calibrated.
     """
     df = _run_dmc(synth_md_filtered, test="logit_t")
@@ -107,22 +107,22 @@ def test_dmc_fisher_runs_and_is_powerful_but_anti_conservative(
     power = power_at_threshold(df, synth_bundle.truth, alpha=0.05)
     fdr   = fdr_at_threshold(df, synth_bundle.truth, alpha=0.05)
     assert power >= POWER_MIN_FISHER, f"fisher power too low: {power:.3f}"
-    # Document expected anti-conservativeness — we don't fail on high FDR.
+    # Document expected anti-conservativeness -- we don't fail on high FDR.
     assert fdr <= FDR_MAX_FISHER, f"fisher FDR runaway: {fdr:.3f}"
 
 
 def test_dmc_lr_meth_diff_bias_small(synth_md_filtered, synth_bundle: SynthBundle):
-    """Recovered Δβ on truly-DMC sites is approximately unbiased.
+    """Recovered Deltabeta on truly-DMC sites is approximately unbiased.
 
-    The synthetic fixture now uses **deterministically balanced** ±Δβ
+    The synthetic fixture now uses **deterministically balanced** +/-Deltabeta
     signs across both DMRs (half hyper, half hypo) and scattered DMCs
     (half hyper, half hypo), so the truth-table mean effect is exactly
     zero. Any residual mean bias must therefore come from the estimator
-    itself — coverage weighting, boundary handling near β = 0.7, etc.
+    itself -- coverage weighting, boundary handling near beta = 0.7, etc.
 
     The threshold of 0.04 is loose enough to absorb minor coverage-
     weighted-estimator quirks but tight enough to surface a real bug
-    (a sign-convention flip would show |bias| ≈ |Δβ|). If the first
+    (a sign-convention flip would show |bias| ~= |Deltabeta|). If the first
     green run reports a bias well under 0.02, this can be tightened.
     """
     df = _run_dmc(synth_md_filtered, test="lr")
@@ -175,7 +175,7 @@ def test_dmr_sliding_window_recovers_seeded_regions(
     """Sliding-window DMR (lower power than tile) should still recover a
     decent fraction of seeded DMRs after running DMC first.
 
-    Uses window_bp=1000 / min_cpgs=2 to match the tile-test geometry —
+    Uses window_bp=1000 / min_cpgs=2 to match the tile-test geometry --
     the fixture's CpG density (~225 bp mean spacing) makes a 500/3
     window+min_cpgs filter drop most candidate windows before BH.
     """
@@ -192,7 +192,7 @@ def test_dmr_sliding_window_recovers_seeded_regions(
     n_recovered, n_seeded = dmr_recovery(
         dmr_df, synth_bundle.truth, synth_bundle.config, alpha=0.05,
     )
-    # Sliding window is less powerful — accept a third.
+    # Sliding window is less powerful -- accept a third.
     assert n_recovered >= max(1, n_seeded // 3), (
         f"sliding_window DMR recovered only {n_recovered}/{n_seeded} seeded regions"
     )
@@ -223,7 +223,7 @@ def test_dmr_tile_dmr_types_consistent_with_seed_direction(
     else:
         sig = dmr_df
     assert len(sig) > 0, (
-        "No significant DMRs called on the calibrated fixture — "
+        "No significant DMRs called on the calibrated fixture -- "
         "test_dmr_tile_recovers_seeded_regions would also fail. Check "
         "the tile engine, fixture config, or FDR correction."
     )
@@ -259,7 +259,7 @@ def test_dmr_tile_dmr_types_consistent_with_seed_direction(
                     correct += 1
                 break
     assert matched > 0, (
-        "Zero significant DMRs overlapped any seeded region — same "
+        "Zero significant DMRs overlapped any seeded region -- same "
         "calibration concern as above. Inspect uns['dmr'] vs the truth "
         "seed_intervals."
     )
@@ -275,15 +275,15 @@ def test_dmr_tile_dmr_types_consistent_with_seed_direction(
 def _dmr_sens_fdr(dmr_df, truth, cfg, alpha=0.05):
     """Compute (sensitivity, false-discovery proportion) for a DMR table.
 
-    sensitivity = seeded DMRs overlapped by ≥1 significant call / n_seeded
+    sensitivity = seeded DMRs overlapped by >=1 significant call / n_seeded
     fdp         = significant calls that catch *no* truly differential
                   CpG (neither a scattered DMC nor a DMR CpG) /
                   n_called
 
     On the synth fixture the truth set has two signal kinds: 10 seeded
-    DMRs *and* ~500 scattered DMCs at the same Δβ. A tile spanning a
+    DMRs *and* ~500 scattered DMCs at the same Deltabeta. A tile spanning a
     region that happens to contain a scattered DMC is detecting real
-    signal — it's a true positive at the tile level even though it
+    signal -- it's a true positive at the tile level even though it
     doesn't overlap a seeded DMR interval. Counting it as a false
     positive (the naive definition) pushes the empirical FDP well above
     the BH-q<0.05 nominal because the tile engine pools reads across
@@ -352,11 +352,11 @@ def _dmr_sens_fdr(dmr_df, truth, cfg, alpha=0.05):
     return sensitivity, fdp
 
 
-# Calibrated against the medium fixture (10 seeded DMRs at Δβ=0.40,
+# Calibrated against the medium fixture (10 seeded DMRs at Deltabeta=0.40,
 # 4-vs-4, 1 kbp tiles / windows). Tile is the recommended path and
 # substantially more powerful than sliding-window; thresholds reflect
 # that. Both should keep the false-discovery proportion low because a
-# DMR-level Δβ of 0.40 produces obviously-non-null tiles.
+# DMR-level Deltabeta of 0.40 produces obviously-non-null tiles.
 DMR_TILE_SENS_MIN  = 0.50
 DMR_TILE_FDP_MAX   = 0.35
 DMR_SLIDE_SENS_MIN = 0.30
@@ -364,7 +364,7 @@ DMR_SLIDE_FDP_MAX  = 0.50
 
 
 def test_dmr_tile_sensitivity_and_fdp(synth_md_filtered, synth_bundle: SynthBundle):
-    """Tile-based DMR caller must recover ≥half the seeded DMRs while
+    """Tile-based DMR caller must recover >=half the seeded DMRs while
     keeping the false-discovery proportion of called regions modest."""
     import epykit as ep
     ep.tl.dmr(
@@ -388,7 +388,7 @@ def test_dmr_tile_sensitivity_and_fdp(synth_md_filtered, synth_bundle: SynthBund
 def test_dmr_sliding_window_sensitivity_and_fdp(
     synth_md_filtered, synth_bundle: SynthBundle
 ):
-    """Sliding-window DMR caller — same checks at looser thresholds."""
+    """Sliding-window DMR caller -- same checks at looser thresholds."""
     import epykit as ep
     ep.tl.dmc(synth_md_filtered, test="lr")
     ep.tl.dmr(
@@ -412,7 +412,7 @@ def test_dmr_sliding_window_sensitivity_and_fdp(
 
 
 
-# Coverage-weighted Δβ consistency between case and control
+# Coverage-weighted Deltabeta consistency between case and control
 
 
 def test_dmc_lr_per_group_mean_betas_are_finite_and_in_range(

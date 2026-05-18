@@ -1,7 +1,7 @@
 """TSS / gene-body metaplots.
 
 Reuses the cached GTF parser in :mod:`epykit.annotate` to enumerate gene
-TSS coordinates, then bins per-CpG β values into ``n_bins`` slots from
+TSS coordinates, then bins per-CpG beta values into ``n_bins`` slots from
 ``-window_bp`` to ``+window_bp`` around each TSS. One line per sample,
 optionally grouped by ``md.obs[group_by]``.
 """
@@ -59,11 +59,11 @@ def tss_metaplot(
     figsize=(7, 4),
     save: str | None = None,
 ):
-    """Plot mean β around the TSS, averaged across genes.
+    """Plot mean beta around the TSS, averaged across genes.
 
-    For each sample, β values are pooled across all gene TSS in a
-    ``±window_bp`` window, binned into ``n_bins`` slots based on relative
-    position (sign-flipped for - strand so 5'→3' is left→right), and
+    For each sample, beta values are pooled across all gene TSS in a
+    ``+/-window_bp`` window, binned into ``n_bins`` slots based on relative
+    position (sign-flipped for - strand so 5'->3' is left->right), and
     averaged. Each sample is drawn as a faint line, with one bold line
     per group (if ``group_by`` matches a column on ``md.obs``).
 
@@ -77,9 +77,9 @@ def tss_metaplot(
         bounded LRU GTF cache, so repeated calls within one process
         skip the streaming parse.
     window_bp : int
-        Half-window width in base pairs (default 2000 → ±2 kb).
+        Half-window width in base pairs (default 2000 -> +/-2 kb).
     n_bins : int
-        Number of bins to summarise β within the window. Default 100.
+        Number of bins to summarise beta within the window. Default 100.
     group_by : str or None
         Optional ``md.obs`` column for per-group means. Pass ``None`` to
         draw only the per-sample lines.
@@ -104,7 +104,7 @@ def tss_metaplot(
     # Bin layout: bin = floor((rel + window_bp) / bin_size); range [-window, +window).
     bin_size = (2 * window_bp) / n_bins
 
-    # mean β per (sample, bin). Allocate before the per-chrom loop.
+    # mean beta per (sample, bin). Allocate before the per-chrom loop.
     sum_beta = np.zeros((len(samples), n_bins), dtype=np.float64)
     count = np.zeros((len(samples), n_bins), dtype=np.int64)
     sample_idx = {s: i for i, s in enumerate(samples)}
@@ -199,8 +199,8 @@ def tss_metaplot(
 
     ax.axvline(0, color="black", lw=0.7, ls="--", alpha=0.5)
     ax.set_xlabel("Distance from TSS (bp)")
-    ax.set_ylabel("Mean β")
-    ax.set_title(f"TSS metaplot (±{window_bp} bp, n_bins={n_bins})")
+    ax.set_ylabel("Mean beta")
+    ax.set_title(f"TSS metaplot (+/-{window_bp} bp, n_bins={n_bins})")
 
     if save:
         _save_fig(md, fig, save)
@@ -240,20 +240,20 @@ def gene_body_metaplot(
     figsize=(8, 4),
     save: str | None = None,
 ):
-    """Plot mean β across a normalised gene body with TSS / TES flanks.
+    """Plot mean beta across a normalised gene body with TSS / TES flanks.
 
     The x-axis has three zones:
 
     * Left flank: ``-flank_bp`` to ``+0`` relative to TSS, binned into
       ``n_bins_flank`` slots.
-    * Body: TSS → TES on every gene, length-normalised into
+    * Body: TSS -> TES on every gene, length-normalised into
       ``n_bins_body`` slots so a 50 kb gene and a 500 kb gene contribute
       the same number of points per bin.
     * Right flank: TES to ``+flank_bp``, binned into ``n_bins_flank`` slots.
 
     Genes shorter than ``min_gene_bp`` are dropped to avoid the body
     binning collapsing onto a handful of CpGs. Strand is honoured so
-    5'→3' is left→right for every gene.
+    5'->3' is left->right for every gene.
 
     Parameters mirror :func:`tss_metaplot` where they overlap.
     """
@@ -269,7 +269,7 @@ def gene_body_metaplot(
     )
     if genes.is_empty():
         raise ValueError(
-            f"No genes ≥{min_gene_bp} bp in the GTF — every record is too short "
+            f"No genes >={min_gene_bp} bp in the GTF -- every record is too short "
             "for body-binning."
         )
     if max_genes is not None and len(genes) > max_genes:
@@ -327,7 +327,7 @@ def gene_body_metaplot(
             # For + strand: left flank = [tx_start - flank, tx_start),
             #               body         = [tx_start, tx_end],
             #               right flank  = (tx_end, tx_end + flank].
-            # For - strand: flip so 5'→3' is left→right.
+            # For - strand: flip so 5'->3' is left->right.
             if strand == 1:
                 lo, hi = tx_start - flank_bp, tx_end + flank_bp
             else:
@@ -347,26 +347,26 @@ def gene_body_metaplot(
             chunk_betas = chunk_betas[mask]
 
             # Zone assignment.
-            #   pos < tx_start  → left flank
-            #   tx_start ≤ pos ≤ tx_end → body
-            #   pos > tx_end    → right flank
+            #   pos < tx_start  -> left flank
+            #   tx_start <= pos <= tx_end -> body
+            #   pos > tx_end    -> right flank
             in_left = chunk_pos < tx_start
             in_right = chunk_pos > tx_end
             in_body = ~(in_left | in_right)
 
             bin_idx = np.zeros(chunk_pos.shape, dtype=np.int64)
-            # Left flank: rel ∈ [-flank, 0) → bins [0, n_bins_flank).
+            # Left flank: rel  in  [-flank, 0) -> bins [0, n_bins_flank).
             rel_left = (chunk_pos[in_left] - tx_start)  # negative
             bf = np.floor((rel_left + flank_bp) / (flank_bp / n_bins_flank))
             bin_idx[in_left] = np.clip(bf, 0, n_bins_flank - 1)
-            # Body: fraction along gene → [body_start, body_end).
+            # Body: fraction along gene -> [body_start, body_end).
             body_len = max(1, tx_end - tx_start)
             frac = (chunk_pos[in_body] - tx_start) / body_len
             bin_idx[in_body] = body_start + np.clip(
                 np.floor(frac * n_bins_body).astype(np.int64),
                 0, n_bins_body - 1,
             )
-            # Right flank: rel ∈ (0, flank] → bins [body_end, total).
+            # Right flank: rel  in  (0, flank] -> bins [body_end, total).
             rel_right = chunk_pos[in_right] - tx_end
             br = np.floor(rel_right / (flank_bp / n_bins_flank))
             bin_idx[in_right] = body_end + np.clip(
@@ -374,7 +374,7 @@ def gene_body_metaplot(
             )
 
             if strand == -1:
-                # Flip the bin axis so 5'→3' reads left→right for - strand.
+                # Flip the bin axis so 5'->3' reads left->right for - strand.
                 bin_idx = (total_bins - 1) - bin_idx
 
             np.add.at(sum_beta, (chunk_samples, bin_idx), chunk_betas)
@@ -432,9 +432,9 @@ def gene_body_metaplot(
     ax.set_xticks(tick_pos)
     ax.set_xticklabels(tick_lbl)
     ax.set_xlabel("Position along gene")
-    ax.set_ylabel("Mean β")
+    ax.set_ylabel("Mean beta")
     ax.set_title(
-        f"Gene-body metaplot (±{flank_bp} bp flanks, "
+        f"Gene-body metaplot (+/-{flank_bp} bp flanks, "
         f"n_genes={len(genes):,})"
     )
 

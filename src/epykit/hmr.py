@@ -1,18 +1,18 @@
-"""HMR / LMR caller — single-sample hypo- and low-methylated regions.
+"""HMR / LMR caller -- single-sample hypo- and low-methylated regions.
 
-MethylSeekR-style. Two-state HMM on per-CpG β (not smoothed —
+MethylSeekR-style. Two-state HMM on per-CpG beta (not smoothed --
 HMR/LMR are short-range, ~hundreds bp to few kb, and smoothing washes
 them out).
 
-  - HMR (hypo-methylated region): contiguous run of low-β CpGs at
-    average ``β < hmr_threshold``. Includes CpG islands, promoters,
+  - HMR (hypo-methylated region): contiguous run of low-beta CpGs at
+    average ``beta < hmr_threshold``. Includes CpG islands, promoters,
     enhancers.
-  - LMR (low-methylated region): contiguous low-β run NOT in a CpG-
+  - LMR (low-methylated region): contiguous low-beta run NOT in a CpG-
     island context, i.e. mostly distal regulatory elements. LMRs are
     a subset of "hypo-state" runs filtered on CpG density:
     LMR = hypo-state run with low CpG density (< lmr_max_density).
 
-Results land in ``md.uns["hmr"]`` and ``md.uns["lmr"]`` — two parallel
+Results land in ``md.uns["hmr"]`` and ``md.uns["lmr"]`` -- two parallel
 frames with ``(sample_id, chrom, start, end, n_cpgs, mean_beta, length_bp)``.
 """
 
@@ -48,7 +48,7 @@ def _segment_chrom(
     store: Path, sample: str, chrom: str,
     *, hmr_threshold: float, self_loop: float,
 ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Load one chrom's β and return (positions, beta, viterbi)."""
+    """Load one chrom's beta and return (positions, beta, viterbi)."""
     part = store / f"sample={sample}" / f"chrom={chrom}" / "part-0.parquet"
     if not part.exists():
         return None
@@ -76,7 +76,7 @@ def call_hmr_one_sample(
     *,
     chromosomes: Optional[list[str]] = None,
     hmr_threshold: float = 0.30,
-    lmr_max_density: float = 0.020,   # CpGs per bp; below this → LMR
+    lmr_max_density: float = 0.020,   # CpGs per bp; below this -> LMR
     min_cpgs: int = 4,
     self_loop: float = 0.85,
     backend: str = "sequential",
@@ -85,8 +85,8 @@ def call_hmr_one_sample(
     """Call HMRs (and tag LMR subset) for one sample.
 
     The default ``self_loop=0.85`` is deliberately looser than the PMD
-    caller's 0.999 — HMR/LMR are short-range (hundreds bp to a few kb)
-    so a too-sticky chain misses them between filler high-β CpGs.
+    caller's 0.999 -- HMR/LMR are short-range (hundreds bp to a few kb)
+    so a too-sticky chain misses them between filler high-beta CpGs.
     """
     store = Path(store)
     if chromosomes is None:
@@ -114,7 +114,7 @@ def call_hmr_one_sample(
             if valid.sum() == 0:
                 continue
             mean_beta = float(sel_beta[valid].mean())
-            # HMR if mean β < hmr_threshold; skip otherwise.
+            # HMR if mean beta < hmr_threshold; skip otherwise.
             if mean_beta >= hmr_threshold:
                 continue
             # LMR if CpG density (n_cpgs / length_bp) is low.

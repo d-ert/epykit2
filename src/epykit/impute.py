@@ -1,21 +1,21 @@
-"""kNN methylation β imputation.
+"""kNN methylation beta imputation.
 
 Useful for filling sparse coverage gaps before PCA / UMAP / clustering /
-regression-on-β analyses where missing values either propagate as NaN
+regression-on-beta analyses where missing values either propagate as NaN
 through the downstream math or force every analysis to do its own
 imputation. Two entry points:
 
-* :func:`impute_knn_beta` — pure-numpy: ``(n_samples, n_sites)`` β
+* :func:`impute_knn_beta` -- pure-numpy: ``(n_samples, n_sites)`` beta
   matrix in, imputed matrix out. Per-chromosome inverse-distance kNN.
   No heavy dependencies.
-* :func:`impute_knn_anndata` — operates on an :class:`anndata.AnnData`
-  with sample × site layout (the orientation epykit's ``to_anndata``
+* :func:`impute_knn_anndata` -- operates on an :class:`anndata.AnnData`
+  with sample x site layout (the orientation epykit's ``to_anndata``
   emits). Imputes one chromosome at a time using ``adata.var['chrom']``
   / ``adata.var['pos']`` so the same algorithm works on a stacked
   multi-chromosome matrix.
 
-The model is intentionally simple: missing β at (sample s, site j)
-becomes the inverse-distance-weighted mean of β values at sample s
+The model is intentionally simple: missing beta at (sample s, site j)
+becomes the inverse-distance-weighted mean of beta values at sample s
 across the k nearest *covered* CpGs within ``max_distance_bp`` of
 position j on the same chromosome. No cross-sample sharing (so it
 won't smooth across treatment / control groups by accident); no
@@ -47,11 +47,11 @@ def impute_knn_beta(
     ----------
     positions : (n_sites,) int
         Genomic position of each site. Must be sorted ascending and
-        contain CpGs from a *single* chromosome — call this once per
+        contain CpGs from a *single* chromosome -- call this once per
         chromosome and concatenate the result, or use
         :func:`impute_knn_anndata`.
     beta_matrix : (n_samples, n_sites) float
-        Per-sample β values; missing entries are NaN. Modified copy is
+        Per-sample beta values; missing entries are NaN. Modified copy is
         returned; the input is not mutated.
     k : int
         Number of nearest covered CpGs used in the inverse-distance
@@ -79,7 +79,7 @@ def impute_knn_beta(
     if not np.all(np.diff(positions) >= 0):
         raise ValueError("positions must be sorted ascending")
     if k < 1:
-        raise ValueError(f"k must be ≥1, got {k}")
+        raise ValueError(f"k must be >=1, got {k}")
 
     n_samples, n_sites = beta_matrix.shape
     out = beta_matrix.astype(np.float64, copy=True)
@@ -137,7 +137,7 @@ def impute_knn_anndata(
     layer: Optional[str] = None,
     inplace: bool = False,
 ):
-    """Impute missing β values in an :class:`anndata.AnnData`.
+    """Impute missing beta values in an :class:`anndata.AnnData`.
 
     The AnnData must follow epykit's convention: rows = samples, cols =
     sites, with ``adata.var['chrom']`` and ``adata.var['pos']`` set. The
@@ -151,7 +151,7 @@ def impute_knn_anndata(
     k, max_distance_bp
         Forwarded to :func:`impute_knn_beta`.
     layer : str, optional
-        Which layer to impute. Default ``None`` → ``adata.X``.
+        Which layer to impute. Default ``None`` -> ``adata.X``.
     inplace : bool
         If True, write the imputed matrix back into the source layer
         and return ``adata``. If False (default), return the imputed

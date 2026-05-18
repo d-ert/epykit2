@@ -89,7 +89,7 @@ def test_mbias_plot_renders_from_paths(tmp_path):
     fig, ax = ep.pl.mbias_plot(
         {"s1": p1, "s2": str(p2)}, context="CpG",
     )
-    # Two samples × R1 + R2 = 4 lines.
+    # Two samples x R1 + R2 = 4 lines.
     assert len(ax.get_lines()) == 4
     assert ax.get_xlabel() == "Read position (bp)"
     # y-axis should be locked to 0..100 (percent methylation).
@@ -103,7 +103,7 @@ def test_mbias_plot_renders_from_parsed_dataframes(tmp_path):
     _write_report(p1)
     df = parse_bismark_mbias(str(p1))
     fig, ax = ep.pl.mbias_plot({"s1": df}, context="CHG")
-    # CHG has only R1, 2 rows → 1 line.
+    # CHG has only R1, 2 rows -> 1 line.
     assert len(ax.get_lines()) == 1
 
 

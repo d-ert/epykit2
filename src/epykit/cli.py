@@ -1,17 +1,17 @@
 """Command-line entry point for epykit.
 
-Default DMC test is ``lr`` everywhere (CLI, Python API, docstrings) — the
+Default DMC test is ``lr`` everywhere (CLI, Python API, docstrings) -- the
 quasi-binomial likelihood-ratio chi-square with per-site McCullagh-Nelder
-dispersion. Closed-form on streaming (S0_g, S1_g, Σm²/n_g) accumulators,
+dispersion. Closed-form on streaming (S0_g, S1_g, Sigmam^2/n_g) accumulators,
 recommended at n >= 2 replicates per group.
 
 CLI surface:
-* ``dmc`` — per-CpG calling with ``--test {lr,score,glm,logit_t,welch_t,
+* ``dmc`` -- per-CpG calling with ``--test {lr,score,glm,logit_t,welch_t,
   bb_lr,cmh,fisher}``, ``--min-samples-treatment`` / ``--min-samples-control``
   filters (the older ``--min-samples-case`` is accepted as a deprecated alias),
   and ``--allow-n1`` to opt into the (anti-conservative) Fisher fallback when
   there are fewer than 2 replicates per group.
-* ``dmr`` — ``--method {tile,sliding_window}``. The tile path takes a
+* ``dmr`` -- ``--method {tile,sliding_window}``. The tile path takes a
   methylstore + samplesheet and pools reads per tile; the sliding-window path
   takes a DMC parquet and combines per-CpG p-values.
 """
@@ -328,7 +328,8 @@ def _cmd_annotate(args: argparse.Namespace):
         from .annotate import annotate_features
         sites = annotate_features(
             sites,
-            annotation_gtf=args.gtf,
+            args.gtf,
+            source="gtf",
             promoter_upstream_bp=args.promoter_upstream_bp,
             promoter_downstream_bp=args.promoter_downstream_bp,
         )
@@ -446,9 +447,9 @@ def _configure_logging(verbosity: int) -> None:
     allowed to configure logging because the user has explicitly invoked it.
 
     ``verbosity`` is the net of ``-v`` (count) minus ``-q`` (count):
-      0  → INFO (default)
-      ≥1 → DEBUG
-      ≤−1 → WARNING
+      0  -> INFO (default)
+      >=1 -> DEBUG
+      <=-1 -> WARNING
     """
     if verbosity >= 1:
         level = logging.DEBUG
@@ -468,7 +469,7 @@ def _configure_logging(verbosity: int) -> None:
 
 
 def main():
-    # Help strings and log messages embed unicode (β, →, μ, ...). On
+    # Help strings and log messages embed unicode (beta, ->, mu, ...). On
     # Windows the default console codec is cp1252 and argparse's
     # `--help` print crashes with UnicodeEncodeError before any
     # subcommand runs. Reconfigure both streams to UTF-8 with
@@ -510,7 +511,7 @@ def main():
             "Source file format. 'bismark' (default) for .cov[.gz] files "
             "produced by bismark_methylation_extractor / bismark2bedGraph. "
             "'methyldackel' for .bedGraph[.gz] files produced by "
-            "MethylDackel extract — same 6-column layout, with the leading "
+            "MethylDackel extract -- same 6-column layout, with the leading "
             "track header skipped automatically."
         ),
     )
@@ -557,21 +558,21 @@ def main():
         default="lr",
         help=(
             "Statistical test (default: lr). "
-            "lr — Quasi-binomial likelihood-ratio chi-square with per-site "
+            "lr -- Quasi-binomial likelihood-ratio chi-square with per-site "
             "McCullagh-Nelder dispersion. Closed-form on streaming "
             "accumulators; recommended default at n>=2. "
-            "score — Quasi-binomial score test on the same dispersion-corrected "
+            "score -- Quasi-binomial score test on the same dispersion-corrected "
             "accumulators as lr; marginally more powerful but mildly "
             "anti-conservative at the boundaries. "
-            "glm — Binomial GLM with covariates (requires a design via "
+            "glm -- Binomial GLM with covariates (requires a design via "
             "--formula). "
-            "logit_t — Welch t on logit(beta), variance-stabilising fallback. "
-            "welch_t — Welch t on raw betas (formerly 'beta_binomial'). "
-            "beta_binomial — Deprecated alias for welch_t. "
-            "bb_lr — True quasi-binomial LRT on a binary-treatment GLM with "
+            "logit_t -- Welch t on logit(beta), variance-stabilising fallback. "
+            "welch_t -- Welch t on raw betas (formerly 'beta_binomial'). "
+            "beta_binomial -- Deprecated alias for welch_t. "
+            "bb_lr -- True quasi-binomial LRT on a binary-treatment GLM with "
             "per-site dispersion. "
-            "cmh — Cochran-Mantel-Haenszel on per-pair strata. "
-            "fisher — Fisher exact on reads pooled across replicates "
+            "cmh -- Cochran-Mantel-Haenszel on per-pair strata. "
+            "fisher -- Fisher exact on reads pooled across replicates "
             "(anti-conservative, kept for backward compatibility; warns)."
         ),
     )
@@ -604,7 +605,7 @@ def main():
         "--allow-n1", action="store_true", default=False,
         help=(
             "Allow n<2 per group: fall back to Fisher exact on pooled reads. "
-            "Default is to refuse — between-replicate variance is ignored "
+            "Default is to refuse -- between-replicate variance is ignored "
             "and p-values are anti-conservative under this fallback."
         ),
     )
@@ -671,7 +672,7 @@ def main():
         "--allow-n1", action="store_true", default=False,
         help=(
             "(tile only) Allow n<2 per group: fall back to Fisher exact on "
-            "pooled reads. Default is to refuse — between-replicate variance "
+            "pooled reads. Default is to refuse -- between-replicate variance "
             "is ignored and p-values are anti-conservative."
         ),
     )
@@ -727,7 +728,7 @@ def main():
         help="Gaussian-kernel methylation beta smoothing (approximates BSmooth)",
         description=(
             "Gaussian-kernel methylation beta smoothing. Approximates BSmooth "
-            "via scipy.ndimage.gaussian_filter1d on a regular grid — not a "
+            "via scipy.ndimage.gaussian_filter1d on a regular grid -- not a "
             "true local LOESS. ~500x faster than statsmodels LOESS."
         ),
     )
@@ -777,8 +778,8 @@ def main():
     p_exp = sub.add_parser("export", help="Export to BedGraph / BigWig / BED")
     exp_sub = p_exp.add_subparsers(dest="export_cmd", required=True)
     for name, help_text in (
-        ("bedgraph", "Per-sample β / coverage → BedGraph"),
-        ("bigwig", "Per-sample β / coverage → BigWig (pyBigWig)"),
+        ("bedgraph", "Per-sample beta / coverage -> BedGraph"),
+        ("bigwig", "Per-sample beta / coverage -> BigWig (pyBigWig)"),
     ):
         sp = exp_sub.add_parser(name, help=help_text)
         sp.add_argument("--md", required=True)
@@ -787,14 +788,14 @@ def main():
         sp.add_argument("--value", default="beta",
                         choices=["beta", "coverage", "N_meth"])
         sp.set_defaults(func=_cmd_export)
-    sp_d = exp_sub.add_parser("dmcs-bed", help="DMCs → 6-column BED")
+    sp_d = exp_sub.add_parser("dmcs-bed", help="DMCs -> 6-column BED")
     sp_d.add_argument("--md", required=True)
     sp_d.add_argument("--output", required=True)
     sp_d.add_argument("--alpha", type=float, default=0.05)
     sp_d.add_argument("--min-abs-diff", dest="min_abs_diff", type=float, default=0.0)
     sp_d.add_argument("--test", default=None)
     sp_d.set_defaults(func=_cmd_export)
-    sp_r = exp_sub.add_parser("dmrs-bed", help="DMRs → 6-column BED")
+    sp_r = exp_sub.add_parser("dmrs-bed", help="DMRs -> 6-column BED")
     sp_r.add_argument("--md", required=True)
     sp_r.add_argument("--output", required=True)
     sp_r.set_defaults(func=_cmd_export)

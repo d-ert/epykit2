@@ -17,7 +17,7 @@ def test_to_bedgraph(synth_md_filtered, tmp_path):
     lines = out.read_text(encoding="utf-8").splitlines()
     # First line is the track header
     assert lines[0].startswith("track type=bedGraph")
-    # Subsequent lines: 4 fields, β in [0, 1]
+    # Subsequent lines: 4 fields, beta in [0, 1]
     data = [ln.split("\t") for ln in lines[1:] if ln.strip()]
     assert len(data) > 0
     for chrom, start, end, val in data[:200]:
@@ -73,7 +73,7 @@ def test_dmrs_to_bed(synth_md_filtered, tmp_path):
     # expect a non-trivial DMR table; if this is empty something upstream
     # regressed (covered by test_accuracy.test_dmr_tile_recovers_seeded_regions).
     assert dmr_df is not None and len(dmr_df) > 0, (
-        "tile DMR returned 0 rows even with min_mean_qvalue=1.0 — "
+        "tile DMR returned 0 rows even with min_mean_qvalue=1.0 -- "
         "BED export test cannot run; investigate the DMR engine."
     )
     synth_md_filtered.dmrs_to_bed(str(out))

@@ -3,7 +3,7 @@
 For each heterozygous SNV in a per-individual VCF, partition the
 overlapping reads by their base at the SNV position into haplotype 1 /
 haplotype 2, then project each read's methylation calls onto every CpG
-it covers. Per CpG, build a 2 × 2 (h1_meth, h1_unmeth, h2_meth,
+it covers. Per CpG, build a 2 x 2 (h1_meth, h1_unmeth, h2_meth,
 h2_unmeth) contingency table and test allele-specific methylation
 with Fisher's exact test.
 
@@ -17,7 +17,7 @@ modification.
 
 Inputs
 ------
-* ``bam``: ``{sample_id → bam_path}``. BAMs must be coordinate-sorted
+* ``bam``: ``{sample_id -> bam_path}``. BAMs must be coordinate-sorted
   and indexed; reads need either Bismark ``XM`` tags or
   MethylDackel ``MM/ML`` tags.
 * ``vcf``: path to a per-individual VCF (bgzipped + tabix-indexed
@@ -93,7 +93,7 @@ def call_asm(
                 continue
 
         logger.info(
-            "[ASM] %s: %d reads × CpG rows; phasing via VCF", sample_id, meth_df.height,
+            "[ASM] %s: %d reads x CpG rows; phasing via VCF", sample_id, meth_df.height,
         )
         df = _call_asm_one_sample(
             pysam, meth_df, str(vcf_p), bam_path,
@@ -125,10 +125,10 @@ def _call_asm_one_sample(
     min_phased_snvs: int,
     min_mapq: int,
 ) -> pl.DataFrame:
-    """Per-sample ASM: phase reads via het SNVs, build 2×2 tables per CpG."""
-    # ---- 1. Map each read_id → haplotype via het SNVs in the VCF ----
-    read_haplotype: dict[str, int] = {}        # read_id → 1 or 2
-    read_phased_snv_count: dict[str, int] = {} # read_id → # of confirming SNVs
+    """Per-sample ASM: phase reads via het SNVs, build 2x2 tables per CpG."""
+    # ---- 1. Map each read_id -> haplotype via het SNVs in the VCF ----
+    read_haplotype: dict[str, int] = {}        # read_id -> 1 or 2
+    read_phased_snv_count: dict[str, int] = {} # read_id -> # of confirming SNVs
 
     with pysam.VariantFile(vcf_path) as vcf, pysam.AlignmentFile(str(bam_path), "rb") as bam:
         for rec in vcf:
@@ -156,7 +156,7 @@ def _call_asm_one_sample(
                     continue
                 # Find the base in this read at the SNV position.
                 aligned = dict(read.get_aligned_pairs(matches_only=True))
-                # Reverse lookup: ref_pos → query_idx.
+                # Reverse lookup: ref_pos -> query_idx.
                 qry = None
                 for q, r in aligned.items():
                     if r == pos:

@@ -2,10 +2,10 @@
 
 Functions
 ---------
-* ``to_bedgraph``  : single-sample β (or coverage) → BedGraph (chrom start end value).
+* ``to_bedgraph``  : single-sample beta (or coverage) -> BedGraph (chrom start end value).
 * ``to_bigwig``    : same, BigWig via pyBigWig (optional dep).
-* ``dmcs_to_bed``  : DMC table → BED, optionally filtered by α / |Δβ|.
-* ``dmrs_to_bed``  : DMR table → BED.
+* ``dmcs_to_bed``  : DMC table -> BED, optionally filtered by alpha / |Deltabeta|.
+* ``dmrs_to_bed``  : DMR table -> BED.
 
 All BedGraph / BED writers work with no extra dependencies. ``to_bigwig``
 imports ``pyBigWig`` lazily and raises a friendly error if missing
@@ -69,7 +69,7 @@ def to_bedgraph(
     *,
     value: str = "beta",
 ) -> str:
-    """Write a single sample's β (or coverage) as a 4-column BedGraph.
+    """Write a single sample's beta (or coverage) as a 4-column BedGraph.
 
     Output rows: ``chrom\\tstart\\tend\\tvalue`` (1 bp interval per CpG;
     end = start + 1). 0-based half-open, matching the methylstore.
@@ -83,7 +83,7 @@ def to_bedgraph(
         Output file path. Suffix ``.bedgraph`` / ``.bg`` is conventional
         but not enforced.
     value : {"beta", "coverage", "N_meth"}
-        Column to emit. β is in [0, 1].
+        Column to emit. beta is in [0, 1].
 
     Returns
     -------
@@ -133,9 +133,9 @@ def to_bigwig(
     value: str = "beta",
     chrom_sizes: dict[str, int] | None = None,
 ) -> str:
-    """Write a single sample's β (or coverage) as a BigWig.
+    """Write a single sample's beta (or coverage) as a BigWig.
 
-    Requires ``pyBigWig`` — install with ``pip install 'epykit[export]'``.
+    Requires ``pyBigWig`` -- install with ``pip install 'epykit[export]'``.
     There is no Windows wheel on PyPI at the time of writing; use
     :func:`to_bedgraph` instead on Windows.
 
@@ -154,7 +154,7 @@ def to_bigwig(
         raise ImportError(
             "pyBigWig is required for BigWig export. "
             "Install it with: pip install 'epykit[export]'  "
-            "(no Windows wheel — use to_bedgraph instead on Windows)."
+            "(no Windows wheel -- use to_bedgraph instead on Windows)."
         ) from exc
 
     df = _load_sample_beta(md, sample, value)

@@ -1,4 +1,4 @@
-"""MuData export — multi-omics interop adapter .
+"""MuData export -- multi-omics interop adapter .
 
 Builds on the existing AnnData export and packages it as a MuData with
 the methylation modality keyed ``"meth"``. Optional ``other_modalities``

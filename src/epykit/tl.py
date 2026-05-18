@@ -1,9 +1,10 @@
 """High-level orchestrators for the standard WGBS analysis flow.
 
-Public entry points: ``qc``, ``dmc``, ``dmr``, ``annotate``. Each mutates a
-``MethylData`` in place — results land in ``md.obs`` / ``md.varm`` /
-``md.uns``. See the module docstrings of ``dmc.py`` and ``dmr.py`` for the
-underlying engines.
+Public entry points: ``qc``, ``dmc``, ``dmr``, ``annotate``,
+``diagnose_dmr_calling``. Each mutates a ``MethylData`` in place (except
+``diagnose_dmr_calling`` which returns a dict) -- results land in
+``md.obs`` / ``md.varm`` / ``md.uns``. See the module docstrings of
+``dmc.py`` and ``dmr.py`` for the underlying engines.
 """
 
 from __future__ import annotations
@@ -17,7 +18,13 @@ from .dmc import (
     empirical_fdr_for_dmc,
     process_chromosomes_dmc,
 )
-from .dmr import call_dmr_sliding_window, call_dmr_tile_based, empirical_fdr_for_dmr
+from .dmr import (
+    DMR_PRESETS,
+    call_dmr_chain_merge,
+    call_dmr_sliding_window,
+    call_dmr_tile_based,
+    empirical_fdr_for_dmr,
+)
 from .methyldata import MethylData
 from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
 
@@ -45,7 +52,7 @@ def _auto_test(
 
 # One-shot warning gate: ``tl.dmc`` emits a UserWarning the first time a
 # user explicitly selects ``test="fisher"`` in a session. We don't want to
-# spam them across thousands of chromosomes/sites — once is enough.
+# spam them across thousands of chromosomes/sites -- once is enough.
 _FISHER_WARNED = False
 
 
@@ -97,7 +104,7 @@ def _resolve_min_samples_aliases(
     """Accept the deprecated ``min_samples_case`` kwarg with a DeprecationWarning.
 
     Returns the resolved canonical value. Either both None (use default), one
-    set, or — illegally — both set (TypeError).
+    set, or -- illegally -- both set (TypeError).
     """
     import warnings
     if min_samples_case is not None:
@@ -118,9 +125,9 @@ def _resolve_min_samples_aliases(
 def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
     """Pick a sensible test based on group size.
 
-    Current default at n>=2: ``"lr"`` — the quasi-binomial likelihood-ratio
+    Current default at n>=2: ``"lr"`` -- the quasi-binomial likelihood-ratio
     chi-square with per-site McCullagh-Nelder dispersion. Closed-form on
-    the streaming (S0_g, S1_g, Σm²/n_g) accumulators we already keep for
+    the streaming (S0_g, S1_g, Sigmam^2/n_g) accumulators we already keep for
     the score test. LR is closer to nominal type-I error than the score
     test at the small samples (n=6) and boundary proportions typical in
     WGBS.
@@ -134,7 +141,7 @@ def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
     boundaries) statistic on the same accumulators.
 
     At n=1 (single replicate per group) there is no between-replicate
-    variability for φ̂ to estimate. By default this is treated as a hard error
+    variability for phi to estimate. By default this is treated as a hard error
     (statistical inference is not credible). Pass ``allow_n1=True`` to opt
     into the Fisher exact fallback (anti-conservative; warns at runtime).
     """
@@ -248,7 +255,7 @@ def qc(
         corr_df = _samp_corr(md.store, samples, method=correlation_method)
         md.uns["qc_sample_correlation"] = corr_df
         if len(corr_df) > 0:
-            # Per-sample min off-diagonal correlation (low → likely swap).
+            # Per-sample min off-diagonal correlation (low -> likely swap).
             off_diag = corr_df.filter(pl.col("sample_a") != pl.col("sample_b"))
             min_corr = (
                 off_diag.group_by("sample_a")
@@ -288,6 +295,8 @@ def dmc(
     glm_backend: str = "cpu",
     resumable: bool = False,
     use_smoothed: bool = False,
+    smoothing: bool = False,
+    smoothing_span_bp: int = 500,
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -308,11 +317,11 @@ def dmc(
        This is **not** equivalent to DSS's ``DMLfit.multiFactor(smoothing=TRUE)``.
        DSS uses BSmooth-smoothed estimates only in the per-CpG **dispersion**
        step; the per-CpG GLM still fits raw counts. The pseudo-count
-       approach here is more aggressive — it replaces the count signal
+       approach here is more aggressive -- it replaces the count signal
        entirely with the locally-averaged version, which can wash out
        genuine per-CpG signal at default BSmooth parameters (ns=70,
        h_bp=1000). For replicating DSS-style analyses, prefer
-       ``use_smoothed=False`` (the default) with ``test="lr"`` — the
+       ``use_smoothed=False`` (the default) with ``test="lr"`` -- the
        quasi-binomial LR with McCullagh-Nelder dispersion is the closest
        per-CpG match to DSS's count model in epykit. Reach for
        ``use_smoothed=True`` only when you genuinely want a strongly
@@ -322,7 +331,7 @@ def dmc(
     Backend selection
     -----------------
     ``backend="sequential"`` (default) walks chromosomes one at a time on
-    the calling process — bit-identical to the pre-0.4 behaviour.
+    the calling process -- bit-identical to the pre-0.4 behaviour.
     ``backend="dask"`` and ``backend="ray"`` submit one task per
     chromosome to a worker pool; both require the corresponding optional
     extra (``pip install 'epykit[distributed]'`` for Dask, ``epykit[ray]``
@@ -332,7 +341,7 @@ def dmc(
     ``glm_backend="cpu"`` (default) runs the batched IRLS used by
     ``test="glm"`` / formula contrasts on the CPU via numpy. Setting
     ``glm_backend="gpu"`` routes the IRLS through CuPy (requires
-    ``pip install 'epykit[gpu]'``) — only affects the GLM hot path; the
+    ``pip install 'epykit[gpu]'``) -- only affects the GLM hot path; the
     closed-form ``lr`` / ``score`` tests stay CPU-only.
 
     ``resumable=True`` (default False) participates in the 0.4.0
@@ -343,7 +352,7 @@ def dmc(
     treatment / control sample lists, ``test``, ``formula``,
     ``contrast``, ``covariates``, ``min_samples_*``, ``dispersion``,
     ``reference``. Set False (the default) to preserve pre-0.4
-    behaviour — no manifest read, no skip, no sidecar write.
+    behaviour -- no manifest read, no skip, no sidecar write.
 
     Parameters
     ----------
@@ -352,7 +361,7 @@ def dmc(
         treatment/control sample lists.
     test : str
         One of ``"auto"``, ``"lr"``, ``"score"``, ``"logit_t"``,
-        ``"welch_t"`` (formerly ``"beta_binomial"`` — deprecated alias),
+        ``"welch_t"`` (formerly ``"beta_binomial"`` -- deprecated alias),
         ``"bb_lr"`` (true quasi-binomial LRT), ``"cmh"``, ``"fisher"``,
         ``"glm"``. ``"auto"`` resolves to ``"fisher"`` at n<2 and ``"lr"``
         (the recommended default) at n>=2.
@@ -368,10 +377,10 @@ def dmc(
     contrast : str or np.ndarray, optional
         Contrast specification. Accepts:
         - a column name in the resolved design (``"age"`` for a continuous
-          covariate primary effect; produces a single-coef Wald-z² test
+          covariate primary effect; produces a single-coef Wald-z^2 test
           with meth-scale CIs);
         - a factor name (``"group"``); every dummy of that factor is
-          included → joint F-test (multi-group);
+          included -> joint F-test (multi-group);
         - a patsy linear-combination string
           (``"group[T.KO] - group[T.WT]"``); produces a single-row contrast;
         - a raw ``(k, p)`` matrix.
@@ -384,7 +393,7 @@ def dmc(
         without it.
     dispersion : {"site", "chrom", "shrink"}
         McCullagh-Nelder dispersion strategy used by the ``"lr"`` and
-        ``"score"`` tests. Default ``"site"`` estimates a per-site φ̂_i
+        ``"score"`` tests. Default ``"site"`` estimates a per-site phi_i
         from the 4-df Pearson residual sum. See :func:`_score_finalize`
         in ``dmc.py`` for the alternatives.
     chromosomes : list[str], optional
@@ -503,6 +512,19 @@ def dmc(
     import tempfile as _tempfile
     from pathlib import Path as _Path
     if use_smoothed:
+        import warnings as _warnings
+        _warnings.warn(
+            "use_smoothed=True (pseudo-count transform of raw reads via "
+            "BSmooth) is NOT equivalent to DSS's smoothing=TRUE -- it's "
+            "too aggressive (washes out per-CpG signal at default BSmooth "
+            "parameters). For DSS-style behavior, use smoothing=True "
+            "(applies DSS's uniform-box +/-smoothing_span_bp//2 moving "
+            "average to each sample's raw counts before they hit the "
+            "test, matching DMLfit.multiFactor(smoothing=TRUE)). The "
+            "use_smoothed pseudo-count path will be removed in a future "
+            "minor release.",
+            DeprecationWarning, stacklevel=2,
+        )
         if "smooth_path" not in md.uns:
             raise ValueError(
                 "use_smoothed=True requires ep.pp.smooth(md) first "
@@ -545,13 +567,15 @@ def dmc(
             n_workers=n_workers,
             glm_backend=glm_backend,
             return_store=True,
+            smoothing=smoothing,
+            smoothing_span_bp=smoothing_span_bp,
         )
         dmc_store = apply_multiple_testing_correction(dmc_store, method="fdr_bh")
 
         # Materialise the full DataFrame for md.varm back-compat
         # (plot.py / report.py / pl modules consume md.dmc as a
         # DataFrame). With chrom/strand stored as pl.Enum this is
-        # roughly 700 MB at 22M rows vs. ~2 GB before — manageable
+        # roughly 700 MB at 22M rows vs. ~2 GB before -- manageable
         # alongside the per-chrom DMR working set.
         result = dmc_store.to_dataframe()
 
@@ -604,6 +628,12 @@ def dmc(
         "smooth_method": (
             md.uns.get("smooth_params", {}).get("method") if use_smoothed else None
         ),
+        # DSS-style count smoothing (DMLfit.multiFactor(smoothing=TRUE)
+        # analogue). Surface params for both modes so the metadata
+        # round-trips through save / report consistently; the span is
+        # only meaningful when smoothing == True.
+        "smoothing": bool(smoothing),
+        "smoothing_span_bp": int(smoothing_span_bp) if smoothing else None,
         # Path to the persistent per-chrom DMC store. Lets downstream
         # tools (esp. tl.dmr(method='sliding_window')) stream
         # chromosomes from disk instead of holding the materialised
@@ -675,7 +705,7 @@ def _run_dmc_contrast(
         raise ValueError("md.obs is empty; cannot build a design matrix.")
     samples_all = md.obs.get_column("sample_id").to_list()
 
-    # Build design — without requiring a treatment column if we have a
+    # Build design -- without requiring a treatment column if we have a
     # formula that doesn't reference one. The user's `treatment_col`
     # default ("treatment") is *only* required when the existing binary
     # path would have used it; here we let the formula speak.
@@ -781,6 +811,8 @@ def _run_dmc_contrast(
 def dmr(
     md: MethylData,
     method: str = "tile",
+    # Parameter preset bundle (chain_merge only; see DMR_PRESETS) ----------
+    preset: str | None = None,
     # Tile-method options ---------------------------------------------------
     tile_size_bp: int = 1000,
     min_cpgs_per_tile: int = 5,
@@ -799,6 +831,11 @@ def dmr(
     step_bp: int = 250,
     min_cpgs: int = 5,
     min_sites_significant: int = 3,
+    # Chain-merge options (DSS callDMR semantics) --------------------------
+    dis_merge_bp: int = 100,
+    pct_sig: float = 0.5,
+    minlen_bp: int = 50,
+    use_q_for_sig: bool = False,
     # Shared filters --------------------------------------------------------
     alpha: float = 0.05,
     min_abs_meth_diff: float = 0.1,
@@ -828,12 +865,12 @@ def dmr(
 
     Two methods are supported:
 
-    * ``method="tile"`` (default, recommended) — aggregates read counts
+    * ``method="tile"`` (default, recommended) -- aggregates read counts
       within fixed tiles and runs a single test per tile. Requires direct
       access to ``md.store`` and the per-sample methylstore; does not
       need a prior DMC table. The right path for whole-genome WGBS
       analyses.
-    * ``method="sliding_window"`` — the legacy in-tree method: takes the
+    * ``method="sliding_window"`` -- the legacy in-tree method: takes the
       DMC result on ``md`` and combines per-CpG p-values within overlapping
       windows with signed Stouffer's Z. Faster (no extra I/O) but
       substantially lower-power than tile-based aggregation at typical
@@ -841,8 +878,25 @@ def dmr(
 
     Parameters
     ----------
-    method : {"tile", "sliding_window"}
+    method : {"tile", "sliding_window", "hmm", "chain_merge"}
         Which DMR algorithm to run.
+    preset : {"strict", "default", "permissive"}, optional
+        Parameter preset bundle for ``method="chain_merge"``. Applies
+        ``(alpha, min_abs_meth_diff, dis_merge_bp, min_cpgs, pct_sig,
+        minlen_bp)`` from :data:`epykit.tl.DMR_PRESETS` for the chosen
+        bundle. Any explicit kwarg passed alongside ``preset`` overrides
+        the bundled value. Ignored for other methods.
+
+        Preset summary:
+
+        * ``"strict"`` -- validation-ready DMRs only (alpha=1e-6,
+          min_cpgs=5, min_abs_meth_diff=0.20). DSS-strict alpha.
+        * ``"default"`` -- balanced (alpha=1e-4, min_abs_meth_diff=0.10).
+          One order looser on alpha than DSS to capture real-but-moderate
+          signal; keeps the 10% per-CpG effect-size floor. Recommended
+          starting point for general WGBS analyses.
+        * ``"permissive"`` -- recall-oriented (alpha=1e-4,
+          dis_merge_bp=200, min_abs_meth_diff=0.05). Expect lower PPV.
     tile_size_bp, min_cpgs_per_tile : int
         Tile-method options. Default ``tile_size_bp=1000``.
     test : str
@@ -996,7 +1050,7 @@ def dmr(
 
     if method == "sliding_window":
         # Prefer streaming from the persistent DMC store when ep.tl.dmc
-        # has staged one — keeps DMR peak memory at O(largest chrom)
+        # has staged one -- keeps DMR peak memory at O(largest chrom)
         # instead of holding the full 22M-row DataFrame plus a per-chrom
         # working set in memory at the same time.
         dmc_store_path = md.uns.get("dmc", {}).get("store_path")
@@ -1069,9 +1123,278 @@ def dmr(
         }
         return
 
+    if method == "chain_merge":
+        # DSS::callDMR semantics -- chain contiguous sig CpGs whose gap is
+        # <= dis_merge_bp, then filter by minlen_bp / min_cpgs / pct_sig.
+        # Reuses the same DMC store as sliding_window when available so a
+        # 22M-CpG run stays streaming-friendly.
+        dmc_store_path = md.uns.get("dmc", {}).get("store_path")
+        dmc_input: object
+        if dmc_store_path:
+            from ._dmc_store import DMCStore
+            from pathlib import Path as _Path
+            store_path = _Path(dmc_store_path)
+            if (store_path / ".epykit_dmc_manifest.json").exists():
+                dmc_input = DMCStore.open(store_path)
+            else:
+                dmc_input = md.dmc
+        else:
+            dmc_input = md.dmc
+
+        if dmc_input is None:
+            raise ValueError(
+                "method='chain_merge' needs a DMC table on md. "
+                "Run ep.tl.dmc(md) first."
+            )
+
+        dmr_df = call_dmr_chain_merge(
+            dmc_input,
+            preset=preset,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+            dis_merge_bp=dis_merge_bp,
+            min_cpgs=min_cpgs,
+            pct_sig=pct_sig,
+            minlen_bp=minlen_bp,
+            use_q_for_sig=use_q_for_sig,
+        )
+
+        # Same post-hoc q-value filter as the sliding-window path: drop
+        # candidate DMRs whose BH-corrected combined q-value isn't sig.
+        if len(dmr_df) > 0 and min_mean_qvalue is not None:
+            q_col = "combined_qvalue" if "combined_qvalue" in dmr_df.columns else "combined_pvalue"
+            dmr_df = dmr_df.filter(pl.col(q_col) < min_mean_qvalue)
+
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "chain_merge",
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "dis_merge_bp": dis_merge_bp,
+            "min_cpgs": min_cpgs,
+            "pct_sig": pct_sig,
+            "minlen_bp": minlen_bp,
+            "use_q_for_sig": use_q_for_sig,
+            "min_mean_qvalue": min_mean_qvalue,
+        }
+        return
+
     raise ValueError(
-        f"Unknown DMR method '{method}'. Expected 'tile', 'sliding_window', or 'hmm'."
+        f"Unknown DMR method '{method}'. Expected 'tile', 'sliding_window', "
+        f"'hmm', or 'chain_merge'."
     )
+
+
+def diagnose_dmr_calling(
+    md: MethylData,
+    reference_dmrs: pl.DataFrame,
+    *,
+    dmc_key: str | None = None,
+    chromosomes: list[str] | None = None,
+    alpha_threshold: float = 1e-5,
+) -> dict:
+    """Classify reference DMRs by recovery status to debug missing-DMR causes.
+
+    Given a reference DMR set (e.g. from a published paper or another
+    pipeline), bucket each reference DMR by *why* epykit's current DMC +
+    DMR-calling produced (or didn't produce) an overlapping DMR. Lets
+    you diagnose a low recall number into actionable categories instead
+    of guessing which parameter to tune.
+
+    Five buckets:
+
+    * ``SUCCESS_OVERLAP`` -- our DMR set already contains a region that
+      overlaps this reference DMR. Nothing to fix.
+    * ``H1_NO_CPGS`` -- 0 of our united CpGs fall inside the reference
+      coordinates. The coverage filter or unite step dropped them;
+      relax ``min_coverage`` or use ``type="union"`` for ``pp.unite``.
+    * ``H2_NO_SIG_CPGS`` -- at least one CpG present but none reach
+      ``q < 0.05``. The DMC test statistic is too conservative for this
+      region. The only fix is a more powerful test (e.g. a spatial-
+      covariance Wald test); no DMR-caller tuning can recover this.
+    * ``H3a_WEAK_ALPHA`` -- has sig CpGs at ``q < 0.05`` but none reach
+      ``alpha_threshold`` (default 1e-5, matching DSS callDMR). Recover
+      by loosening ``alpha`` in :func:`ep.tl.dmr` (e.g. to 1e-4 or
+      1e-3, ideally via ``preset="permissive"``).
+    * ``H3b_STRUCTURE`` -- CpGs at ``q < alpha_threshold`` exist in the
+      region but no DMR was called. Chain-merge dropped the candidate
+      on a structural filter: ``min_cpgs``, ``pct_sig``, ``minlen_bp``,
+      or ``dis_merge_bp``. Loosen ``dis_merge_bp`` first (highest
+      Pareto leverage), then ``min_cpgs``.
+
+    Parameters
+    ----------
+    md : MethylData
+        Must have a DMC table populated (``ep.tl.dmc`` already run) and
+        ``md.uns['dmr']`` populated (``ep.tl.dmr`` already run).
+    reference_dmrs : polars DataFrame
+        Reference DMR set with at least ``chrom``, ``start``, ``end``
+        columns. Coordinates assumed 0-based half-open (BED convention).
+    dmc_key : str, optional
+        Specific key in ``md.varm`` to use as the DMC table. Defaults to
+        ``md.uns['dmc']['last_key']``.
+    chromosomes : list of str, optional
+        Restrict analysis to these chromosomes (e.g. main chroms only,
+        skipping ``_random`` / alt contigs). Defaults to all chromosomes
+        present in both the reference and the DMC table.
+    alpha_threshold : float, default 1e-5
+        The per-CpG significance cutoff that was used in chain-merge.
+        Determines the H3a vs H3b boundary. Pass the same value you used
+        in ``ep.tl.dmr(alpha=...)`` so the diagnosis matches your run.
+
+    Returns
+    -------
+    dict with keys:
+
+    * ``"counts"`` (dict[str, int]) -- count per bucket
+    * ``"bucket_indices"`` (dict[str, list[int]]) -- 0-based row indices
+      into ``reference_dmrs`` for each bucket
+    * ``"n_reference"`` (int) -- total reference DMRs analyzed
+    * ``"summary"`` (str) -- multi-line human-readable summary
+    * ``"alpha_threshold"`` (float) -- the threshold used
+    """
+    import numpy as np
+    from collections import defaultdict
+
+    # ---- Resolve inputs ----
+    if dmc_key is None:
+        dmc_key = md.uns.get("dmc", {}).get("last_key")
+    if dmc_key is None or dmc_key not in md.varm:
+        raise ValueError(
+            "No DMC table found on md. Run ep.tl.dmc(md, ...) first, or pass "
+            "dmc_key= explicitly."
+        )
+    dmc = md.varm[dmc_key]
+
+    if "dmr" not in md.uns:
+        raise ValueError(
+            "No DMR table found at md.uns['dmr']. Run ep.tl.dmr(md, ...) "
+            "first so the diagnostic knows which reference DMRs we recovered."
+        )
+    ours_dmr = md.uns["dmr"]
+
+    # Normalize reference column types
+    ref = reference_dmrs.with_columns([
+        pl.col("chrom").cast(pl.Utf8),
+        pl.col("start").cast(pl.Int64),
+        pl.col("end").cast(pl.Int64),
+    ])
+
+    # Optional chromosome filter
+    if chromosomes is not None:
+        chrom_set = set(chromosomes)
+        ref = ref.filter(pl.col("chrom").is_in(chrom_set))
+
+    # Pick the q-value column on the DMC table (prefer qvalue over pvalue)
+    qcol = "qvalue" if "qvalue" in dmc.columns else (
+        "pvalue" if "pvalue" in dmc.columns else None
+    )
+    if qcol is None:
+        raise ValueError(
+            f"DMC table at varm[{dmc_key!r}] has neither 'qvalue' nor "
+            f"'pvalue' columns; cannot diagnose."
+        )
+    pos_col = "pos" if "pos" in dmc.columns else "start"
+
+    # ---- Build indexed lookups ----
+    # Our DMRs: chrom -> sorted [(start, end), ...]
+    ours_by_chr: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for r in ours_dmr.iter_rows(named=True):
+        ours_by_chr[str(r["chrom"])].append((int(r["start"]), int(r["end"])))
+    for c in ours_by_chr:
+        ours_by_chr[c].sort()
+
+    def _has_overlap(intervals, s, e):
+        # Linear scan is fine for typical DMR-set sizes; bisect would help
+        # only with 100k+ DMRs which is unusual.
+        for ps, pe in intervals:
+            if pe < s: continue
+            if ps > e: break
+            return True
+        return False
+
+    # DMC table: per-chrom (sorted positions array, q-values array). We
+    # convert to numpy for searchsorted speed; the cost is O(n_cpgs) per
+    # chromosome but only paid once across all reference DMRs.
+    dmc_pd = dmc.to_pandas()
+    dmc_pd["chrom"] = dmc_pd["chrom"].astype(str)
+    dmc_by_chr: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, g in dmc_pd.groupby("chrom"):
+        if chromosomes is not None and chrom not in chrom_set:
+            continue
+        g = g.sort_values(pos_col)
+        dmc_by_chr[chrom] = (
+            g[pos_col].to_numpy(dtype=np.int64),
+            g[qcol].to_numpy(dtype=np.float64),
+        )
+
+    # ---- Classify ----
+    buckets: dict[str, list[int]] = {
+        "SUCCESS_OVERLAP": [], "H1_NO_CPGS": [], "H2_NO_SIG_CPGS": [],
+        "H3a_WEAK_ALPHA": [], "H3b_STRUCTURE": [],
+    }
+
+    for idx, r in enumerate(ref.iter_rows(named=True)):
+        chrom = str(r["chrom"])
+        rs, re_ = int(r["start"]), int(r["end"])
+
+        # Bucket 0: already recovered?
+        if _has_overlap(ours_by_chr.get(chrom, []), rs, re_):
+            buckets["SUCCESS_OVERLAP"].append(idx)
+            continue
+
+        # Bucket H1: no CpGs in the region
+        entry = dmc_by_chr.get(chrom)
+        if entry is None:
+            buckets["H1_NO_CPGS"].append(idx)
+            continue
+        pos_arr, q_arr = entry
+        lo = int(np.searchsorted(pos_arr, rs, side="left"))
+        hi = int(np.searchsorted(pos_arr, re_, side="right"))
+        if lo == hi:
+            buckets["H1_NO_CPGS"].append(idx)
+            continue
+
+        region_q = q_arr[lo:hi]
+        min_q = float(np.nanmin(region_q))
+
+        if min_q >= 0.05:
+            buckets["H2_NO_SIG_CPGS"].append(idx)
+        elif min_q >= alpha_threshold:
+            buckets["H3a_WEAK_ALPHA"].append(idx)
+        else:
+            buckets["H3b_STRUCTURE"].append(idx)
+
+    # ---- Assemble result ----
+    counts = {k: len(v) for k, v in buckets.items()}
+    n_ref = sum(counts.values())
+
+    # Build a human-readable summary
+    lines = [
+        f"DMR-calling diagnostic on {n_ref} reference DMRs:",
+        f"  alpha_threshold = {alpha_threshold:.0e}  (matches chain-merge alpha)",
+        "",
+    ]
+    bucket_help = {
+        "SUCCESS_OVERLAP":  "already recovered (no fix needed)",
+        "H1_NO_CPGS":       "no CpGs present  -> coverage/unite issue",
+        "H2_NO_SIG_CPGS":   "no sig CpGs at q<0.05  -> need better test stat (e.g. Wald-smoothed)",
+        "H3a_WEAK_ALPHA":   f"sig CpGs at q<0.05 but not q<{alpha_threshold:.0e}  -> loosen alpha (preset='permissive')",
+        "H3b_STRUCTURE":    "sig CpGs exist but chain-merge dropped  -> loosen dis_merge_bp first",
+    }
+    for name in ("SUCCESS_OVERLAP", "H1_NO_CPGS", "H2_NO_SIG_CPGS",
+                 "H3a_WEAK_ALPHA", "H3b_STRUCTURE"):
+        n = counts[name]
+        pct = n / max(n_ref, 1)
+        lines.append(f"  {name:<18} {n:>5} ({pct:>5.1%})  -- {bucket_help[name]}")
+
+    return {
+        "counts": counts,
+        "bucket_indices": buckets,
+        "n_reference": n_ref,
+        "summary": "\n".join(lines),
+        "alpha_threshold": alpha_threshold,
+    }
 
 
 def dvc(
@@ -1087,7 +1410,7 @@ def dvc(
     """Differential-Variability CpG calling (iEVORA-style).
 
     Identifies CpGs whose between-replicate variance differs significantly
-    between the treatment and control groups *while* the means do not —
+    between the treatment and control groups *while* the means do not --
     the signature of an outlier-driven shift in variability that purely
     mean-based DMC analysis misses (cancer / aging methylomes).
 
@@ -1099,14 +1422,14 @@ def dvc(
     Parameters
     ----------
     test : {"bartlett"}
-        Variance-equality test. Only ``"bartlett"`` is supported — its
+        Variance-equality test. Only ``"bartlett"`` is supported -- its
         closed-form expression fits the Welford streaming budget. Levene /
         Brown-Forsythe would need per-replicate centered deviations that
         the streaming accumulators don't keep.
     alpha : float
         q-value cutoff on the variance test for the ``is_dvc`` flag.
     mean_filter_alpha : float
-        Sites are flagged DVC only when ``p_mean > mean_filter_alpha`` —
+        Sites are flagged DVC only when ``p_mean > mean_filter_alpha`` --
         i.e. variance changes that aren't accompanied by mean changes.
     """
     from .dvc import process_chromosomes_dvc
@@ -1142,7 +1465,7 @@ def dvr(
     min_cpgs_per_tile: int = 5,
     alpha: float = 0.05,
 ) -> None:
-    """Differentially Variable Regions — density-based aggregation of DVC.
+    """Differentially Variable Regions -- density-based aggregation of DVC.
 
     Requires ``ep.tl.dvc(md)`` to have been run first; reads
     ``md.varm['dvc']`` and writes the region call to ``md.uns['dvr']``.
@@ -1254,6 +1577,10 @@ def annotate(
     promoter_upstream_bp: int = 2000,
     promoter_downstream_bp: int = 200,
     clear_gtf_cache: bool = True,
+    multi_annotation: bool = True,
+    *,
+    refgene: str | None = None,
+    gene_type_filter: str | list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Annotate DMC/DMR outputs.
 
@@ -1263,13 +1590,32 @@ def annotate(
 
     Parameters
     ----------
+    gtf, refgene : str or None
+        Annotation source. Provide exactly one of ``gtf`` (GENCODE / Ensembl
+        GTF) or ``refgene`` (UCSC ``refGene.txt(.gz)`` -- HOMER's default
+        catalog, gives the highest paper-gene recall for methylation work
+        because it's curated and protein-coding-biased).
+    gene_type_filter : str or list of str or None, keyword-only
+        Restrict the gene catalog before building overlap intervals and the
+        nearest-TSS index. Typical: ``"protein_coding"`` to drop lincRNAs /
+        pseudogenes / novel predictions. Works on both sources.
     clear_gtf_cache : bool, optional
         If True (default), clear the GTF cache and run garbage collection
         after annotation. Set to False if you plan to call annotate()
         multiple times to reuse the cached GTF.
+    multi_annotation : bool, optional
+        If True (default), populate annotatr-style columns on every
+        annotated table: ``nearest_tss_gene`` / ``nearest_tss_distance``
+        (HOMER's nearest-TSS rule), plus ``all_overlapping_genes`` /
+        ``all_overlapping_features`` (one-to-many). Set False to skip them
+        and keep only the legacy single-best gene-name columns. See
+        :func:`epykit.annotate.annotate_features` for details.
     """
-    if not gtf and not cpg_islands:
-        raise ValueError("Provide at least one of gtf or cpg_islands")
+    if gtf and refgene:
+        raise ValueError("Provide only one of gtf or refgene, not both")
+    feature_source_present = bool(gtf or refgene)
+    if not feature_source_present and not cpg_islands:
+        raise ValueError("Provide at least one of gtf / refgene / cpg_islands")
 
     for key, df in list(md.varm.items()):
         if not key.startswith("dmc"):
@@ -1285,12 +1631,21 @@ def annotate(
         if len(ann) == 0:
             continue
 
-        if gtf:
+        if feature_source_present:
+            # Pass through to the new annotate_features API. `gtf` and
+            # `refgene` are the wrapper-level convenience kwargs; under
+            # the hood there's one ``annotation`` argument with explicit
+            # source. We forward whichever the caller set.
+            annotation_path = gtf if gtf is not None else refgene
+            forwarded_source = "gtf" if gtf is not None else "refgene"
             ann = annotate_features(
                 ann,
-                annotation_gtf=gtf,
+                annotation_path,
+                source=forwarded_source,
                 promoter_upstream_bp=promoter_upstream_bp,
                 promoter_downstream_bp=promoter_downstream_bp,
+                multi_annotation=multi_annotation,
+                gene_type_filter=gene_type_filter,
             )
         if cpg_islands:
             ann = annotate_cpg_islands(ann, cpg_island_bed=cpg_islands)
@@ -1298,21 +1653,29 @@ def annotate(
         # Store as separate key so full DMC results are preserved
         md.varm[f"{key}_annotated"] = ann
 
-    if "dmr" in md.uns and isinstance(md.uns["dmr"], pl.DataFrame) and gtf:
+    if "dmr" in md.uns and isinstance(md.uns["dmr"], pl.DataFrame) and feature_source_present:
+        annotation_path = gtf if gtf is not None else refgene
+        forwarded_source = "gtf" if gtf is not None else "refgene"
         md.uns["dmr"] = annotate_features(
             md.uns["dmr"],
-            annotation_gtf=gtf,
+            annotation_path,
+            source=forwarded_source,
             promoter_upstream_bp=promoter_upstream_bp,
             promoter_downstream_bp=promoter_downstream_bp,
+            multi_annotation=multi_annotation,
+            gene_type_filter=gene_type_filter,
         )
 
     md.uns["annotation"] = {
         "gtf": gtf,
+        "refgene": refgene,
         "cpg_islands": cpg_islands,
         "significant_only": significant_only,
         "alpha": alpha,
         "promoter_upstream_bp": promoter_upstream_bp,
         "promoter_downstream_bp": promoter_downstream_bp,
+        "multi_annotation": multi_annotation,
+        "gene_type_filter": gene_type_filter,
     }
 
     # Clear GTF cache if requested (default: True)
@@ -1331,7 +1694,7 @@ def asm(
     chromosomes: list[str] | None = None,
     caller: str = "bismark",
 ) -> None:
-    """Allele-specific methylation (ASM) caller — 0.5.0.
+    """Allele-specific methylation (ASM) caller -- 0.5.0.
 
     See :func:`epykit.asm.call_asm` for the algorithm. Per-CpG ASM tests
     are stored at ``md.varm["asm"]`` with the same column names as the
@@ -1341,7 +1704,7 @@ def asm(
     Parameters
     ----------
     bam : mapping
-        ``{sample_id → bam_path}``. BAMs must be coordinate-sorted and
+        ``{sample_id -> bam_path}``. BAMs must be coordinate-sorted and
         indexed; per-base methylation calls come from Bismark ``XM``
         tags or MethylDackel ``MM/ML`` tags.
     vcf : str | Path
@@ -1365,7 +1728,7 @@ def entropy(
     chromosomes: list[str] | None = None,
     caller: str = "bismark",
 ) -> None:
-    """Methylation entropy caller — 0.5.0.
+    """Methylation entropy caller -- 0.5.0.
 
     See :func:`epykit.entropy.call_entropy` for the algorithm. Per-CpG-
     window Shannon entropy is stored at ``md.varm["entropy"]``.
@@ -1386,7 +1749,7 @@ def pmd(
     backend: str = "sequential",
     n_workers: int | None = None,
 ) -> None:
-    """Partially methylated domain (PMD) caller — 0.6.0.
+    """Partially methylated domain (PMD) caller -- 0.6.0.
 
     See :func:`epykit.pmd.call_pmd_one_sample` for the algorithm.
     Per-sample, megabase-scale 2-state HMM segmentation; results land
@@ -1409,10 +1772,10 @@ def hmr(
     backend: str = "sequential",
     n_workers: int | None = None,
 ) -> None:
-    """HMR / LMR caller (MethylSeekR-style) — 0.6.0.
+    """HMR / LMR caller (MethylSeekR-style) -- 0.6.0.
 
     See :func:`epykit.hmr.call_hmr_one_sample` for the algorithm.
-    Two-state HMM per sample over raw per-CpG β; results land in
+    Two-state HMM per sample over raw per-CpG beta; results land in
     ``md.uns["hmr"]`` and ``md.uns["lmr"]``.
     """
     from .hmr import hmr as _hmr

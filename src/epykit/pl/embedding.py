@@ -38,7 +38,7 @@ def umap(
     color : str, optional
         Name of an ``md.obs`` column to colour points by. Defaults to
         ``"group"`` when present, then ``"treatment"``.
-    ax, figsize, save : matplotlib plumbing — see :mod:`epykit.pl`.
+    ax, figsize, save : matplotlib plumbing -- see :mod:`epykit.pl`.
     """
     try:
         import umap as umap_lib  # type: ignore
