@@ -212,7 +212,10 @@ def _cmd_dmc(args: argparse.Namespace):
             f"min_samples_control={args.min_samples_control}"
         )
 
-    results = dmc.process_chromosomes_dmc(
+    # Stream through a DMCStore so BH never holds the full DataFrame in
+    # memory alongside its own pvalue/qvalue arrays. Materialise once
+    # at the end purely for the parquet write.
+    dmc_store = dmc.process_chromosomes_dmc(
         args.methylstore,
         treatment_samples,
         control_samples,
@@ -220,10 +223,13 @@ def _cmd_dmc(args: argparse.Namespace):
         unite=args.unite,
         min_samples_treatment=args.min_samples_treatment,
         min_samples_control=args.min_samples_control,
+        return_store=True,
     )
-    results = dmc.apply_multiple_testing_correction(results, method="fdr_bh")
+    dmc_store = dmc.apply_multiple_testing_correction(dmc_store, method="fdr_bh")
+    results = dmc_store.to_dataframe()
     results.write_parquet(args.output)
     print(f"DMC results written to {args.output}")
+    print(f"  DMC store at:      {dmc_store.path}")
     n_sig = int((results["qvalue"] < 0.05).sum()) if "qvalue" in results.columns else 0
     print(f"  Total sites tested: {len(results):,}")
     print(f"  Significant (q<0.05): {n_sig:,}")

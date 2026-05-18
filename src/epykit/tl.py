@@ -524,8 +524,13 @@ def dmc(
         _smoothed_tmp = None
         _dmc_store = md.store
 
+    dmc_store = None
     try:
-        result = process_chromosomes_dmc(
+        # Use return_store=True so the per-chrom parquet directory
+        # becomes the source of truth. Both BH correction and
+        # downstream DMR can then stream chromosomes from disk and
+        # avoid materialising the full 22M-row table in memory.
+        dmc_store = process_chromosomes_dmc(
             methylstore_path=_dmc_store,
             samples_treatment=md.treatment_ids,
             samples_control=md.control_ids,
@@ -539,8 +544,16 @@ def dmc(
             backend=backend,
             n_workers=n_workers,
             glm_backend=glm_backend,
+            return_store=True,
         )
-        result = apply_multiple_testing_correction(result, method="fdr_bh")
+        dmc_store = apply_multiple_testing_correction(dmc_store, method="fdr_bh")
+
+        # Materialise the full DataFrame for md.varm back-compat
+        # (plot.py / report.py / pl modules consume md.dmc as a
+        # DataFrame). With chrom/strand stored as pl.Enum this is
+        # roughly 700 MB at 22M rows vs. ~2 GB before — manageable
+        # alongside the per-chrom DMR working set.
+        result = dmc_store.to_dataframe()
 
         if empirical_fdr and len(result) > 0:
             result = empirical_fdr_for_dmc(
@@ -591,6 +604,12 @@ def dmc(
         "smooth_method": (
             md.uns.get("smooth_params", {}).get("method") if use_smoothed else None
         ),
+        # Path to the persistent per-chrom DMC store. Lets downstream
+        # tools (esp. tl.dmr(method='sliding_window')) stream
+        # chromosomes from disk instead of holding the materialised
+        # DataFrame plus a per-chrom working set in memory at the
+        # same time.
+        "store_path": str(dmc_store.path) if dmc_store is not None else None,
     }
 
     # 0.4.0 checkpoint/resume: persist a sidecar parquet + manifest entry
@@ -714,7 +733,7 @@ def _run_dmc_contrast(
     unite_info = md.uns.get("unite")
     unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
 
-    result = process_chromosomes_dmc(
+    dmc_store_contrast = process_chromosomes_dmc(
         methylstore_path=md.store,
         samples_treatment=samples_case_local,
         samples_control=samples_control_local,
@@ -730,8 +749,12 @@ def _run_dmc_contrast(
         contrast_label=contrast_label,
         samples_all_ordered=samples_all,
         group_labels_per_sample=group_labels,
+        return_store=True,
     )
-    result = apply_multiple_testing_correction(result, method="fdr_bh")
+    dmc_store_contrast = apply_multiple_testing_correction(
+        dmc_store_contrast, method="fdr_bh"
+    )
+    result = dmc_store_contrast.to_dataframe()
 
     key = "dmc_glm_contrast"
     md.varm[key] = result
@@ -751,6 +774,7 @@ def _run_dmc_contrast(
         "dispersion": dispersion,
         "reference": reference,
         "last_key": key,
+        "store_path": str(dmc_store_contrast.path),
     }
 
 
@@ -971,15 +995,31 @@ def dmr(
         return
 
     if method == "sliding_window":
-        dmc_df = md.dmc
-        if dmc_df is None:
+        # Prefer streaming from the persistent DMC store when ep.tl.dmc
+        # has staged one — keeps DMR peak memory at O(largest chrom)
+        # instead of holding the full 22M-row DataFrame plus a per-chrom
+        # working set in memory at the same time.
+        dmc_store_path = md.uns.get("dmc", {}).get("store_path")
+        dmc_input: object
+        if dmc_store_path:
+            from ._dmc_store import DMCStore
+            from pathlib import Path as _Path
+            store_path = _Path(dmc_store_path)
+            if (store_path / ".epykit_dmc_manifest.json").exists():
+                dmc_input = DMCStore.open(store_path)
+            else:
+                dmc_input = md.dmc
+        else:
+            dmc_input = md.dmc
+
+        if dmc_input is None:
             raise ValueError(
                 "No DMC results available. Run ep.tl.dmc(md) first, or use "
                 "method='tile' which goes directly to the methylstore."
             )
 
         dmr_df = call_dmr_sliding_window(
-            dmc_results=dmc_df,
+            dmc_results=dmc_input,
             window_bp=window_bp,
             step_bp=step_bp,
             min_cpgs=min_cpgs,

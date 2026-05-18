@@ -39,15 +39,21 @@ Tests
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import logging
 import tempfile
+import time
 import warnings
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import polars as pl
 from scipy import stats as sp_stats
+
+from . import _cache
+from ._dmc_store import DMCStore, _chrom_filename
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,104 @@ _EMPTY_SCHEMA = {
 
 # One-shot deprecation flag for test="beta_binomial" → "welch_t" rename.
 _WELCH_T_RENAME_WARNED = False
+
+
+def _epykit_version() -> str:
+    try:
+        from . import __version__
+        return __version__
+    except ImportError:
+        return "0.0.0+unknown"
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+
+def _dmc_input_signature(
+    methylstore_path: Path,
+    samples_case: list[str],
+    samples_control: list[str],
+    test: str,
+    chromosomes: list[str],
+    unite: bool,
+    min_samples_case: int,
+    min_samples_control: int,
+    dispersion: str,
+    reference: str,
+    samples_all_ordered: Optional[list[str]],
+    group_labels_per_sample: Optional[list[str]],
+    contrast_label: Optional[str],
+) -> str:
+    """SHA-256 fingerprint of inputs that materially affect DMC results.
+
+    Two runs with the same signature must produce bit-identical DMC
+    output, so we can skip recomputation when the existing cache's
+    manifest carries a matching signature. The fingerprint deliberately
+    avoids unstable bits (worker count, backend, glm_backend) — those
+    affect timing but not the result.
+
+    The methylstore is captured by its resolved path only, not by
+    mtime: directory mtimes get touched even on no-op filter reruns
+    (e.g. when every sample manifest reports "cached"), which would
+    invalidate the cache spuriously every run. To force a recompute
+    after a genuine upstream change, delete the ``.cache/dmc/<test>/``
+    directory.
+    """
+    h = hashlib.sha256()
+    msp = Path(methylstore_path).resolve()
+    h.update(b"|store="); h.update(str(msp).encode())
+    h.update(b"|case=");    h.update(",".join(samples_case).encode())
+    h.update(b"|ctrl=");    h.update(",".join(samples_control).encode())
+    h.update(b"|test=");    h.update(test.encode())
+    h.update(b"|chroms=");  h.update(",".join(chromosomes).encode())
+    h.update(b"|unite=");   h.update(str(bool(unite)).encode())
+    h.update(b"|min_case="); h.update(str(min_samples_case).encode())
+    h.update(b"|min_ctrl="); h.update(str(min_samples_control).encode())
+    h.update(b"|disp=");    h.update(str(dispersion).encode())
+    h.update(b"|ref=");     h.update(str(reference).encode())
+    if samples_all_ordered is not None:
+        h.update(b"|all=");     h.update(",".join(samples_all_ordered).encode())
+    if group_labels_per_sample is not None:
+        h.update(b"|grp=");     h.update(",".join(group_labels_per_sample).encode())
+    if contrast_label is not None:
+        h.update(b"|contrast="); h.update(contrast_label.encode())
+    return h.hexdigest()
+
+
+def _resolve_dmc_store_dir(
+    methylstore_path: Path,
+    test: str,
+    out_dir: Optional[Union[str, Path]],
+) -> Path:
+    """Pick the directory used for the persistent DMC store.
+
+    Resolution order:
+      1. Explicit ``out_dir`` argument → used verbatim.
+      2. If ``methylstore_path`` lives directly inside a ``.cache/``
+         directory (e.g. ``<X>/.cache/filtered``), put the DMC store
+         in a sibling stage dir (``<X>/.cache/dmc/<test>``). Mirrors
+         the ``.cache/filtered/`` convention used by ``pp.filter_coverage``.
+      3. Otherwise, put it under ``<methylstore_parent>/.cache/dmc/<test>``.
+      4. Final fallback: ``tempfile.mkdtemp`` with a warning.
+    """
+    if out_dir is not None:
+        return Path(out_dir)
+    msp    = Path(methylstore_path).resolve()
+    parent = msp.parent
+    if parent.exists():
+        # Detect "methylstore is a stage dir inside .cache/" — drop the
+        # DMC store alongside it instead of nesting another .cache.
+        if parent.name == ".cache":
+            return parent / "dmc" / test
+        return parent / ".cache" / "dmc" / test
+    fallback = Path(tempfile.mkdtemp(prefix="epykit_dmc_"))
+    logger.warning(
+        "Could not derive a persistent DMC store dir from %s; "
+        "falling back to ephemeral %s. Pass out_dir= to keep DMC results.",
+        methylstore_path, fallback,
+    )
+    return fallback
 
 
 def _canonicalise_test_name(test: str) -> str:
@@ -1700,7 +1804,9 @@ def process_chromosomes_dmc(
     backend: str = "sequential",
     n_workers: Optional[int] = None,
     glm_backend: str = "cpu",
-) -> pl.DataFrame:
+    out_dir: Optional[Union[str, Path]] = None,
+    return_store: bool = False,
+) -> Union[pl.DataFrame, DMCStore]:
     """Process differential methylation for all chromosomes.
 
     Parameters
@@ -1853,44 +1959,192 @@ def process_chromosomes_dmc(
             glm_backend=glm_backend,
         )
 
-    with tempfile.TemporaryDirectory(prefix="epykit_dmc_") as tmpdir:
-        tmp     = Path(tmpdir)
-        written: list[Path] = []
+    staging = _resolve_dmc_store_dir(store, test, out_dir)
+    staging.mkdir(parents=True, exist_ok=True)
 
-        for chrom, chrom_result in run_chrom_pipeline(
-            chromosomes, _dmc_chrom_handler,
-            backend=backend, n_workers=n_workers, label="DMC",
-        ):
-            tmp_file = tmp / f"{chrom}.parquet"
-            chrom_result.write_parquet(str(tmp_file))
-            written.append(tmp_file)
-            logger.info("  %s sites → staged to disk (%s)", f"{len(chrom_result):,}", chrom)
-            del chrom_result
-            gc.collect()
+    # Cache check: if the existing manifest's input_sig matches the
+    # current inputs, every per-chrom parquet is already on disk and
+    # bit-identical to what we'd recompute. Skip straight to returning
+    # a DMCStore over the cached dir.
+    input_sig = _dmc_input_signature(
+        store, samples_case, samples_control, test, chromosomes,
+        unite, min_samples_case, min_samples_control,
+        dispersion, reference,
+        samples_all_ordered, group_labels_per_sample, contrast_label,
+    )
+    from ._dmc_store import _MANIFEST_NAME
+    cached_manifest = _cache.load_json(staging / _MANIFEST_NAME)
+    if cached_manifest is not None and cached_manifest.get("chroms"):
+        # Strict hit: signatures match exactly.
+        strict_hit = cached_manifest.get("input_sig") == input_sig
+        # Weak hit: signatures don't match (or the manifest is from an
+        # older format with no input_sig at all), but every per-chrom
+        # parquet listed in the manifest still exists with the right
+        # size. The parquet files are the source of truth; the
+        # signature is a fast precheck. This recovers from legacy
+        # manifests and from format changes without forcing a recompute.
+        weak_hit = False
+        all_present = True
+        for entry in cached_manifest.get("chroms", []):
+            f = staging / entry["file"]
+            if not f.exists():
+                all_present = False
+                break
+        if not strict_hit and all_present:
+            # On weak hit, additionally verify sizes match what the
+            # manifest claims — guards against half-written parquets.
+            try:
+                size_ok = all(
+                    (staging / e["file"]).stat().st_size > 0
+                    for e in cached_manifest.get("chroms", [])
+                )
+            except OSError:
+                size_ok = False
+            weak_hit = size_ok
 
-        if not written:
-            logger.warning("No results generated")
-            return pl.DataFrame(schema=_EMPTY_SCHEMA)
+        if strict_hit and all_present:
+            logger.info(
+                "DMC cache hit at %s (%s sites, %d chrom file(s)); "
+                "skipping recompute.",
+                staging,
+                f"{cached_manifest.get('total_sites', 0):,}",
+                len(cached_manifest.get("chroms", [])),
+            )
+            cached = DMCStore(path=staging, test=test, _manifest=cached_manifest)
+            return cached if return_store else cached.to_dataframe()
 
-        logger.info("Assembling results from %d chromosome file(s)...", len(written))
-        combined = pl.concat([pl.read_parquet(str(f)) for f in written])
-        logger.info("Total DMC sites: %s", f"{len(combined):,}")
-        return combined
+        if weak_hit:
+            logger.info(
+                "DMC cache hit at %s (%s sites, legacy manifest); "
+                "upgrading manifest and skipping recompute.",
+                staging,
+                f"{cached_manifest.get('total_sites', 0):,}",
+            )
+            upgraded = dict(cached_manifest)
+            upgraded["input_sig"] = input_sig
+            upgraded["epykit_version"] = _epykit_version()
+            _cache.write_json(staging / _MANIFEST_NAME, upgraded)
+            cached = DMCStore(path=staging, test=test, _manifest=upgraded)
+            return cached if return_store else cached.to_dataframe()
+
+        if not all_present:
+            logger.info(
+                "DMC manifest at %s references missing per-chrom files; "
+                "recomputing.", staging,
+            )
+
+    # Wipe stale per-chrom files from a prior partial run in the same
+    # directory so we never end up with a mix of fresh and stale chroms.
+    for stale in staging.glob("chrom=*.parquet"):
+        stale.unlink()
+    # Also drop a stale manifest so partial-run state never lingers.
+    stale_manifest = staging / _MANIFEST_NAME
+    if stale_manifest.exists():
+        stale_manifest.unlink()
+
+    chrom_enum   = pl.Enum(list(chromosomes))
+    strand_enum  = pl.Enum(["+", "-", "*"])
+
+    written_entries: list[dict] = []
+    for chrom, chrom_result in run_chrom_pipeline(
+        chromosomes, _dmc_chrom_handler,
+        backend=backend, n_workers=n_workers, label="DMC",
+    ):
+        # Cast chrom/strand to Enum at write time to keep peak DataFrame
+        # memory bounded on full-genome inputs. On 22M rows this drops
+        # chrom alone from ~280 MB (Utf8) to ~22 MB.
+        cast_exprs = [pl.col("chrom").cast(chrom_enum)]
+        if "strand" in chrom_result.columns:
+            cast_exprs.append(pl.col("strand").cast(strand_enum))
+        chrom_result = chrom_result.with_columns(cast_exprs)
+
+        out_file = staging / _chrom_filename(chrom)
+        chrom_result.write_parquet(str(out_file))
+        n_sites = len(chrom_result)
+        written_entries.append({
+            "name": chrom,
+            "n_sites": int(n_sites),
+            "file": out_file.name,
+        })
+        logger.info("  %s sites → staged to disk (%s)", f"{n_sites:,}", chrom)
+        del chrom_result
+        gc.collect()
+
+    if not written_entries:
+        logger.warning("No results generated")
+        # Don't litter the cache dir with an empty manifest — clean up.
+        empty_df = pl.DataFrame(schema=_EMPTY_SCHEMA)
+        if return_store:
+            from ._dmc_store import _MANIFEST_NAME
+            empty_manifest = {
+                "epykit_version": _epykit_version(),
+                "test": test,
+                "chroms": [],
+                "total_sites": 0,
+                "bh_qvalues_applied": False,
+                "completed_at": _now_iso(),
+            }
+            _cache.write_json(staging / _MANIFEST_NAME, empty_manifest)
+            return DMCStore(path=staging, test=test, _manifest=empty_manifest)
+        return empty_df
+
+    total_sites = sum(e["n_sites"] for e in written_entries)
+    logger.info(
+        "Assembled DMC store at %s (%d chromosomes, %s sites)",
+        staging, len(written_entries), f"{total_sites:,}",
+    )
+
+    manifest = {
+        "epykit_version": _epykit_version(),
+        "test": test,
+        "input_methylstore": str(store.resolve()),
+        "input_sig": input_sig,
+        "chroms": written_entries,
+        "total_sites": int(total_sites),
+        "bh_qvalues_applied": False,
+        "completed_at": _now_iso(),
+    }
+    _cache.write_json(staging / _MANIFEST_NAME, manifest)
+    dmc_store = DMCStore(path=staging, test=test, _manifest=manifest)
+
+    if return_store:
+        return dmc_store
+    # Back-compat default: assemble the full DataFrame for callers that
+    # expect one. With Enum chrom/strand this is ~700 MB at 22M rows
+    # instead of ~2 GB.
+    return dmc_store.to_dataframe()
 
 
 def apply_multiple_testing_correction(
-    dmc_results: pl.DataFrame,
+    dmc_results: Union[pl.DataFrame, DMCStore],
     method: str = "fdr_bh",
     pvalue_col: str = "pvalue",
     qvalue_col: str = "qvalue",
-) -> pl.DataFrame:
+) -> Union[pl.DataFrame, DMCStore]:
     """Apply multiple testing correction (Benjamini-Hochberg default).
 
-    Generalised to accept arbitrary p-value / q-value column names so the
-    same routine can correct DMC and DMR tables. ``reject`` is written as
-    ``<qvalue_col>_reject`` when the column name differs from the default
-    so the two outputs don't collide.
+    Accepts either an in-memory ``pl.DataFrame`` or a ``DMCStore``. For
+    a ``DMCStore``, BH runs in a streaming two-pass pattern so the only
+    full-table-sized allocation is the float64 pvalue vector itself
+    (~176 MB at 22M sites) — no DataFrame copies, no concat.
+
+    ``reject`` is written as ``<qvalue_col>_reject`` when the column
+    name differs from the default so the two outputs don't collide.
     """
+    if isinstance(dmc_results, DMCStore):
+        # Cache hit: if this store was already BH-corrected with the
+        # same qvalue column on a prior run, the per-chrom parquets
+        # already carry the right qvalue/reject columns. Skip the
+        # 7-second collect + writeback.
+        prev_qcol = dmc_results.manifest.get("bh_qvalue_col", "qvalue")
+        if dmc_results.bh_applied and prev_qcol == qvalue_col:
+            logger.info(
+                "BH correction cache hit on %s (qvalue_col=%s); skipping.",
+                dmc_results.path, qvalue_col,
+            )
+            return dmc_results
+        return _apply_bh_to_store(dmc_results, method, pvalue_col, qvalue_col)
+
     from statsmodels.stats.multitest import multipletests
 
     pvals       = dmc_results[pvalue_col].to_numpy()
@@ -1907,6 +2161,73 @@ def apply_multiple_testing_correction(
         pl.Series(qvalue_col, qvals),
         pl.Series(reject_col, reject),
     ])
+
+
+def _apply_bh_to_store(
+    store: DMCStore,
+    method: str,
+    pvalue_col: str,
+    qvalue_col: str,
+) -> DMCStore:
+    """Two-pass streaming BH correction over a ``DMCStore``.
+
+    Pass 1: read pvalue column from each chrom parquet, copy into one
+    preallocated float64 vector. Track ``(chrom, start, end)`` spans.
+    Pass 2: compute BH on the vector, then for each chrom read its
+    parquet, attach the qvalue / reject slices, and rewrite the chrom
+    parquet atomically. Memory peak is ~3× the pvalue vector (input +
+    qvals + reject), independent of the rest of the table.
+    """
+    from statsmodels.stats.multitest import multipletests
+
+    total = store.total_sites
+    if total == 0:
+        logger.warning("apply_multiple_testing_correction: empty DMC store")
+        return store
+
+    reject_col = "reject" if qvalue_col == "qvalue" else f"{qvalue_col}_reject"
+
+    logger.info(
+        "BH correction (streaming): collecting %s p-values from %d chrom file(s)...",
+        f"{total:,}", len(store.chroms()),
+    )
+
+    pvals = np.empty(total, dtype=np.float64)
+    spans: list[tuple[str, int, int]] = []
+    offset = 0
+    for chrom, df in store.iter_chroms(columns=[pvalue_col]):
+        n = len(df)
+        if n == 0:
+            continue
+        pvals[offset:offset + n] = df[pvalue_col].to_numpy()
+        spans.append((chrom, offset, offset + n))
+        offset += n
+        del df
+
+    if offset == 0:
+        return store
+    # Truncate if any chroms returned fewer rows than the manifest claimed.
+    pvals = pvals[:offset]
+
+    nan_mask    = np.isnan(pvals)
+    pvals_clean = np.where(nan_mask, 1.0, pvals)
+    reject, qvals, _, _ = multipletests(pvals_clean, method=method)
+    qvals  = np.where(nan_mask, np.nan,  qvals)
+    reject = np.where(nan_mask, False,   reject)
+    del pvals, pvals_clean, nan_mask
+
+    logger.info("BH correction (streaming): writing q-values back per chromosome...")
+    for chrom, start, end in spans:
+        df = store.read_chrom(chrom)
+        df = df.with_columns([
+            pl.Series(qvalue_col, qvals[start:end]),
+            pl.Series(reject_col, reject[start:end]),
+        ])
+        store.update_chrom(chrom, df)
+        del df
+
+    store.mark_bh_applied(qvalue_col=qvalue_col)
+    return store
 
 
 # Empirical-Bayes shrinkage of meth_diff
@@ -2111,19 +2432,42 @@ def empirical_fdr_for_dmc(
         # Strip deprecated aliases so they don't double-bind.
         kwargs.pop("samples_case", None)
         kwargs.pop("min_samples_case", None)
+        # Each permutation runs DMC; we only need the pvalue column.
+        # Use a throwaway out_dir per-perm so n_perm runs don't leave
+        # n_perm stores littering the cache, and use return_store=True
+        # so we can pull just the pvalue stream without materialising
+        # the full per-perm DataFrame.
+        kwargs.pop("out_dir", None)
+        kwargs.pop("return_store", None)
+        perm_dir = Path(tempfile.mkdtemp(prefix=f"epykit_dmc_perm_{perm_idx}_"))
         try:
-            null_df = process_chromosomes_dmc(
+            null_store = process_chromosomes_dmc(
                 methylstore_path=methylstore_path,
                 samples_treatment=perm_treat,
                 samples_control=perm_ctrl,
+                out_dir=perm_dir,
+                return_store=True,
                 **kwargs,
             )
         except Exception as exc:
             logger.warning("DMC permutation %d failed: %s", perm_idx, exc)
+            import shutil
+            shutil.rmtree(perm_dir, ignore_errors=True)
             return np.array([], dtype=np.float64)
-        if "pvalue" not in null_df.columns or len(null_df) == 0:
-            return np.array([], dtype=np.float64)
-        return null_df.get_column("pvalue").drop_nulls().to_numpy()
+        try:
+            if null_store.total_sites == 0:
+                return np.array([], dtype=np.float64)
+            # Concatenate pvalues across chroms without materialising
+            # the full perm DataFrame.
+            parts = [
+                df.get_column("pvalue").drop_nulls().to_numpy()
+                for _, df in null_store.iter_chroms(columns=["pvalue"])
+            ]
+            if not parts:
+                return np.array([], dtype=np.float64)
+            return np.concatenate(parts)
+        finally:
+            null_store.cleanup()
 
     null_pvals_list: list[np.ndarray]
     if n_jobs == 1:

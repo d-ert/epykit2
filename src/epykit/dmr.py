@@ -24,15 +24,46 @@ smoother — see its own docstring.
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
 import tempfile
 from pathlib import Path
+from typing import Iterator, Union
 
 import numpy as np
 import polars as pl
 from scipy import stats as sp_stats
 
+from ._dmc_store import DMCStore
+
 logger = logging.getLogger(__name__)
+
+
+def _dmr_sliding_cache_key(
+    store: DMCStore,
+    window_bp: int,
+    min_cpgs: int,
+    min_sites_significant: int,
+    alpha: float,
+    min_abs_meth_diff: float,
+    p_col: str,
+) -> str:
+    """SHA-256 fingerprint of DMR-sliding inputs that affect the result.
+
+    Combines the DMC store's input signature with the DMR parameters so
+    a rerun with identical arguments reads from cache. ``step_bp`` is
+    deliberately omitted — the new two-pointer sweep ignores it.
+    """
+    base_sig = store.manifest.get("input_sig", "")
+    h = hashlib.sha256()
+    h.update(b"|base="); h.update(base_sig.encode())
+    h.update(b"|win=");  h.update(str(int(window_bp)).encode())
+    h.update(b"|mincp="); h.update(str(int(min_cpgs)).encode())
+    h.update(b"|minsig="); h.update(str(int(min_sites_significant)).encode())
+    h.update(b"|alpha=");   h.update(f"{float(alpha):.10g}".encode())
+    h.update(b"|delta=");   h.update(f"{float(min_abs_meth_diff):.10g}".encode())
+    h.update(b"|pcol=");    h.update(p_col.encode())
+    return h.hexdigest()
 
 _DMR_EMPTY_SCHEMA = {
     "chrom":            pl.Utf8,
@@ -77,6 +108,51 @@ _MAX_DMR_BP: int = 10_000
 # a window's direction is called "mixed" when the fraction of
 # valid sites agreeing with the sign of the mean is below this threshold.
 _MIXED_DIRECTION_THRESHOLD: float = 0.6
+
+
+# Internal helpers — DMC input streaming for sliding-window DMR
+
+def _dmc_store_columns(store: DMCStore) -> set[str]:
+    """Return the column set present in the store's per-chrom parquets.
+
+    Reads the schema of the first chromosome's parquet. All chroms are
+    assumed to share the same schema (enforced by
+    ``process_chromosomes_dmc``).
+    """
+    chroms = store.chroms()
+    if not chroms:
+        return set()
+    schema = pl.read_parquet_schema(str(store.path / f"chrom={chroms[0]}.parquet"))
+    return set(schema.keys())
+
+
+def _iter_dmc_store_chroms(
+    store: DMCStore,
+    p_col: str,
+) -> Iterator[tuple[str, pl.DataFrame]]:
+    """Yield ``(chrom, sorted per-chrom DataFrame)`` from a ``DMCStore``.
+
+    Only the columns the sliding-window sweep needs are read; this keeps
+    per-chrom IO at ~50 MB even on chr1 (1.8M CpGs).
+    """
+    cols = ["chrom", "pos", "meth_diff", "pvalue"]
+    if p_col == "qvalue":
+        cols.append("qvalue")
+    for chrom in store.chroms():
+        df = store.read_chrom(chrom, columns=cols)
+        if len(df) == 0:
+            yield chrom, df
+            continue
+        yield chrom, df.sort("pos")
+
+
+def _iter_dataframe_chroms(
+    df: pl.DataFrame,
+    p_col: str,
+) -> Iterator[tuple[str, pl.DataFrame]]:
+    """Yield per-chrom slices of an in-memory DMC DataFrame in sorted order."""
+    for chrom in sorted(df["chrom"].unique().to_list()):
+        yield chrom, df.filter(pl.col("chrom") == chrom).sort("pos")
 
 
 # Internal helpers — p-value combination
@@ -274,7 +350,7 @@ def _recompute_dmr_stats(
 # Public API — sliding-window DMR calling (works from a DMC table)
 
 def call_dmr_sliding_window(
-    dmc_results: pl.DataFrame,
+    dmc_results: Union[pl.DataFrame, DMCStore, str, Path],
     window_bp: int = 500,
     step_bp: int = 250,
     min_cpgs: int = 5,
@@ -291,15 +367,40 @@ def call_dmr_sliding_window(
     individual CpGs aren't significant won't gather enough sig sites to
     pass the `min_sites_significant` gate.
 
+    Memory scaling
+    --------------
+    The implementation uses a two-pointer CpG-anchored sweep — each
+    chromosome's peak memory scales with the number of CpGs on that
+    chromosome (a few hundred MB for full human autosomes), independent
+    of genomic span. The earlier bp-grid enumeration would have
+    materialised one window position every ``step_bp`` across the whole
+    chromosome (5M positions on chr1 alone) and OOM'd on full-genome
+    inputs. ``step_bp`` is still accepted for backward compatibility
+    but is effectively a no-op in the new implementation: every CpG
+    anchors a candidate and the downstream merge collapses redundancy.
+
     Parameters
     ----------
-    dmc_results : pl.DataFrame
-        Output from ``process_chromosomes_dmc`` /
-        ``apply_multiple_testing_correction``.
+    dmc_results : pl.DataFrame | DMCStore | str | Path
+        DMC results to process. Accepts:
+
+        * ``pl.DataFrame`` — in-memory table (legacy path); held in
+          memory for the whole DMR pass.
+        * ``DMCStore`` — handle to a persistent per-chrom parquet
+          directory (returned by
+          ``process_chromosomes_dmc(..., return_store=True)``).
+          Chromosomes are streamed from disk; peak memory is
+          O(largest chromosome).
+        * ``str`` / ``Path`` — path to a populated DMC store
+          directory; opened via :meth:`DMCStore.open`.
+
         Required columns: chrom, pos, meth_diff, pvalue.
         Optional: qvalue (used in preference to pvalue when present).
-    window_bp, step_bp : int
-        Window width and step in base pairs.
+    window_bp : int
+        Window width in base pairs.
+    step_bp : int
+        Accepted but no longer meaningful (see "Memory scaling" above).
+        Kept in the signature so old call sites don't break.
     min_cpgs : int
         Minimum CpG count in a *merged* DMR.
     min_sites_significant : int
@@ -318,16 +419,52 @@ def call_dmr_sliding_window(
         ``combined_qvalue`` is BH-corrected genome-wide across DMR
         candidates that passed the per-window gate.
     """
-    required = {"chrom", "pos", "meth_diff", "pvalue"}
-    missing  = required - set(dmc_results.columns)
-    if missing:
-        raise ValueError(f"DMC results missing required columns: {missing}")
+    if isinstance(dmc_results, (str, Path)):
+        dmc_results = DMCStore.open(dmc_results)
+
     if step_bp > window_bp:
         raise ValueError(
             f"step_bp ({step_bp}) must be ≤ window_bp ({window_bp})"
         )
 
-    p_col = "qvalue" if "qvalue" in dmc_results.columns else "pvalue"
+    # DMR cache: when the input is a DMCStore with a known input_sig,
+    # the entire sliding-window output is a pure function of that sig
+    # plus the DMR params. Stash the result inside the DMC store dir.
+    dmr_cache_path: Path | None = None
+    if isinstance(dmc_results, DMCStore) and dmc_results.manifest.get("input_sig"):
+        available_cols = _dmc_store_columns(dmc_results)
+        p_col_for_key = "qvalue" if "qvalue" in available_cols else "pvalue"
+        key = _dmr_sliding_cache_key(
+            dmc_results, window_bp, min_cpgs, min_sites_significant,
+            alpha, min_abs_meth_diff, p_col_for_key,
+        )
+        dmr_cache_path = dmc_results.path / f".dmr_sliding_{key[:16]}.parquet"
+        if dmr_cache_path.exists():
+            cached = pl.read_parquet(str(dmr_cache_path))
+            logger.info(
+                "DMR sliding-window cache hit at %s (%d DMR(s)); skipping recompute.",
+                dmr_cache_path.name, len(cached),
+            )
+            return cached
+
+    if isinstance(dmc_results, DMCStore):
+        available_cols = _dmc_store_columns(dmc_results)
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing  = required - available_cols
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        p_col = "qvalue" if "qvalue" in available_cols else "pvalue"
+        chrom_iter = _iter_dmc_store_chroms(dmc_results, p_col)
+        n_chroms = len(dmc_results.chroms())
+    else:
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing  = required - set(dmc_results.columns)
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        p_col = "qvalue" if "qvalue" in dmc_results.columns else "pvalue"
+        chrom_iter = _iter_dataframe_chroms(dmc_results, p_col)
+        n_chroms = dmc_results["chrom"].n_unique()
+
     logger.info(
         "call_dmr_sliding_window: window=%d bp, step=%d bp, "
         "min_cpgs=%d, min_sig=%d, alpha=%.3f, min_|Δβ|=%.2f, p_col=%s",
@@ -337,12 +474,7 @@ def call_dmr_sliding_window(
 
     all_records: list[dict] = []
 
-    for chrom in sorted(dmc_results["chrom"].unique().to_list()):
-        chrom_df = (
-            dmc_results
-            .filter(pl.col("chrom") == chrom)
-            .sort("pos")
-        )
+    for chrom, chrom_df in chrom_iter:
         if len(chrom_df) == 0:
             continue
 
@@ -358,35 +490,58 @@ def call_dmr_sliding_window(
         )
 
         # ---------------------------------------------------------------
-        # Build prefix-sum arrays for O(1) range count queries
+        # Two-pointer CpG-anchored sweep.
+        #
+        # Replaces the prior bp-grid enumeration (np.arange over the whole
+        # chromosome with step_bp) which scaled with genome span and
+        # OOM'd on full-genome 22M-CpG input (chr1 alone produced 5M
+        # window positions). The new pass is O(n_CpGs) per chrom and
+        # bounded in memory by the size of the per-chrom arrays.
+        #
+        # For each CpG i, the candidate window is
+        # ``[positions[i], positions[i] + window_bp)``; we maintain a
+        # running right pointer j and a rolling significant-CpG count.
+        # ``step_bp`` is accepted for backward compatibility but is no
+        # longer meaningful — every CpG anchors a candidate, and the
+        # downstream merge collapses redundancy without any change in
+        # the final DMR set.
         # ---------------------------------------------------------------
-        cum_sig = np.empty(len(positions) + 1, dtype=np.int32)
-        cum_sig[0] = 0
-        np.cumsum(is_sig.astype(np.int32), out=cum_sig[1:])
+        is_sig_int = is_sig.astype(np.int8, copy=False)
+        n_pos = len(positions)
+        cand_starts: list[int] = []
+        cand_ends: list[int] = []
 
-        pos_min = int(positions[0])
-        pos_max = int(positions[-1])
+        j = 0
+        n_sig_running = 0
+        for i in range(n_pos):
+            limit = positions[i] + window_bp
+            # advance j until positions[j] no longer fits in [pos_i, pos_i+window_bp)
+            while j < n_pos and positions[j] < limit:
+                n_sig_running += int(is_sig_int[j])
+                j += 1
+            # window [i, j) — all CpGs in [positions[i], positions[i]+window_bp)
+            n_cpgs_win = j - i
+            if n_cpgs_win >= min_cpgs and n_sig_running >= min_sites_significant:
+                cand_starts.append(int(positions[i]))
+                cand_ends.append(int(positions[i]) + window_bp)
+            # drop CpG i from the rolling count before advancing i
+            n_sig_running -= int(is_sig_int[i])
 
-        win_starts_arr = np.arange(pos_min, pos_max + 1, step_bp, dtype=np.int64)
-        win_ends_arr   = win_starts_arr + window_bp
-
-        lefts  = np.searchsorted(positions, win_starts_arr, side="left")
-        rights = np.searchsorted(positions, win_ends_arr,   side="left")
-
-        n_cpgs_arr = (rights - lefts).astype(np.int32)
-        n_sig_arr  = (cum_sig[rights] - cum_sig[lefts]).astype(np.int32)
-
-        cand_mask = (n_cpgs_arr >= min_cpgs) & (n_sig_arr >= min_sites_significant)
-
-        if not np.any(cand_mask):
+        if not cand_starts:
             logger.info("  %s: no candidate windows", chrom)
+            del chrom_df, positions, meth_diffs, pvals, is_sig, is_sig_int
+            gc.collect()
             continue
 
-        cand_starts = win_starts_arr[cand_mask].tolist()
-        cand_ends   = win_ends_arr[cand_mask].tolist()
-
         merged_spans = _merge_intervals(cand_starts, cand_ends)
-        chrom_dmrs   = 0
+        chrom_dmrs = 0
+
+        # _recompute_dmr_stats can still use a prefix-sum array for O(1)
+        # range counts in the final pass — that's per-merged-span (a
+        # small number) so it doesn't break the O(n_CpGs) budget.
+        cum_sig = np.empty(n_pos + 1, dtype=np.int32)
+        cum_sig[0] = 0
+        np.cumsum(is_sig_int.astype(np.int32, copy=False), out=cum_sig[1:])
 
         for start, end in merged_spans:
             rec = _recompute_dmr_stats(
@@ -403,10 +558,19 @@ def call_dmr_sliding_window(
             "  %s: %d candidate span(s) → %d DMR(s)",
             chrom, len(merged_spans), chrom_dmrs,
         )
+        # Free per-chrom buffers before next iteration. Critical when
+        # streaming from a DMCStore on a 22M-site genome: without this
+        # the buffer-pool references can pile up and defeat the
+        # whole-table-streaming win.
+        del chrom_df, positions, meth_diffs, pvals, is_sig, is_sig_int, cum_sig
+        gc.collect()
 
     if not all_records:
         logger.warning("No DMRs found with current filters")
-        return pl.DataFrame(schema=_DMR_EMPTY_SCHEMA)
+        empty = pl.DataFrame(schema=_DMR_EMPTY_SCHEMA)
+        if dmr_cache_path is not None:
+            empty.write_parquet(str(dmr_cache_path))
+        return empty
 
     dmr_df = (
         pl.DataFrame(all_records)
@@ -431,6 +595,11 @@ def call_dmr_sliding_window(
         pvalue_col="combined_pvalue",
         qvalue_col="combined_qvalue",
     )
+    if dmr_cache_path is not None:
+        dmr_df.write_parquet(str(dmr_cache_path))
+        logger.info(
+            "DMR sliding-window result cached at %s", dmr_cache_path.name,
+        )
     return dmr_df
 
 

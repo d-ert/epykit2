@@ -46,6 +46,7 @@ from . import pp, tl, pl, query
 from ._config import set_tmp_dir, get_tmp_dir
 
 from .convert import convert_sample
+from ._dmc_store import DMCStore
 from .dmc import (
     process_chromosomes_dmc,
     apply_multiple_testing_correction,
@@ -107,6 +108,7 @@ __all__ = [
     "empirical_fdr_for_dmc",
     "fisher_exact_vectorized",
     "shrink_meth_diff",
+    "DMCStore",
     # DMR engines
     "call_dmr_sliding_window",
     "smooth_methylation_gaussian",

@@ -50,6 +50,21 @@ _FEAT_COLS = ["Chromosome", "Start", "End", "Strand", "Feature", "gene_id", "gen
 _GTF_CACHE_MAX_SIZE: int = max(1, int(os.environ.get("EPYKIT_GTF_CACHE_SIZE", "2")))
 _GTF_CACHE: "OrderedDict[str, tuple[Any, Any]]" = OrderedDict()
 
+# Built-feature-index cache: bounded LRU of {key -> (features_by_chrom, tss_series, strand_lut)}.
+#
+# ``annotate_features`` calls Steps 2-5 (dedup exons, build feature intervals,
+# group by chromosome, build TSS / strand lookups) on every invocation even
+# when the GTF was already parsed via _GTF_CACHE. On a human GENCODE GTF the
+# rebuild is ~5-6 s, which is meaningful when annotate is called twice in a
+# row (once on the DMC table, once on the DMR table — see ``ep.tl.annotate``).
+# Caching the built index lets the second call skip straight to the per-site
+# overlap loop. Key includes promoter window + feature tuple so changing
+# either invalidates the cache automatically.
+_BUILT_FEATURES_CACHE_MAX_SIZE: int = max(
+    1, int(os.environ.get("EPYKIT_BUILT_FEATURES_CACHE_SIZE", "2"))
+)
+_BUILT_FEATURES_CACHE: "OrderedDict[tuple, tuple[Any, Any, Any]]" = OrderedDict()
+
 
 def set_gtf_cache_size(max_size: int) -> None:
     """Set the maximum number of parsed GTFs held in memory.
@@ -82,6 +97,24 @@ def _gtf_cache_put(key: str, value: tuple[Any, Any]) -> None:
     while len(_GTF_CACHE) > _GTF_CACHE_MAX_SIZE:
         evicted, _ = _GTF_CACHE.popitem(last=False)
         logger.debug("[annotate] GTF cache evicted (LRU): %s", evicted)
+
+
+def _built_features_cache_get(key: tuple) -> tuple[Any, Any, Any] | None:
+    val = _BUILT_FEATURES_CACHE.get(key)
+    if val is not None:
+        _BUILT_FEATURES_CACHE.move_to_end(key)
+    return val
+
+
+def _built_features_cache_put(key: tuple, value: tuple[Any, Any, Any]) -> None:
+    if key in _BUILT_FEATURES_CACHE:
+        _BUILT_FEATURES_CACHE.move_to_end(key)
+        _BUILT_FEATURES_CACHE[key] = value
+        return
+    _BUILT_FEATURES_CACHE[key] = value
+    while len(_BUILT_FEATURES_CACHE) > _BUILT_FEATURES_CACHE_MAX_SIZE:
+        evicted, _ = _BUILT_FEATURES_CACHE.popitem(last=False)
+        logger.debug("[annotate] built-features cache evicted (LRU): %s", evicted[0])
 
 
 def _log(msg: str) -> None:
@@ -345,37 +378,40 @@ def _annotate_chromosome_chunk(
 
 # Public API
 
-def annotate_features(
-    sites: pl.DataFrame,
+def _build_features_index(
     annotation_gtf: str,
-    features: list[str] | tuple[str, ...] = ("promoter", "exon", "intron", "intergenic"),
-    promoter_upstream_bp: int = 2000,
-    promoter_downstream_bp: int = 200,
-) -> pl.DataFrame:
-    """Annotate DMC / DMR sites with gene-level genomic features.
+    features: tuple[str, ...],
+    promoter_upstream_bp: int,
+    promoter_downstream_bp: int,
+) -> tuple[dict[str, Any], Any, Any]:
+    """Build (or fetch from cache) the per-chromosome feature index + lookups.
 
-    The GTF is parsed once per process and cached; subsequent calls with the
-    same file path skip the 60-90 s streaming step entirely.
+    Returns ``(features_by_chrom, tss_series, strand_lut)``. Caches the
+    bundle in ``_BUILT_FEATURES_CACHE`` keyed on the resolved GTF path,
+    feature tuple, and promoter window. ``annotate_features`` calls this
+    instead of inlining Steps 1-5, so a second invocation against the same
+    GTF skips the 5-6 s of dedup / interval construction / groupby /
+    TSS-and-strand-map building.
     """
-    try:
-        import bioframe  # noqa: F401  (presence-check; used inside _annotate_chromosome_chunk)
-    except ImportError as exc:
-        raise ImportError("bioframe is required. pip install bioframe") from exc
-
     import pandas as pd
 
-    _log("=" * 60)
-    _log("annotate_features START")
-    _log(f"  sites input: {_df_info('sites', sites)}")
-    _log(f"  GTF: {annotation_gtf}")
-    _log(f"  features requested: {list(features)}")
-    _log(f"  promoter window: -{promoter_upstream_bp} / +{promoter_downstream_bp}")
-
-    n = len(sites)
-    t_total = time.time()
+    feature_key = tuple(sorted(set(features)))
+    cache_key = (
+        str(Path(annotation_gtf).resolve()),
+        feature_key,
+        int(promoter_upstream_bp),
+        int(promoter_downstream_bp),
+    )
+    cached = _built_features_cache_get(cache_key)
+    if cached is not None:
+        _log(
+            f"  built-features cache hit for {cache_key[0]} "
+            f"(features={feature_key}, prom={promoter_upstream_bp}/{promoter_downstream_bp})"
+        )
+        return cached
 
     # ------------------------------------------------------------------
-    # Step 1: Parse GTF (uses cache after first call)
+    # Step 1: Parse GTF (uses _GTF_CACHE after first call)
     # ------------------------------------------------------------------
     _log("Step 1/8: stream-parsing GTF (gene and exon rows only) ...")
     t0 = time.time()
@@ -478,7 +514,8 @@ def annotate_features(
     gc.collect()
 
     # ------------------------------------------------------------------
-    # Step 5: Build TSS map
+    # Step 5: Build TSS map and strand lookup (both keyed by gene_id;
+    # used in Step 8 for TSS-distance + sign).
     # ------------------------------------------------------------------
     _log("Step 5/8: building TSS map ...")
     _g = genes_pd[["gene_id", "Start", "End", "Strand"]].drop_duplicates("gene_id")
@@ -488,8 +525,63 @@ def annotate_features(
         _g["End"].to_numpy(),
     ).astype(np.int64)
     tss_series = pd.Series(tss_values, index=_g["gene_id"].to_numpy(), dtype="Int64")
+    strand_lut = pd.Series(
+        _g["Strand"].to_numpy(),
+        index=_g["gene_id"].to_numpy(),
+        dtype=object,
+    )
     _log(f"  TSS map built: {len(tss_series):,} genes")
-    del _g
+    del _g, genes_pd, exons_pd
+    gc.collect()
+
+    bundle = (features_by_chrom, tss_series, strand_lut)
+    _built_features_cache_put(cache_key, bundle)
+    return bundle
+
+
+def annotate_features(
+    sites: pl.DataFrame,
+    annotation_gtf: str,
+    features: list[str] | tuple[str, ...] = ("promoter", "exon", "intron", "intergenic"),
+    promoter_upstream_bp: int = 2000,
+    promoter_downstream_bp: int = 200,
+) -> pl.DataFrame:
+    """Annotate DMC / DMR sites with gene-level genomic features.
+
+    The GTF is parsed once per process and cached; subsequent calls with the
+    same file path skip the 60-90 s streaming step entirely.
+    """
+    try:
+        import bioframe  # noqa: F401  (presence-check; used inside _annotate_chromosome_chunk)
+    except ImportError as exc:
+        raise ImportError("bioframe is required. pip install bioframe") from exc
+
+    import pandas as pd
+
+    _log("=" * 60)
+    _log("annotate_features START")
+    _log(f"  sites input: {_df_info('sites', sites)}")
+    _log(f"  GTF: {annotation_gtf}")
+    _log(f"  features requested: {list(features)}")
+    _log(f"  promoter window: -{promoter_upstream_bp} / +{promoter_downstream_bp}")
+
+    n = len(sites)
+    t_total = time.time()
+
+    # ------------------------------------------------------------------
+    # Steps 1-5: GTF parse + dedup + feature intervals + groupby + TSS/strand
+    # maps. All five outputs are pure functions of (GTF path, features tuple,
+    # promoter window) — independent of the input ``sites`` — so we cache the
+    # bundle in _BUILT_FEATURES_CACHE. On a second call inside the same script
+    # (e.g. annotate(md) which annotates DMC then DMR), this shaves ~5 s off
+    # the redundant build.
+    # ------------------------------------------------------------------
+    features_by_chrom, tss_series, strand_lut = _build_features_index(
+        annotation_gtf,
+        tuple(features),
+        promoter_upstream_bp,
+        promoter_downstream_bp,
+    )
 
     # ------------------------------------------------------------------
     # Step 6: Tag sites with original row index
@@ -580,13 +672,9 @@ def annotate_features(
     )
 
     # TSS distance: positive = downstream. On - strand, TSS sits at End and a
-    # higher genomic coordinate is upstream, so flip the sign.
-    _strand_lut = (
-        genes_pd[["gene_id", "Strand"]]
-        .drop_duplicates("gene_id")
-        .set_index("gene_id")["Strand"]
-    )
-    strand_arr  = pd.Series(gene_ids.tolist()).map(_strand_lut).to_numpy(dtype=object)
+    # higher genomic coordinate is upstream, so flip the sign. ``strand_lut``
+    # came from the cached feature index, so this is O(1) on a rerun.
+    strand_arr  = pd.Series(gene_ids.tolist()).map(strand_lut).to_numpy(dtype=object)
     strand_sign = np.where(strand_arr == "-", -1.0, 1.0).astype(np.float64)
     dist_to_tss              = (strand_sign * (site_mids - tss_positions)).astype(np.float32)
     dist_to_tss[gene_ids == ""] = np.nan

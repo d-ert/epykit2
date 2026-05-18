@@ -10,7 +10,7 @@ epykit ingests Bismark / MethylDackel coverage output into a partitioned Parquet
 
 ## Highlights
 
-- **Partitioned Parquet methylstore.** Per-chromosome, per-sample columnar storage — never load a whole genome into RAM.
+- **Partitioned Parquet methylstore.** Per-chromosome, per-sample columnar storage — never load a whole genome into RAM. DMC results follow the same convention: `process_chromosomes_dmc(..., return_store=True)` returns a `DMCStore` handle backed by per-chromosome parquet files under `<methylstore>/.cache/dmc/<test>/`, and `apply_multiple_testing_correction` / `call_dmr_sliding_window` stream from it so peak memory stays at O(largest chromosome) on whole-genome inputs (~22 M CpGs).
 - **Statistical engines.** Per-CpG DMC tests cover the quasi-binomial likelihood-ratio (`lr`, the default at n ≥ 2; closed-form with McCullagh-Nelder dispersion), Pearson score, full IRLS binomial GLM with covariates, Welch t on logit(β), Welch t on raw β (`welch_t`), a true quasi-binomial LRT (`bb_lr`), Cochran-Mantel-Haenszel, and pooled Fisher exact. Every test surfaces 95 % Wald CIs on `meth_diff`. Permutation empirical FDR is available end-to-end: `tl.dmc(..., empirical_fdr=True)` and `tl.dmr(..., empirical_fdr=True)` shuffle labels, re-run the engine, and add `empirical_pvalue` / `empirical_qvalue` columns.
 - **Multi-group & covariate contrasts.** `tl.dmc(formula="~ group + age", contrast="group")` runs a joint F-test across factor levels; `contrast="age"` runs a Wald test on a continuous covariate as the primary effect.
 - **Two DMR engines plus permutation FDR.** Tile-based (read-pooled, default) and per-CpG sliding-window with signed Stouffer's combining. `tl.dmr(..., empirical_fdr=True, n_perm=100)` re-runs the engine on shuffled labels and reports empirical p- and q-values.
@@ -202,7 +202,12 @@ methyl_store/
 │   │   └── sample=cd55_1/
 │   │       └── chrom=chr1/part-0.parquet
 │   ├── filtered/                 # after pp.filter_coverage
-│   └── normalized/               # after pp.normalize_coverage
+│   ├── normalized/               # after pp.normalize_coverage
+│   └── dmc/
+│       └── lr/                   # after tl.dmc(test="lr")
+│           ├── .epykit_dmc_manifest.json
+│           ├── chrom=chr1.parquet
+│           └── chrom=chr2.parquet
 └── results/
     └── cd55_analysis/            # md.save() target
         ├── obs.parquet
@@ -225,6 +230,7 @@ DMC frames carry: `chrom`, `pos`, `strand`, `n_case`, `n_control`, `mean_beta_ca
 | `filter.py`        | Coverage filter, coverage normalisation, blacklist intersect |
 | `pp.py`            | Preprocessing wrappers (`filter_coverage`, `normalize_coverage`, `unite`, `smooth`, `aggregate_regions`) |
 | `dmc.py`           | Streaming per-CpG accumulators + statistical engines (`lr`, `score`, `glm`, `logit_t`, `welch_t`, `bb_lr`, `cmh`, `fisher`), BH correction |
+| `_dmc_store.py`    | `DMCStore` handle — persistent per-chromosome DMC parquet directory + manifest; lets BH and sliding-window DMR stream from disk so peak memory is O(largest chrom), not O(genome) |
 | `dmr.py`           | `call_dmr_tile_based`, `call_dmr_sliding_window`, `empirical_fdr_for_dmr`, `smooth_methylation_gaussian` |
 | `dvc.py`           | Differentially Variable CpG calling (iEVORA-style) |
 | `annotate.py`      | `annotate_features` (GTF), `annotate_cpg_islands` (island / shore / shelf / open-sea) |
