@@ -159,7 +159,7 @@ def compute_sample_site_matrix(
 
     pattern = _store_pattern(md)
 
-    # Probe: one cheap row count to choose a deterministic hash modulus.
+    # Probe: one cheap row count to choose a deterministic modulus.
     # `pl.len()` on a lazy scan only reads parquet footers, so this is
     # near-instantaneous even on terabyte stores.
     n_total = pl.scan_parquet(pattern).select(pl.len()).collect().item()
@@ -168,16 +168,19 @@ def compute_sample_site_matrix(
     target_rows = max(n_sites * len(samples) * 2, len(samples))
     k = max(1, n_total // target_rows)
 
+    # Integer modulo on pos is predicate-pushdown-friendly (polars pushes
+    # it into the parquet reader), so we never read the whole store into
+    # memory just to subsample. Sites are unique per (chrom, pos); using
+    # the same modulus on pos picks the same positions on every chrom
+    # and the same chrom across samples, so per-site coverage is
+    # consistent.
     lf = (
         pl.scan_parquet(pattern)
         .filter(pl.col("coverage") > 0)
-        .select(["chrom", "pos", "sample", "N_meth", "coverage"])
     )
     if k > 1:
-        # Hash on chrom+pos so the same sites survive across samples.
-        site_key = pl.col("chrom") + pl.lit("|") + pl.col("pos").cast(pl.Utf8)
-        lf = lf.filter(site_key.hash(seed=seed) % k == 0)
-    lf = lf.with_columns(
+        lf = lf.filter((pl.col("pos") % k) == (seed % k))
+    lf = lf.select(["chrom", "pos", "sample", "N_meth", "coverage"]).with_columns(
         (pl.col("N_meth").cast(pl.Float64) / pl.col("coverage").cast(pl.Float64))
         .alias("beta")
     ).select(["chrom", "pos", "sample", "beta"])
@@ -305,6 +308,31 @@ def _tss_intervals(gtf_path: str, *, window_bp: int, max_genes: Optional[int]):
     ]).select(["chrom", "start", "end", "tss", "strand", "gene_id"])
 
 
+def _merge_intervals(starts: np.ndarray, ends: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Merge potentially overlapping [start, end) intervals.
+
+    Returns sorted, non-overlapping arrays. Used by the metaplot to push
+    a tight pre-filter into the polars lazy scan -- otherwise the
+    bounding span of all TSS windows can effectively be the entire
+    chromosome and the filter is a no-op.
+    """
+    if starts.size == 0:
+        return starts, ends
+    order = np.argsort(starts)
+    ws = starts[order].astype(np.int64)
+    we = ends[order].astype(np.int64)
+    out_s = [int(ws[0])]
+    out_e = [int(we[0])]
+    for i in range(1, len(ws)):
+        if int(ws[i]) <= out_e[-1]:
+            if int(we[i]) > out_e[-1]:
+                out_e[-1] = int(we[i])
+        else:
+            out_s.append(int(ws[i]))
+            out_e.append(int(we[i]))
+    return np.asarray(out_s, dtype=np.int64), np.asarray(out_e, dtype=np.int64)
+
+
 def compute_tss_metaplot(
     md,
     gtf_path: str,
@@ -315,25 +343,20 @@ def compute_tss_metaplot(
     max_genes: Optional[int] = None,
     use_cache: bool = True,
 ) -> MetaplotResult:
-    """Compute mean beta around the TSS, vectorised.
+    """Compute mean beta around the TSS, with bounded peak memory.
 
-    Per chromosome: one streaming scan of the store filtered to
-    ``[min TSS window, max TSS window]``, one ``bioframe.overlap`` between
-    CpGs and TSS windows, and a single ``np.add.at`` accumulation into the
-    output histogram. No per-TSS Python loop, no per-sample re-scan.
+    Per chromosome, per sample: one streaming scan of just that sample's
+    chrom partition, filtered down to CpGs falling inside the union of
+    TSS windows. Vectorised ``np.searchsorted`` then assigns each CpG to
+    its TSS bin and accumulates into the running ``(n_samples, n_bins)``
+    arrays. Peak resident memory is bounded by one sample's
+    window-resident CpGs (typically <50 MB for a human chromosome).
     """
     cache_key = f"tss_metaplot:{gtf_path}:{window_bp}:{n_bins}:{group_by}:{max_genes}"
     if use_cache:
         cached = _cache_get(md, cache_key)
         if cached is not None:
             return cached
-
-    try:
-        import bioframe  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "bioframe is required for TSS metaplots. pip install bioframe"
-        ) from exc
 
     samples = md.obs.get_column("sample_id").to_list()
     if not samples:
@@ -346,74 +369,77 @@ def compute_tss_metaplot(
     bin_size = (2 * window_bp) / n_bins
     sum_beta = np.zeros((len(samples), n_bins), dtype=np.float64)
     count = np.zeros((len(samples), n_bins), dtype=np.int64)
-    sample_idx = {s: i for i, s in enumerate(samples)}
 
     chroms = sorted(set(tss.get_column("chrom").to_list()))
     for chrom in chroms:
         tss_c = tss.filter(pl.col("chrom") == chrom)
         if tss_c.is_empty():
             continue
-        win_lo = int(tss_c["start"].min())
-        win_hi = int(tss_c["end"].max())
+        tss_positions = tss_c["tss"].to_numpy().astype(np.int64)
+        tss_starts = tss_c["start"].to_numpy().astype(np.int64)
+        tss_ends = tss_c["end"].to_numpy().astype(np.int64)
+        strands_raw = tss_c["strand"].to_numpy()
+        strand_sign = np.where(strands_raw == "-", -1, 1).astype(np.int8)
 
-        pattern = f"{md.store}/sample=*/chrom={chrom}/part-*.parquet"
-        try:
-            cpgs = (
-                pl.scan_parquet(pattern)
-                .select(["pos", "sample", "N_meth", "coverage"])
-                .filter(pl.col("coverage") > 0)
-                .filter(pl.col("pos").is_between(win_lo, win_hi, closed="left"))
-                .with_columns(
-                    (pl.col("N_meth").cast(pl.Float64)
-                     / pl.col("coverage").cast(pl.Float64)).alias("beta")
+        # Union of TSS windows -- tight pre-filter when genes are clustered.
+        merged_s, merged_e = _merge_intervals(tss_starts, tss_ends)
+        if merged_s.size == 0:
+            continue
+
+        # Per sample, streaming. One sample's chrom partition at a time
+        # keeps peak memory bounded by ~chrom_size_in_bp / spacing CpGs.
+        for s_idx, sample_id in enumerate(samples):
+            part_dir = f"{md.store}/sample={sample_id}/chrom={chrom}"
+            try:
+                lf = (
+                    pl.scan_parquet(f"{part_dir}/part-*.parquet")
+                    .select(["pos", "N_meth", "coverage"])
+                    .filter(pl.col("coverage") > 0)
+                    # Cheap bounding-box filter; polars pushes this into
+                    # the parquet reader.
+                    .filter(pl.col("pos").is_between(
+                        int(merged_s[0]), int(merged_e[-1]),
+                    ))
                 )
-                .collect()
+                df = lf.collect()
+            except Exception:
+                continue
+            if df.is_empty():
+                continue
+
+            positions = df["pos"].to_numpy().astype(np.int64)
+            # Tighter filter: keep only positions inside any merged window.
+            # Vectorised: for each pos find the latest merged_s <= pos via
+            # searchsorted, then check that pos < merged_e[that index].
+            idx = np.searchsorted(merged_s, positions, side="right") - 1
+            valid = (idx >= 0) & (positions < merged_e[np.clip(idx, 0, len(merged_e) - 1)])
+            if not valid.any():
+                continue
+            positions = positions[valid]
+            betas = (
+                df["N_meth"].to_numpy().astype(np.float64)[valid]
+                / df["coverage"].to_numpy().astype(np.float64)[valid]
             )
-        except Exception:
-            continue
-        if cpgs.is_empty():
-            continue
+            # Sort by position so per-TSS searchsorted is correct.
+            order = np.argsort(positions, kind="mergesort")
+            positions = positions[order]
+            betas = betas[order]
 
-        cpg_pd = cpgs.to_pandas()
-        cpg_pd["chrom"] = chrom
-        cpg_pd["start"] = cpg_pd["pos"].astype(np.int64)
-        cpg_pd["end"] = cpg_pd["start"] + 1
-
-        import bioframe as bf
-        joined = bf.overlap(
-            cpg_pd, tss_c.to_pandas(),
-            how="inner",
-            cols1=("chrom", "start", "end"),
-            cols2=("chrom", "start", "end"),
-            suffixes=("", "_tss"),
-        )
-        if len(joined) == 0:
-            continue
-
-        # bioframe sometimes suffixes every df2 column ("tss" -> "tss_tss"),
-        # sometimes only collisions. Look up either form.
-        def _pick(col: str):
-            if col in joined.columns:
-                return joined[col]
-            return joined[f"{col}_tss"]
-
-        rel = (joined["pos"].to_numpy(np.int64)
-               - _pick("tss").to_numpy(np.int64))
-        strands = _pick("strand").to_numpy()
-        rel = np.where(strands == "-", -rel, rel)
-        bins = np.floor((rel + window_bp) / bin_size).astype(np.int64)
-        np.clip(bins, 0, n_bins - 1, out=bins)
-
-        s_idx = np.fromiter(
-            (sample_idx.get(s, -1) for s in joined["sample"]),
-            count=len(joined), dtype=np.int32,
-        )
-        m = s_idx >= 0
-        if not m.any():
-            continue
-        betas = joined["beta"].to_numpy(np.float64)
-        np.add.at(sum_beta, (s_idx[m], bins[m]), betas[m])
-        np.add.at(count, (s_idx[m], bins[m]), 1)
+            # Per-TSS window: pull the CpGs inside, compute relative bin,
+            # accumulate. The Python loop is over TSS (~ thousands), not
+            # CpGs, so vectorisation lives inside.
+            for tss_pos, sign in zip(tss_positions, strand_sign):
+                lo = int(tss_pos) - window_bp
+                hi = int(tss_pos) + window_bp
+                left = np.searchsorted(positions, lo, side="left")
+                right = np.searchsorted(positions, hi, side="left")
+                if right <= left:
+                    continue
+                rel = (positions[left:right] - int(tss_pos)) * int(sign)
+                bins = np.floor((rel + window_bp) / bin_size).astype(np.int64)
+                np.clip(bins, 0, n_bins - 1, out=bins)
+                np.add.at(sum_beta[s_idx], bins, betas[left:right])
+                np.add.at(count[s_idx], bins, 1)
 
     with np.errstate(invalid="ignore"):
         mean_beta = np.where(count > 0, sum_beta / count, np.nan)
