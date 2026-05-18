@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .._style import apply_theme as _apply_theme
+from .._style import apply_theme as _apply_theme, PALETTE, set_palette
 
 _apply_theme()
 
@@ -13,7 +13,15 @@ from .embedding import umap
 from .correlation import sample_correlation
 from .dashboard import qc_dashboard
 from .dmr_boxplot import dmr_boxplot
+from .dmr_summary import dmr_violin, dmr_heatmap
 from .overlap import dmr_overlap
+from .annotation import (
+    plot_annotation_counts,
+    plot_numerical_by_annotation,
+    plot_coannotations,
+    plot_categorical,
+)
+from .composer import figure_grid
 
 __all__ = [
     "coverage_histogram",
@@ -32,5 +40,23 @@ __all__ = [
     "sample_correlation",
     "qc_dashboard",
     "dmr_boxplot",
+    "dmr_violin",
+    "dmr_heatmap",
     "dmr_overlap",
+    # annotatr-style plots
+    "plot_annotation_counts",
+    "plot_numerical_by_annotation",
+    "plot_coannotations",
+    "plot_categorical",
+    # composer
+    "figure_grid",
+    # styling
+    "apply_theme",
+    "PALETTE",
+    "set_palette",
 ]
+
+
+def apply_theme(context: str = "paper") -> None:
+    """Re-apply the matplotlib theme. See :func:`epykit._style.apply_theme`."""
+    return _apply_theme(context)

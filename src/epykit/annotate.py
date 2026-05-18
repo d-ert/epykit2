@@ -47,11 +47,28 @@ import polars as pl
 logger = logging.getLogger(__name__)
 
 _FEATURE_PRIORITY: dict[str, int] = {
+    # HOMER-style priority order. Sites are tagged with the highest-priority
+    # (lowest number) feature that overlaps them. Coarse features
+    # (promoter / exon / intron / intergenic) keep their historic priorities
+    # so existing tests and downstream consumers don't shift; the
+    # fine-grained HOMER additions (5UTR / 3UTR / TTS / noncoding) slot in
+    # between them.
     "promoter":   0,
-    "exon":       1,
-    "intron":     2,
-    "intergenic": 3,
+    "5UTR":       1,
+    "3UTR":       2,
+    "TTS":        3,
+    "exon":       4,
+    "intron":     5,
+    "noncoding":  6,
+    "intergenic": 7,
 }
+
+# HOMER-equivalent feature catalog: pass this tuple to ``annotate_features``
+# to reproduce a HOMER-style 8-category breakdown
+# (matches the typical methylation-paper pie chart).
+HOMER_FEATURES: tuple[str, ...] = (
+    "promoter", "5UTR", "exon", "intron", "3UTR", "TTS", "noncoding",
+)
 
 _FEAT_COLS = ["Chromosome", "Start", "End", "Strand", "Feature", "gene_id", "gene_name"]
 
@@ -209,6 +226,155 @@ def _build_intron_df(exons_pd, genes_pd) -> "pd.DataFrame":
     introns["Feature"]     = "intron"
     introns                = introns.rename(columns={"_g_chrom": "Chromosome"})
     return introns[_FEAT_COLS].reset_index(drop=True)
+
+
+_UTR_PARSE_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+
+
+def _utr_parse_cache_get(key: str):
+    if key in _UTR_PARSE_CACHE:
+        _UTR_PARSE_CACHE.move_to_end(key)
+        return _UTR_PARSE_CACHE[key]
+    return None
+
+
+def _utr_parse_cache_put(key: str, value) -> None:
+    _UTR_PARSE_CACHE[key] = value
+    while len(_UTR_PARSE_CACHE) > _GTF_CACHE_MAX_SIZE:
+        _UTR_PARSE_CACHE.popitem(last=False)
+
+
+def _parse_gtf_utrs(gtf_path: str) -> "pd.DataFrame":
+    """Stream-parse the same GTF for ``five_prime_utr`` / ``three_prime_utr``
+    rows, returning a single DataFrame tagged by ``Feature``.
+
+    Kept in a separate cache so the primary :func:`_parse_gtf_streaming`
+    (genes + exons only) stays cheap and 2-tuple-shaped for the callers
+    that don't care about UTRs. Returns an empty frame when the GTF
+    doesn't emit UTR rows (older GENCODE versions, custom assemblies);
+    callers should treat absence as 'fall through to other features'.
+    """
+    import pandas as pd
+
+    cache_key = "utrs::" + str(Path(gtf_path).resolve())
+    cached = _utr_parse_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows: list[dict] = []
+    attr_re = re.compile(r'(\w+)\s+"([^"]+)"')
+    is_gzip = gtf_path.endswith(".gz")
+    open_fn = gzip.open if is_gzip else open
+
+    try:
+        with open_fn(gtf_path, "rt") as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 9:
+                    continue
+                feature = parts[2]
+                if feature not in ("five_prime_utr", "three_prime_utr"):
+                    continue
+                chrom = parts[0]
+                start = int(parts[3]) - 1
+                end = int(parts[4])
+                strand = parts[6]
+                attrs = {}
+                for m in attr_re.finditer(parts[8]):
+                    attrs[m.group(1)] = m.group(2)
+                gene_id = attrs.get("gene_id", "")
+                gene_name = attrs.get("gene_name", gene_id)
+                rows.append({
+                    "Chromosome": chrom, "Start": start, "End": end,
+                    "Strand": strand, "gene_id": gene_id,
+                    "gene_name": gene_name,
+                    "Feature": "5UTR" if feature == "five_prime_utr" else "3UTR",
+                })
+    except Exception:
+        _log(f"  warning: UTR parse failed for {gtf_path}; "
+             "falling back to no-UTR mode")
+        rows = []
+
+    cols = ["Chromosome", "Start", "End", "Strand", "gene_id", "gene_name", "Feature"]
+    out = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
+    _utr_parse_cache_put(cache_key, out)
+    return out
+
+
+def _build_tts_df(
+    genes_pd,
+    *,
+    upstream_bp: int = 100,
+    downstream_bp: int = 1000,
+):
+    """Build a transcription-termination-site (TES) window DataFrame.
+
+    Analogous to :func:`_build_promoter_df` but anchored at the gene's
+    3' end. HOMER's defaults are ``-100/+1000`` around the TES.
+    """
+    import pandas as pd
+    if len(genes_pd) == 0:
+        return pd.DataFrame(columns=_FEAT_COLS)
+    plus  = genes_pd[genes_pd["Strand"] == "+"].copy()
+    minus = genes_pd[genes_pd["Strand"] == "-"].copy()
+    # + strand: TES = End -> window [End-upstream, End+downstream)
+    plus["Start"] = (plus["End"] - upstream_bp).clip(lower=0)
+    plus["End"]   = plus["End"] + downstream_bp
+    # - strand: TES = Start -> window [Start-downstream, Start+upstream)
+    tts_minus = minus["Start"].copy()
+    minus["Start"] = (tts_minus - downstream_bp).clip(lower=0)
+    minus["End"]   = tts_minus + upstream_bp
+    combined = pd.concat([plus, minus], ignore_index=True)
+    combined["Feature"] = "TTS"
+    if "gene_name" not in combined.columns:
+        combined["gene_name"] = combined.get("gene_id", "")
+    return combined[_FEAT_COLS]
+
+
+def _build_noncoding_df(genes_pd):
+    """Whole gene-body intervals for genes flagged as non-protein-coding.
+
+    HOMER's "noncoding" bucket gets a hit when a site overlaps a
+    transcript whose biotype is not ``protein_coding`` (lincRNA,
+    antisense, miRNA, snoRNA, ...). When the source has no ``gene_type``
+    column, returns an empty frame so the priority chain falls through.
+    """
+    import pandas as pd
+    if len(genes_pd) == 0 or "gene_type" not in genes_pd.columns:
+        return pd.DataFrame(columns=_FEAT_COLS)
+    nc = genes_pd[genes_pd["gene_type"].fillna("") != "protein_coding"].copy()
+    if len(nc) == 0:
+        return pd.DataFrame(columns=_FEAT_COLS)
+    nc["Feature"] = "noncoding"
+    if "gene_name" not in nc.columns:
+        nc["gene_name"] = nc.get("gene_id", "")
+    return nc[_FEAT_COLS].reset_index(drop=True)
+
+
+def _build_utr_df_from_gtf_utrs(utr_pd, side: str):
+    """Filter the cached GTF-derived UTR frame to one side (5UTR / 3UTR)."""
+    import pandas as pd
+    if len(utr_pd) == 0:
+        return pd.DataFrame(columns=_FEAT_COLS)
+    sub = utr_pd[utr_pd["Feature"] == side].copy()
+    if len(sub) == 0:
+        return pd.DataFrame(columns=_FEAT_COLS)
+    return sub[_FEAT_COLS].reset_index(drop=True)
+
+
+def _build_utr_df_from_refgene(genes_pd, exons_pd, side: str):
+    """Derive UTR intervals from refGene-style CDS coordinates.
+
+    refGene stores ``cdsStart`` / ``cdsEnd`` on each transcript but we
+    only kept tx-level Start/End in ``genes_pd``. For refGene-sourced
+    UTRs the cleanest path is to fall through to "no UTRs" so the
+    priority chain demotes those sites to ``exon`` / ``intron``. Users
+    who need UTR resolution should annotate with a GTF.
+    """
+    import pandas as pd
+    return pd.DataFrame(columns=_FEAT_COLS)
 
 
 def _parse_gtf_streaming(gtf_path: str) -> tuple["pd.DataFrame", "pd.DataFrame"]:
@@ -684,6 +850,39 @@ def _build_features_index(
                 feature_dfs.append(intron_df[_FEAT_COLS])
         except Exception:
             _log(f"  ERROR building introns:\n{traceback.format_exc()}")
+
+    # HOMER-style additions. UTRs come from a second GTF pass (cheap with
+    # the dedicated UTR cache); TTS is derived from gene-body coordinates;
+    # noncoding filters genes by biotype.
+    if "5UTR" in features or "3UTR" in features:
+        if source == "gtf":
+            utr_pd = _parse_gtf_utrs(annotation_path)
+            if "5UTR" in features:
+                u5 = _build_utr_df_from_gtf_utrs(utr_pd, "5UTR")
+                _log(f"  {_df_info('5UTRs', u5)}")
+                if len(u5) > 0:
+                    feature_dfs.append(u5[_FEAT_COLS])
+            if "3UTR" in features:
+                u3 = _build_utr_df_from_gtf_utrs(utr_pd, "3UTR")
+                _log(f"  {_df_info('3UTRs', u3)}")
+                if len(u3) > 0:
+                    feature_dfs.append(u3[_FEAT_COLS])
+        else:
+            _log("  WARNING: 5UTR/3UTR requested but source is refGene; "
+                 "refGene's CDS coordinates aren't carried through the parser. "
+                 "Use a GTF source for UTR-level resolution.")
+
+    if "TTS" in features and len(genes_pd) > 0:
+        tts_df = _build_tts_df(genes_pd)
+        _log(f"  {_df_info('TTS', tts_df)}")
+        if len(tts_df) > 0:
+            feature_dfs.append(tts_df[_FEAT_COLS])
+
+    if "noncoding" in features and len(genes_pd) > 0:
+        nc_df = _build_noncoding_df(genes_pd)
+        _log(f"  {_df_info('noncoding', nc_df)}")
+        if len(nc_df) > 0:
+            feature_dfs.append(nc_df[_FEAT_COLS])
 
     if feature_dfs:
         t0 = time.time()

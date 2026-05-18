@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import numpy as np
-import polars as pl
 
 from .._style import PALETTE
+from ._compute import (
+    compute_volcano_data,
+    compute_ma_data,
+    compute_manhattan_data,
+)
 from ._utils import _get_ax, _save_fig
 from ..methyldata import MethylData
 
@@ -17,34 +21,25 @@ def volcano(
     figsize=(6, 5),
     save: str | None = None,
 ):
-    dmc = md.dmc
-    if dmc is None:
-        raise ValueError("Run ep.tl.dmc(md) first")
-
-    p_col = "qvalue" if "qvalue" in dmc.columns else "pvalue"
-    diff = dmc["meth_diff"].to_numpy()
-    pval = dmc[p_col].to_numpy()
-    y = -np.log10(np.maximum(pval, 1e-300))
-
-    sig = (pval < alpha) & (np.abs(diff) >= min_abs_diff)
-    hyper = sig & (diff > 0)
-    hypo = sig & (diff < 0)
-    ns = ~sig
+    data = compute_volcano_data(md, alpha=alpha, min_abs_diff=min_abs_diff)
+    diff = data.meth_diff
+    y = data.neg_log_p
+    ns = ~data.sig
 
     fig, ax = _get_ax(ax, figsize)
     ax.scatter(diff[ns], y[ns], s=4, color=PALETTE["neutral"], alpha=0.4, rasterized=True)
-    ax.scatter(diff[hypo], y[hypo], s=4, color=PALETTE["hypo"], alpha=0.7, rasterized=True)
-    ax.scatter(diff[hyper], y[hyper], s=4, color=PALETTE["hyper"], alpha=0.7, rasterized=True)
+    ax.scatter(diff[data.hypo], y[data.hypo], s=4, color=PALETTE["hypo"], alpha=0.7, rasterized=True)
+    ax.scatter(diff[data.hyper], y[data.hyper], s=4, color=PALETTE["hyper"], alpha=0.7, rasterized=True)
 
     ax.axhline(-np.log10(alpha), color="grey", lw=0.8, ls="--")
     ax.axvline(min_abs_diff, color="grey", lw=0.8, ls="--")
     ax.axvline(-min_abs_diff, color="grey", lw=0.8, ls="--")
 
-    n_hyper = int(hyper.sum())
-    n_hypo = int(hypo.sum())
+    n_hyper = int(data.hyper.sum())
+    n_hypo = int(data.hypo.sum())
     ax.set_title(f"DMC volcano  |  hyper={n_hyper:,}  hypo={n_hypo:,}")
     ax.set_xlabel("Methylation difference (treatment - control)")
-    ax.set_ylabel(f"-log_1_0({p_col})")
+    ax.set_ylabel(f"-log_1_0({data.p_col})")
 
     if save:
         _save_fig(md, fig, save)
@@ -60,41 +55,21 @@ def ma_plot(
     figsize=(7, 5),
     save: str | None = None,
 ):
-    """MA plot: mean beta vs methylation difference.
-
-    x-axis: mean methylation across treatment and control
-    y-axis: methylation difference (treatment - control)
-    color: hypermethylated (red), hypomethylated (blue), not significant (grey)
-    """
-    dmc = md.dmc
-    if dmc is None:
-        raise ValueError("Run ep.tl.dmc(md) first")
-
-    p_col = "qvalue" if "qvalue" in dmc.columns else "pvalue"
-    diff = dmc["meth_diff"].to_numpy()
-    pval = dmc[p_col].to_numpy()
-    
-    # Compute mean_beta as average of case and control
-    mean_beta = (
-        dmc["mean_beta_case"].to_numpy() + dmc["mean_beta_control"].to_numpy()
-    ) / 2.0
-
-    sig = (pval < alpha) & (np.abs(diff) >= min_abs_diff)
-    hyper = sig & (diff > 0)
-    hypo = sig & (diff < 0)
-    ns = ~sig
+    """MA plot: mean beta vs methylation difference."""
+    data = compute_ma_data(md, alpha=alpha, min_abs_diff=min_abs_diff)
+    ns = ~data.sig
 
     fig, ax = _get_ax(ax, figsize)
-    ax.scatter(mean_beta[ns], diff[ns], s=4, color=PALETTE["neutral"], alpha=0.4, rasterized=True)
-    ax.scatter(mean_beta[hypo], diff[hypo], s=4, color=PALETTE["hypo"], alpha=0.7, rasterized=True)
-    ax.scatter(mean_beta[hyper], diff[hyper], s=4, color=PALETTE["hyper"], alpha=0.7, rasterized=True)
+    ax.scatter(data.mean_beta[ns], data.meth_diff[ns], s=4, color=PALETTE["neutral"], alpha=0.4, rasterized=True)
+    ax.scatter(data.mean_beta[data.hypo], data.meth_diff[data.hypo], s=4, color=PALETTE["hypo"], alpha=0.7, rasterized=True)
+    ax.scatter(data.mean_beta[data.hyper], data.meth_diff[data.hyper], s=4, color=PALETTE["hyper"], alpha=0.7, rasterized=True)
 
     ax.axhline(0, color="black", lw=1)
     ax.axhline(min_abs_diff, color="grey", lw=0.8, ls="--", alpha=0.5)
     ax.axhline(-min_abs_diff, color="grey", lw=0.8, ls="--", alpha=0.5)
 
-    n_hyper = int(hyper.sum())
-    n_hypo = int(hypo.sum())
+    n_hyper = int(data.hyper.sum())
+    n_hypo = int(data.hypo.sum())
     ax.set_title(f"MA plot  |  hyper={n_hyper:,}  hypo={n_hypo:,}")
     ax.set_xlabel("Mean methylation")
     ax.set_ylabel("Methylation difference (treatment - control)")
@@ -112,72 +87,20 @@ def manhattan(
     figsize=(14, 4),
     save: str | None = None,
 ):
-    """Manhattan plot: genome-wide significance.
-
-    x-axis: chromosome position
-    y-axis: -log_1_0(p-value)
-    color: alternates by chromosome
-    """
-    dmc = md.dmc
-    if dmc is None:
-        raise ValueError("Run ep.tl.dmc(md) first")
-
-    if "chrom" not in dmc.columns or "pos" not in dmc.columns:
-        raise ValueError("DMC table must contain 'chrom' and 'pos' columns. Run ep.tl.annotate(md) first.")
-
-    p_col = "qvalue" if "qvalue" in dmc.columns else "pvalue"
-
-    dmc_sorted = dmc.sort(["chrom", "pos"])
-    chroms = dmc_sorted["chrom"].unique().to_list()
-
-    chrom_order = (
-        [f"chr{i}" for i in range(1, 23)]
-        + [f"chr{c}" for c in ["X", "Y", "M"]]
-        + [c for c in chroms if c not in [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY", "chrM"]]
-    )
+    """Manhattan plot: genome-wide significance."""
+    data = compute_manhattan_data(md, alpha=alpha)
 
     fig, ax = _get_ax(ax, figsize)
-
-    cumulative_pos = 0
-    chrom_offsets = {}
     colors = [PALETTE["hypo"], PALETTE["hyper"]]
-
-    for chrom_idx, chrom in enumerate(chrom_order):
-        if chrom not in chroms:
-            continue
-        chrom_data = dmc_sorted.filter(pl.col("chrom") == chrom)
-        if len(chrom_data) == 0:
-            continue
-
-        positions = chrom_data["pos"].to_numpy()
-        pvals = chrom_data[p_col].to_numpy()
-        y = -np.log10(np.maximum(pvals, 1e-300))
-
-        x_coords = cumulative_pos + positions
-        color = colors[chrom_idx % 2]
-        ax.scatter(x_coords, y, s=3, color=color, alpha=0.6, rasterized=True)
-
-        chrom_offsets[chrom] = (cumulative_pos, cumulative_pos + positions.max())
-        cumulative_pos += positions.max() + 1e7  # add gap between chromosomes
-
-    ax.axhline(-np.log10(alpha), color="red", lw=1, ls="--", label=f"alpha={alpha}")
+    for i, block in enumerate(data.chrom_blocks):
+        ax.scatter(block["x"], block["y"], s=3, color=colors[i % 2], alpha=0.6, rasterized=True)
+    ax.axhline(data.alpha_line_y, color="red", lw=1, ls="--", label=f"alpha={alpha}")
     ax.set_xlabel("Chromosome")
-    ax.set_ylabel(f"-log_1_0({p_col})")
+    ax.set_ylabel(f"-log_1_0({data.p_col})")
     ax.set_title("Manhattan plot")
     ax.legend()
-
-    # Set chromosome labels at midpoints
-    tick_positions = []
-    tick_labels = []
-    for chrom in chrom_order:
-        if chrom in chrom_offsets:
-            start, end = chrom_offsets[chrom]
-            mid = (start + end) / 2
-            tick_positions.append(mid)
-            tick_labels.append(chrom.replace("chr", ""))
-
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(tick_labels, fontsize=8)
+    ax.set_xticks(data.tick_pos)
+    ax.set_xticklabels(data.tick_label, fontsize=8)
 
     if save:
         _save_fig(md, fig, save)

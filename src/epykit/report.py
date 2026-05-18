@@ -201,6 +201,9 @@ def generate_report(
     dmc_top_n: int = 50,
     dmr_top_n: int = 50,
     metaplot_max_genes: Optional[int] = 5000,
+    pca_n_sites: int = 10_000,
+    coverage_max_points: int = 200_000,
+    clear_cache: bool = False,
 ) -> str:
     """Render a single-file HTML report.
 
@@ -219,6 +222,16 @@ def generate_report(
         DMC q-value threshold for KPI counts. Default 0.05.
     min_abs_diff : float
         Minimum |meth_diff| for KPI counts. Default 0.1.
+    pca_n_sites : int
+        Cap for sites entering PCA. Lower (e.g. 5_000) to shave RAM/time
+        on huge stores; the visual is virtually unchanged below ~20_000.
+    coverage_max_points : int
+        Cap for points entering the coverage histogram. The store is
+        subsampled deterministically beyond this limit.
+    clear_cache : bool
+        If True, drop any cached compute results on ``md.uns['_report_cache']``
+        before rendering. Use after re-running upstream steps so a stale
+        PCA / metaplot doesn't survive into the new report.
 
     Returns
     -------
@@ -237,6 +250,9 @@ def generate_report(
         pca_plotly,
         tss_metaplot_plotly,
     )
+    if clear_cache:
+        from .pl._compute import clear_report_cache
+        clear_report_cache(md)
 
     env = Environment(
         loader=FileSystemLoader(str(_TEMPLATE_DIR)),
@@ -297,7 +313,7 @@ def generate_report(
         "filter_params": _pretty_dict(md.uns.get("filter")),
         "regions_params": _pretty_dict(md.uns.get("regions")),
         "qc_summary": _qc_summary(md),
-        "coverage_plot": _fig_html(_safe(coverage_histogram_plotly, md)),
+        "coverage_plot": _fig_html(_safe(coverage_histogram_plotly, md, max_points=coverage_max_points)),
         "dmc_available": dmc_stats.get("available", False),
         "dmc_n_total": _fmt_value(dmc_stats.get("n_total")),
         "dmc_n_sig": _fmt_value(dmc_stats.get("n_sig")),
@@ -324,7 +340,7 @@ def generate_report(
                             max_genes=metaplot_max_genes))
             if gtf_path else None
         ),
-        "pca_plot": _fig_html(_safe(pca_plotly, md)),
+        "pca_plot": _fig_html(_safe(pca_plotly, md, n_sites=pca_n_sites)),
         "provenance": json.dumps(provenance_payload, indent=2, default=str),
     }
 

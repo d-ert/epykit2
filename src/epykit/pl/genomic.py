@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 import numpy as np
 import polars as pl
 
+from ._compute import compute_annotation_counts
 from ._utils import _get_ax, _save_fig
 from ..methyldata import MethylData
 
@@ -29,9 +30,9 @@ def genomic_context_bar(md: MethylData, ax=None, figsize=(7, 4), save: str | Non
     if dmc is None or "feature_type" not in dmc.columns:
         raise ValueError("No feature annotations found. Run ep.tl.annotate(md, gtf=...) first.")
 
-    counts = dmc.group_by("feature_type").len().sort("len", descending=True)
+    counts = compute_annotation_counts(dmc, annot_col="feature_type")
     fig, ax = _get_ax(ax, figsize)
-    ax.bar(counts["feature_type"].to_list(), counts["len"].to_list())
+    ax.bar(counts["feature_type"].to_list(), counts["count"].to_list())
     ax.set_xlabel("Feature type")
     ax.set_ylabel("Count")
     ax.set_title("Genomic context")
@@ -47,9 +48,9 @@ def cpg_island_pie(md: MethylData, ax=None, figsize=(5, 5), save: str | None = N
     if dmc is None or "cpg_context" not in dmc.columns:
         raise ValueError("No CpG-island annotations found. Run ep.tl.annotate(md, cpg_islands=...) first.")
 
-    counts = dmc.group_by("cpg_context").len().sort("len", descending=True)
+    counts = compute_annotation_counts(dmc, annot_col="cpg_context")
     fig, ax = _get_ax(ax, figsize)
-    ax.pie(counts["len"].to_list(), labels=counts["cpg_context"].to_list(), autopct="%1.1f%%")
+    ax.pie(counts["count"].to_list(), labels=counts["cpg_context"].to_list(), autopct="%1.1f%%")
     ax.set_title("CpG island context")
 
     if save:

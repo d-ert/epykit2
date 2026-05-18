@@ -64,6 +64,7 @@ from .dmr import (
 from .annotate import (
     annotate_features,
     annotate_cpg_islands,
+    HOMER_FEATURES,
 )
 from .qc import (
     bisulfite_conversion_rate,
@@ -128,6 +129,7 @@ __all__ = [
     "deconvolve",
     # annotation
     "annotate_features",
+    "HOMER_FEATURES",
     "annotate_cpg_islands",
     # QC
     "bisulfite_conversion_rate",
