@@ -4,7 +4,10 @@ A Python-native WGBS methylation analysis pipeline built on Parquet partitioning
 
 epykit ingests Bismark / MethylDackel coverage output into a partitioned Parquet **methylstore** and runs the whole downstream analysis (QC → filtering → DMC → DMR → annotation → plotting → report) over that store with [polars](https://pola.rs) and lazy I/O. The Python API is organised in a scanpy-style `pp` / `tl` / `pl` namespace; a CLI mirrors the same operations for scripting.
 
-> **Status:** version 0.7.0 (unreleased), pre-1.0. API may change. MIT licensed. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+> **Status:** version 0.7.0 (unreleased), pre-1.0. API may change. MIT licensed.
+
+[Documentation](https://d-ert.github.io/epykit2/) | [Changelog](CHANGELOG.md)
+
 
 ---
 
