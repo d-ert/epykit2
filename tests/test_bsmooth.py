@@ -21,6 +21,8 @@ import pytest
 import epykit as ep
 from epykit.dmr import _bsmooth_make_njit, smooth_methylation_bsmooth
 
+pytestmark = pytest.mark.slow
+
 
 # ---- 1. Direct numerical correctness on hand-built signals ---------
 

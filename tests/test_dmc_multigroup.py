@@ -14,6 +14,8 @@ import pytest
 import epykit as ep
 from tests.fixtures.synth import SimConfig, generate
 
+pytestmark = pytest.mark.slow
+
 
 # Calibrated against the fixture. The multi-group joint F-test (3 groups,
 # 4 reps each, effect step 0.20 => Deltabeta_max~=0.40 across levels) is well-

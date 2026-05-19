@@ -19,6 +19,8 @@ import pytest
 
 matplotlib.use("Agg", force=True)
 
+pytestmark = pytest.mark.slow
+
 
 # ---------------------------------------------------------------------------
 # Fixture: annotated DMR table with multi-annotation columns.

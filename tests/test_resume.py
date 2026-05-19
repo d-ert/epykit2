@@ -31,6 +31,8 @@ from epykit._cache import (
     pipeline_manifest_path,
 )
 
+pytestmark = pytest.mark.slow
+
 
 # ---- 1. Low-level _cache primitives ----------------------------------
 

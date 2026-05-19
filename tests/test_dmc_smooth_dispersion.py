@@ -25,6 +25,8 @@ from epykit.dmc import (
     _smooth_sample_counts_box,
 )
 
+pytestmark = pytest.mark.slow
+
 
 # 1. Unit tests for `_smooth_sample_counts_box`
 

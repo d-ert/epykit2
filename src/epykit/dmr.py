@@ -1094,8 +1094,6 @@ def call_dmr_tile_based(
     design_reduced: np.ndarray | None = None,
     coef_idx: int | None = None,
     *,
-    samples_case: list[str] | None = None,         # deprecated alias
-    min_samples_case: int | None = None,           # deprecated alias
     backend: str = "sequential",
     n_workers: int | None = None,
     merge_adjacent: bool = True,
@@ -1126,7 +1124,7 @@ def call_dmr_tile_based(
     ----------
     methylstore_path : str
         Path to the filtered partitioned Parquet methylstore.
-    samples_case, samples_control : list[str]
+    samples_treatment, samples_control : list[str]
         Sample IDs.
     tile_size_bp : int
         Tile width in bp (default 1000). Adjacent tiles do not overlap.
@@ -1146,7 +1144,7 @@ def call_dmr_tile_based(
         Minimum |meth_diff| for a tile to be called significant.
     unite : bool
         If True (default), only test tiles covered in every sample.
-    min_samples_case, min_samples_control : int
+    min_samples_treatment, min_samples_control : int
         Per-tile minimum number of samples required to be present in each
         group (only relevant when unite=False).
 
@@ -1160,14 +1158,14 @@ def call_dmr_tile_based(
     from .dmc import (
         process_chromosomes_dmc,
         apply_multiple_testing_correction,
-        _resolve_treatment_aliases,
     )
 
-    samples_treatment, min_samples_treatment = _resolve_treatment_aliases(
-        samples_treatment, samples_case, min_samples_treatment, min_samples_case
-    )
+    if samples_treatment is None:
+        raise TypeError("Missing required argument: samples_treatment")
     if samples_control is None:
         raise TypeError("Missing required argument: samples_control")
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
     samples_case = samples_treatment
     min_samples_case = min_samples_treatment
 

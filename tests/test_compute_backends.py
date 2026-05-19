@@ -21,6 +21,8 @@ import pytest
 import epykit as ep
 from epykit._compute import run_chrom_pipeline
 
+pytestmark = pytest.mark.slow
+
 
 # ---- 1. Direct dispatcher tests --------------------------------------
 

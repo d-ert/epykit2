@@ -6,8 +6,7 @@ Verifies the data-object contract:
 * Preprocessing state is derived from ``uns['_store_history']``.
 * ``MethylData.get_dmc(test=...)`` looks up by explicit name; ``.dmc``
   resolves to the *last-written* table via ``uns['dmc']['last_key']``.
-* Deprecated ``samples_case=`` / ``min_samples_case=`` kwargs still work
-  but emit ``DeprecationWarning``.
+* Removed ``samples_case=`` / ``min_samples_case=`` aliases raise errors.
 * Covariate-adjusted GLM dispatches correctly through ``tl.dmr``.
 """
 
@@ -205,64 +204,33 @@ def test_get_dmc_prefers_annotated_when_available(synth_md_filtered):
 
 
 
-# Deprecation warnings
+# Removed-alias tests
 
 
-def test_samples_case_kwarg_emits_deprecation_warning(synth_md_filtered):
-    """Calling ``process_chromosomes_dmc(samples_case=...)`` directly should
-    fire a DeprecationWarning and still work."""
+def test_samples_case_kwarg_is_rejected(synth_md_filtered):
+    """The ``samples_case`` kwarg was removed; passing it raises TypeError."""
     from epykit.dmc import process_chromosomes_dmc
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        df = process_chromosomes_dmc(
-            methylstore_path=synth_md_filtered.store,
-            samples_case=synth_md_filtered.treatment_ids,    # deprecated
-            samples_control=synth_md_filtered.control_ids,
-            test="fisher",   # cheap path
-        )
-    dep_msgs = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert any("samples_case" in str(w.message) for w in dep_msgs)
-    assert df is not None and len(df) > 0
-
-
-def test_samples_treatment_kwarg_does_not_warn(synth_md_filtered):
-    """The canonical ``samples_treatment=`` kwarg should NOT trigger any
-    deprecation warning."""
-    from epykit.dmc import process_chromosomes_dmc
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with pytest.raises(TypeError):
         process_chromosomes_dmc(
             methylstore_path=synth_md_filtered.store,
-            samples_treatment=synth_md_filtered.treatment_ids,
+            samples_case=synth_md_filtered.treatment_ids,
             samples_control=synth_md_filtered.control_ids,
             test="fisher",
         )
-    dep_msgs = [
-        w for w in caught
-        if issubclass(w.category, DeprecationWarning)
-        and ("samples_case" in str(w.message)
-             or "min_samples_case" in str(w.message))
-    ]
-    assert dep_msgs == [], f"unexpected deprecation: {[str(w.message) for w in dep_msgs]}"
 
 
-def test_passing_both_aliases_raises_typeerror(synth_md_filtered):
-    """It's a programmer error to pass both ``samples_case`` and
-    ``samples_treatment`` -- refuse the call."""
+def test_samples_treatment_kwarg_works(synth_md_filtered):
+    """The canonical ``samples_treatment=`` kwarg works without warnings."""
     from epykit.dmc import process_chromosomes_dmc
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        with pytest.raises(TypeError, match="either samples_treatment or samples_case"):
-            process_chromosomes_dmc(
-                methylstore_path=synth_md_filtered.store,
-                samples_treatment=synth_md_filtered.treatment_ids,
-                samples_case=synth_md_filtered.treatment_ids,
-                samples_control=synth_md_filtered.control_ids,
-                test="fisher",
-            )
+    df = process_chromosomes_dmc(
+        methylstore_path=synth_md_filtered.store,
+        samples_treatment=synth_md_filtered.treatment_ids,
+        samples_control=synth_md_filtered.control_ids,
+        test="fisher",
+    )
+    assert df is not None and len(df) > 0
 
 
 
@@ -320,3 +288,86 @@ def test_all_lists_documented_public_surface():
     }
     missing = expected - set(epykit.__all__)
     assert not missing, f"epykit.__all__ missing: {sorted(missing)}"
+
+
+# ---- Region aggregation (merged from test_pp_regions.py) -------------
+
+
+def _write_bed(path, rows):
+    path.write_text(
+        "\n".join(f"{c}\t{s}\t{e}\t{name}" for c, s, e, name in rows) + "\n"
+    )
+    return path
+
+
+def test_aggregate_regions_round_trip(synth_md_filtered, tmp_path):
+    """Aggregating to a few wide regions yields a row per (region, sample)."""
+    import epykit as ep
+
+    md = synth_md_filtered
+    bed_rows: list[tuple[str, int, int, str]] = []
+    chrom_bounds = (
+        pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
+        .group_by("chrom")
+        .agg([pl.min("pos").alias("lo"), pl.max("pos").alias("hi")])
+        .collect()
+    )
+    for r in chrom_bounds.iter_rows(named=True):
+        lo, hi = int(r["lo"]), int(r["hi"])
+        if hi - lo < 30:
+            continue
+        third = (hi - lo) // 3
+        bed_rows.extend([
+            (r["chrom"], lo, lo + third, f"{r['chrom']}_a"),
+            (r["chrom"], lo + third, lo + 2 * third, f"{r['chrom']}_b"),
+            (r["chrom"], lo + 2 * third, hi + 1, f"{r['chrom']}_c"),
+        ])
+    bed = _write_bed(tmp_path / "regions.bed", bed_rows)
+
+    ep.pp.aggregate_regions(md, str(bed), min_cpgs_per_region=1)
+
+    new_store = Path(md.store)
+    assert new_store.exists()
+    sample_dirs = list(new_store.glob("sample=*"))
+    assert len(sample_dirs) == md.n_samples
+
+    df = pl.read_parquet(
+        f"{md.store}/sample=*/chrom=*/part-*.parquet"
+    )
+    for col in (
+        "chrom", "pos", "strand", "context",
+        "N_meth", "N_unmeth", "coverage", "sample",
+        "region_id", "start", "end", "n_cpgs",
+    ):
+        assert col in df.columns, f"missing column {col}"
+    assert df["coverage"].eq(df["N_meth"] + df["N_unmeth"]).all()
+    assert md.uns["regions"]["n_regions"] == len(bed_rows)
+    assert any(h["step"] == "regions" for h in md.uns["_store_history"])
+
+
+def test_aggregate_regions_then_dmc(synth_md_filtered, tmp_path):
+    """Downstream `tl.dmc` runs on the region-aggregated store without errors."""
+    import epykit as ep
+
+    md = synth_md_filtered
+    chrom_bounds = (
+        pl.scan_parquet(f"{md.store}/sample=*/chrom=*/part-*.parquet")
+        .group_by("chrom")
+        .agg([pl.min("pos").alias("lo"), pl.max("pos").alias("hi")])
+        .collect()
+    )
+    bed_rows: list[tuple[str, int, int, str]] = []
+    for r in chrom_bounds.iter_rows(named=True):
+        lo, hi = int(r["lo"]), int(r["hi"])
+        step = max(1, (hi - lo) // 5)
+        for i in range(5):
+            bed_rows.append(
+                (r["chrom"], lo + i * step, lo + (i + 1) * step, f"{r['chrom']}_b{i}")
+            )
+    bed = _write_bed(tmp_path / "regions.bed", bed_rows)
+    ep.pp.aggregate_regions(md, str(bed), min_cpgs_per_region=1)
+    md.uns.pop("unite", None)
+    ep.pp.unite(md, type="intersect")
+    ep.tl.dmc(md, test="lr")
+    dmc = md.dmc
+    assert dmc is not None and len(dmc) > 0

@@ -421,7 +421,7 @@ class MethylData:
 
     def to_mudata(self, **kwargs):
         """Return a MuData with methylation as the ``'meth'`` modality."""
-        from .mudata_io import to_mudata
+        from .anndata_io import to_mudata
         return to_mudata(self, **kwargs)
 
     def to_methylkit_tabix(self, output_dir: str, samples=None):

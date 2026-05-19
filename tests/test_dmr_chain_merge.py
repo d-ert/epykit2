@@ -18,6 +18,8 @@ import pytest
 import epykit as ep
 from epykit.dmr import _DMR_EMPTY_SCHEMA, call_dmr_chain_merge
 
+pytestmark = pytest.mark.slow
+
 
 def _mk_dmc_frame(rows: list[dict]) -> pl.DataFrame:
     """Build a minimal DMC-shaped DataFrame for call_dmr_chain_merge."""

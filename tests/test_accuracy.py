@@ -30,6 +30,8 @@ from tests.conftest import (
     power_at_threshold,
 )
 
+pytestmark = pytest.mark.slow
+
 
 # Power / FDR thresholds. Calibrated against the medium fixture
 # (4 vs 4 samples, Deltabeta=0.40, cov~20, replicate_sd=0.03, ~75 k post-filter

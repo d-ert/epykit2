@@ -8,7 +8,12 @@ import numpy as np
 import polars as pl
 import pytest
 
+import matplotlib
+import matplotlib.pyplot as plt
+
 import epykit as ep
+
+matplotlib.use("Agg", force=True)
 
 
 # karyogram
@@ -132,3 +137,105 @@ def test_gene_body_metaplot_runs(synth_md_filtered, tmp_path):
     labels = [t.get_text() for t in ax.get_xticklabels()]
     assert "TSS" in labels and "TES" in labels
     assert ax.get_ylabel() == "Mean beta"
+
+
+# ---- visualization pack (merged from test_pl_pack.py) --------------------
+
+
+def test_pl_umap_returns_axes_or_skips(synth_md_filtered):
+    pytest.importorskip("umap")
+    md = synth_md_filtered
+    fig, ax = ep.pl.umap(md, n_neighbors=4, min_dist=0.3)
+    assert ax is not None
+
+
+def test_pl_sample_correlation_renders(synth_md_filtered):
+    md = synth_md_filtered
+    fig, ax = ep.pl.sample_correlation(md, method="spearman", cluster=False)
+    assert ax is not None
+    assert "qc_sample_correlation" in md.uns
+
+
+def test_pl_qc_dashboard_renders(synth_md_filtered):
+    md = synth_md_filtered
+    ep.tl.qc(md, run_sample_correlation=True)
+    fig, axes = ep.pl.qc_dashboard(md)
+    assert len(axes) >= 5
+
+
+def test_pl_dmr_boxplot_needs_dmr(synth_md_filtered):
+    md = synth_md_filtered
+    with pytest.raises(ValueError):
+        ep.pl.dmr_boxplot(md, top_n=3)
+    ep.tl.dmr(md, method="tile", chromosomes=["chr1"])
+    if len(md.uns.get("dmr", pl.DataFrame())) > 0:
+        fig, axes = ep.pl.dmr_boxplot(md, top_n=3)
+        assert len(axes) >= 1
+
+
+# ---- TSS metaplot (merged from test_pl_metaplot.py) ----------------------
+
+
+def _write_synthetic_gtf(path: Path, synth_md) -> Path:
+    """Write a small GTF whose TSS coordinates land inside the synthetic
+    chromosomes so the metaplot has real CpGs to bin.
+    """
+    chrom_positions = (
+        pl.scan_parquet(f"{synth_md.store}/sample=*/chrom=*/part-*.parquet")
+        .select(["chrom", "pos"])
+        .unique()
+        .group_by("chrom")
+        .agg([pl.col("pos").sort().alias("positions")])
+        .collect()
+    )
+    lines = ['##gtf-version 2']
+    gene_idx = 0
+    for row in chrom_positions.iter_rows(named=True):
+        chrom = row["chrom"]
+        positions = row["positions"]
+        if len(positions) < 6:
+            continue
+        for frac, strand in ((0.33, "+"), (0.66, "-")):
+            tss = int(positions[int(len(positions) * frac)])
+            start = tss + 1
+            end = tss + 1000
+            gene_idx += 1
+            attrs = (
+                f'gene_id "synth_gene_{gene_idx}"; '
+                f'gene_name "synth_gene_{gene_idx}";'
+            )
+            lines.append(
+                "\t".join([
+                    chrom, "synth", "gene", str(start), str(end), ".", strand, ".", attrs
+                ])
+            )
+            lines.append(
+                "\t".join([
+                    chrom, "synth", "exon", str(start), str(end), ".", strand, ".", attrs
+                ])
+            )
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+@pytest.mark.slow
+def test_tss_metaplot_smoke(synth_md_filtered, tmp_path):
+    gtf = _write_synthetic_gtf(tmp_path / "synth.gtf", synth_md_filtered)
+    fig, ax = ep.pl.tss_metaplot(
+        synth_md_filtered, str(gtf),
+        window_bp=2000, n_bins=20, group_by="group", max_genes=200,
+    )
+    assert len(ax.lines) >= synth_md_filtered.n_samples
+    assert ax.get_xlabel().startswith("Distance from TSS")
+    plt.close(fig)
+
+
+@pytest.mark.slow
+def test_tss_metaplot_no_group(synth_md_filtered, tmp_path):
+    gtf = _write_synthetic_gtf(tmp_path / "synth2.gtf", synth_md_filtered)
+    fig, ax = ep.pl.tss_metaplot(
+        synth_md_filtered, str(gtf),
+        window_bp=1500, n_bins=15, group_by=None, max_genes=200,
+    )
+    assert len(ax.lines) >= synth_md_filtered.n_samples
+    plt.close(fig)

@@ -22,6 +22,8 @@ from epykit.dmc import (
     combine_neighbour_pvalues,
 )
 
+pytestmark = pytest.mark.slow
+
 
 # --- Storey -----------------------------------------------------------------
 

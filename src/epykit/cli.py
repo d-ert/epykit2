@@ -8,8 +8,7 @@ recommended at n >= 2 replicates per group.
 CLI surface:
 * ``dmc`` -- per-CpG calling with ``--test {lr,score,glm,logit_t,welch_t,
   bb_lr,cmh,fisher}``, ``--min-samples-treatment`` / ``--min-samples-control``
-  filters (the older ``--min-samples-case`` is accepted as a deprecated alias),
-  and ``--allow-n1`` to opt into the (anti-conservative) Fisher fallback when
+  filters, and ``--allow-n1`` to opt into the (anti-conservative) Fisher fallback when
   there are fewer than 2 replicates per group.
 * ``dmr`` -- ``--method {tile,sliding_window}``. The tile path takes a
   methylstore + samplesheet and pools reads per tile; the sliding-window path
@@ -26,12 +25,7 @@ from . import filter, dmc
 
 
 def _add_min_samples_args(p: argparse.ArgumentParser, scope_help_prefix: str = "") -> None:
-    """Register ``--min-samples-treatment`` (canonical) + deprecated alias.
-
-    The legacy ``--min-samples-case`` is parsed into a separate hidden
-    attribute and resolved post-parse by :func:`_resolve_min_samples_case`
-    with a DeprecationWarning.
-    """
+    """Register ``--min-samples-treatment`` and ``--min-samples-control``."""
     p.add_argument(
         "--min-samples-treatment", type=int, default=0,
         dest="min_samples_treatment",
@@ -42,38 +36,11 @@ def _add_min_samples_args(p: argparse.ArgumentParser, scope_help_prefix: str = "
         ),
     )
     p.add_argument(
-        "--min-samples-case", type=int, default=None,
-        dest="_min_samples_case_legacy",
-        help=argparse.SUPPRESS,  # deprecated alias; warns at runtime
-    )
-    p.add_argument(
         "--min-samples-control", type=int, default=0,
         dest="min_samples_control",
         help=f"{scope_help_prefix}Per-site minimum number of control samples "
              f"with non-zero coverage.",
     )
-
-
-def _resolve_min_samples_case(args: argparse.Namespace) -> None:
-    """Promote legacy ``--min-samples-case`` to ``min_samples_treatment``.
-
-    Emits a DeprecationWarning when the legacy flag was used; raises
-    SystemExit if both are passed (ambiguous).
-    """
-    legacy = getattr(args, "_min_samples_case_legacy", None)
-    if legacy is None:
-        return
-    warnings.warn(
-        "--min-samples-case is deprecated; use --min-samples-treatment.",
-        DeprecationWarning, stacklevel=2,
-    )
-    # Only treat the canonical flag as "explicitly set" when it differs from
-    # the default of 0; otherwise the user just passed the legacy alias.
-    if args.min_samples_treatment not in (0, None):
-        raise SystemExit(
-            "error: pass either --min-samples-treatment or --min-samples-case, not both"
-        )
-    args.min_samples_treatment = int(legacy)
 
 
 def _read_samplesheet_groups(samplesheet: str, treatment_group: str, control_group: str):
@@ -156,7 +123,6 @@ def _cli_n1_and_footgun_checks(args, unit: str = "sites") -> None:
 
 def _cmd_dmc(args: argparse.Namespace):
     """Handler for 'dmc' subcommand."""
-    _resolve_min_samples_case(args)
 
     # formula/contrast path uses ALL samples from the
     # samplesheet rather than binary case/control. We build a tiny
@@ -248,7 +214,6 @@ def _cmd_dmr(args: argparse.Namespace):
                 "--treatment-group and --control-group."
             )
 
-        _resolve_min_samples_case(args)
         treatment_samples, control_samples = _read_samplesheet_groups(
             args.samplesheet, args.treatment_group, args.control_group
         )
@@ -552,7 +517,6 @@ def main():
         "--test",
         choices=[
             "lr", "score", "glm", "logit_t", "welch_t",
-            "beta_binomial",  # deprecated alias for welch_t
             "bb_lr", "cmh", "fisher",
         ],
         default="lr",
@@ -567,8 +531,7 @@ def main():
             "glm -- Binomial GLM with covariates (requires a design via "
             "--formula). "
             "logit_t -- Welch t on logit(beta), variance-stabilising fallback. "
-            "welch_t -- Welch t on raw betas (formerly 'beta_binomial'). "
-            "beta_binomial -- Deprecated alias for welch_t. "
+            "welch_t -- Welch t on raw betas. "
             "bb_lr -- True quasi-binomial LRT on a binary-treatment GLM with "
             "per-site dispersion. "
             "cmh -- Cochran-Mantel-Haenszel on per-pair strata. "
@@ -644,7 +607,6 @@ def main():
         "--test",
         choices=[
             "lr", "score", "glm", "logit_t", "welch_t",
-            "beta_binomial",  # deprecated alias for welch_t
             "bb_lr", "cmh", "fisher",
         ],
         default="lr",

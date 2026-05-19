@@ -306,7 +306,6 @@ def to_anndata(
     layer: str = "beta",
     populate_layers: bool = False,
     dtype: str = "float32",
-    use_smoothed: bool = False,
 ):
     """Materialise a MethylData as an AnnData object.
 
@@ -335,21 +334,12 @@ def to_anndata(
         (4 bytes / cell). Use ``"float64"`` if you want to feed the
         result into algorithms that demand it; halves the per-sample row
         fill speed and doubles RAM.
-    use_smoothed : bool
-        Reserved for future use; currently raises NotImplementedError.
-
     Returns
     -------
     anndata.AnnData
         Shape ``(n_samples, n_sites)`` matching ``md.obs`` x the united
         site axis.
     """
-    if use_smoothed:
-        raise NotImplementedError(
-            "to_anndata(use_smoothed=True) not implemented yet -- the smoothed "
-            "store has a per-sample beta grid, not raw counts."
-        )
-
     try:
         import anndata as ad
     except ImportError as exc:
@@ -434,4 +424,37 @@ def to_anndata(
     return adata
 
 
-__all__ = ["to_anndata"]
+def to_mudata(
+    md,
+    *,
+    layer: str = "beta",
+    other_modalities: dict | None = None,
+):
+    """Return a ``MuData`` with methylation as ``'meth'`` modality.
+
+    Parameters
+    ----------
+    md : MethylData
+        Must be ``pp.unite``-d first (same precondition as ``to_anndata``).
+    layer : str
+        Which methylation matrix to embed as the methylation modality's
+        ``X``. Forwarded to :func:`to_anndata`.
+    other_modalities : dict[str, AnnData], optional
+        Additional modalities to bundle into the MuData.
+    """
+    try:
+        import mudata as md_lib  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "mudata is required for to_mudata. "
+            "Install with: pip install 'epykit[anndata]'"
+        ) from exc
+
+    adata = to_anndata(md, layer=layer)
+    modalities = {"meth": adata}
+    if other_modalities:
+        modalities.update(other_modalities)
+    return md_lib.MuData(modalities)
+
+
+__all__ = ["to_anndata", "to_mudata"]

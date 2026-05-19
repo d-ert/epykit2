@@ -10,3 +10,6 @@ __pycache__/
 dist/
 build/
 referenceScriptsFromAnndataDependentVersion/
+plan2*/
+logs/
+figures/

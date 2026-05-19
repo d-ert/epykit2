@@ -22,9 +22,8 @@ Tests
                   by binomial sampling chance. Use ``lr`` for trustworthy
                   inference; reach for ``logit_t`` only when count-model
                   assumptions are doubtful.
-  welch_t       -- Welch t on raw betas (formerly ``"beta_binomial"`` --
-                  see the rename DeprecationWarning). Same boundary-beta
-                  caveat as ``logit_t``.
+  welch_t       -- Welch t on raw betas. Same boundary-beta caveat as
+                  ``logit_t``.
   bb_lr         -- True quasi-binomial LRT via a full per-site GLM on a
                   binary-treatment design. The honest "fit-the-model"
                   alternative to ``welch_t``; slower than ``lr`` and
@@ -71,10 +70,6 @@ _EMPTY_SCHEMA = {
     "meth_diff_ci_lo":   pl.Float32,
     "meth_diff_ci_hi":   pl.Float32,
 }
-
-# One-shot deprecation flag for test="beta_binomial" -> "welch_t" rename.
-_WELCH_T_RENAME_WARNED = False
-
 
 def _epykit_version() -> str:
     try:
@@ -200,18 +195,6 @@ def _resolve_dmc_store_dir(
 
 def _canonicalise_test_name(test: str) -> str:
     """Map deprecated test names to their canonical form."""
-    global _WELCH_T_RENAME_WARNED
-    if test == "beta_binomial":
-        if not _WELCH_T_RENAME_WARNED:
-            _WELCH_T_RENAME_WARNED = True
-            warnings.warn(
-                "test='beta_binomial' is a misnomer (it runs Welch t on raw "
-                "betas, not a beta-binomial GLM) and is deprecated in favour "
-                "of test='welch_t'. For a true beta-binomial LRT use "
-                "test='bb_lr'.",
-                DeprecationWarning, stacklevel=3,
-            )
-        return "welch_t"
     return test
 
 _TEST_RECOMMENDATIONS = {
@@ -222,38 +205,6 @@ _TEST_RECOMMENDATIONS = {
 # Shared epsilon for boundary clipping in logit / log-OR computations.
 _BETA_EPSILON: float = 1e-6
 
-
-def _resolve_treatment_aliases(
-    samples_treatment, samples_case, min_samples_treatment, min_samples_case
-):
-    """Resolve deprecated samples_case / min_samples_case kwargs.
-
-    Returns ``(samples_treatment, min_samples_treatment)`` with the
-    deprecation warning fired iff the legacy alias was used.
-    """
-    if samples_case is not None:
-        warnings.warn(
-            "samples_case is deprecated; use samples_treatment.",
-            DeprecationWarning, stacklevel=3,
-        )
-        if samples_treatment is not None:
-            raise TypeError("Pass either samples_treatment or samples_case, not both")
-        samples_treatment = samples_case
-    if samples_treatment is None:
-        raise TypeError("Missing required argument: samples_treatment")
-    if min_samples_case is not None:
-        warnings.warn(
-            "min_samples_case is deprecated; use min_samples_treatment.",
-            DeprecationWarning, stacklevel=3,
-        )
-        if min_samples_treatment is not None:
-            raise TypeError(
-                "Pass either min_samples_treatment or min_samples_case, not both"
-            )
-        min_samples_treatment = min_samples_case
-    if min_samples_treatment is None:
-        min_samples_treatment = 0
-    return samples_treatment, min_samples_treatment
 
 
 # Core statistical tests (public, used by unit tests)
@@ -1160,7 +1111,7 @@ def _beta_binom_mom_from_welford(
     # (SE = 0, t genuinely undefined). See the matching block in
     # _beta_binom_mom_from_welford_logit for the rationale: the
     # *either*-zero version killed real signal at boundary beta.
-    # beta_binomial is treated as a weak fallback -- use ``test="lr"``
+    # welch_t is treated as a weak fallback -- use ``test="lr"``
     # for trustworthy inference.
     both_zero_var = (
         (n_valid_case >= 2) & (M2_case <= 0.0)
@@ -1371,7 +1322,7 @@ def _process_one_chromosome(
     Peak memory is O(n_sites) regardless of sample count for the
     Fisher and Welford paths:
 
-        fisher / logit_t / beta_binomial:
+        fisher / logit_t / welch_t:
             4 int64 running sums (Fisher) OR
             6 arrays per group (Welford: float64 mean, float64 M2, int32 n_valid)
 
@@ -1392,7 +1343,7 @@ def _process_one_chromosome(
         (case_i, ctrl_j) pair. Preserves between-replicate variability
         because each replicate contributes its own coverage marginal.
 
-    logit_t / beta_binomial
+    logit_t / welch_t
         Welch t-test on per-replicate beta values (logit-transformed for
         `logit_t`). Welford accumulators give per-site variance without
         materialising the count matrix.
@@ -1998,16 +1949,16 @@ def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
             "   Statistical power is very low. Many true positives will be missed.\n"
             "   Recommendation: Use n>=3 for reliable differential methylation calling."
         )
-    elif min_n <= 2 and test in ("welch_t", "beta_binomial"):
+    elif min_n <= 2 and test == "welch_t":
         logger.warning(
             "[WARN]  CRITICAL: welch_t with n=%d per group produces degenerate "
             "Welch-Satterthwaite DOF and near-zero power. "
             "Use test='lr' instead.",
             min_n,
         )
-    elif min_n < 6 and test in ("welch_t", "beta_binomial"):
+    elif min_n < 6 and test == "welch_t":
         logger.warning(
-            "[WARN]  Welch t (test='welch_t', formerly 'beta_binomial') with "
+            "[WARN]  Welch t with "
             "n<6 may have poor variance estimates.\n"
             "   Consider using test='lr' (recommended) or test='bb_lr' "
             "(true quasi-binomial LRT)."
@@ -2062,8 +2013,6 @@ def process_chromosomes_dmc(
     samples_all_ordered: Optional[list[str]] = None,
     group_labels_per_sample: Optional[list[str]] = None,
     *,
-    samples_case: Optional[list[str]] = None,       # deprecated alias
-    min_samples_case: Optional[int] = None,         # deprecated alias
     backend: str = "sequential",
     n_workers: Optional[int] = None,
     glm_backend: str = "cpu",
@@ -2080,8 +2029,8 @@ def process_chromosomes_dmc(
     ----------
     methylstore_path : str
         Path to filtered partitioned Parquet methylstore.
-    samples_case, samples_control : list[str]
-        Sample identifiers for case and control groups.
+    samples_treatment, samples_control : list[str]
+        Sample identifiers for treatment and control groups.
     test : {"lr", "score", "fisher", "cmh", "logit_t", "welch_t", "bb_lr"}
         Statistical test.
             "lr"       (default) -- Quasi-binomial likelihood-ratio chi-square
@@ -2097,10 +2046,8 @@ def process_chromosomes_dmc(
                                    Welford. Variance-stabilising fallback
                                    when count-model assumptions are
                                    doubtful (e.g. very low coverage).
-            "welch_t"            -- Welch t on raw betas (renamed from
-                                   "beta_binomial" -- see the deprecation
-                                   warning). Same boundary-beta caveat as
-                                   logit_t.
+            "welch_t"            -- Welch t on raw betas. Same boundary-beta
+                                   caveat as logit_t.
             "bb_lr"              -- True quasi-binomial LRT via a full per-
                                    site GLM on a binary-treatment design.
                                    Slow, but the honest "fit-the-model"
@@ -2116,7 +2063,7 @@ def process_chromosomes_dmc(
         (intersection / inner join).
         If False, test all sites covered in at least one sample
         (union / outer join).
-    min_samples_case, min_samples_control : int
+    min_samples_treatment, min_samples_control : int
         Per-site minimum number of replicates with non-zero coverage
         required in each group. Sites failing the threshold have their
         p-value masked to NaN before FDR correction. Use this with
@@ -2149,17 +2096,15 @@ def process_chromosomes_dmc(
         unweighted per-replicate mean (Welford). The two differ when
         per-replicate coverage is uneven.
     """
-    samples_treatment, min_samples_treatment = _resolve_treatment_aliases(
-        samples_treatment, samples_case, min_samples_treatment, min_samples_case
-    )
+    if samples_treatment is None:
+        raise TypeError("Missing required argument: samples_treatment")
     if samples_control is None:
         raise TypeError("Missing required argument: samples_control")
-    # Internal body keeps the original names.
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
     samples_case = samples_treatment
     min_samples_case = min_samples_treatment
 
-    # canonicalise legacy test names before any branching so that
-    # downstream code only ever sees the new names.
     test = _canonicalise_test_name(test)
 
     store       = Path(methylstore_path)

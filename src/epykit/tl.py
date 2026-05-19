@@ -99,32 +99,6 @@ def _check_n1_and_union_footgun(
         )
 
 
-def _resolve_min_samples_aliases(
-    min_samples_treatment: int | None,
-    min_samples_case: int | None,
-    default: int = 0,
-) -> int:
-    """Accept the deprecated ``min_samples_case`` kwarg with a DeprecationWarning.
-
-    Returns the resolved canonical value. Either both None (use default), one
-    set, or -- illegally -- both set (TypeError).
-    """
-    import warnings
-    if min_samples_case is not None:
-        warnings.warn(
-            "min_samples_case is deprecated; use min_samples_treatment.",
-            DeprecationWarning, stacklevel=3,
-        )
-        if min_samples_treatment is not None:
-            raise TypeError(
-                "Pass either min_samples_treatment or min_samples_case, not both"
-            )
-        return int(min_samples_case)
-    if min_samples_treatment is None:
-        return default
-    return int(min_samples_treatment)
-
-
 def _auto_test_simple(md: MethylData, allow_n1: bool = False) -> str:
     """Pick a sensible test based on group size.
 
@@ -292,7 +266,6 @@ def dmc(
     perm_seed: int = 42,
     perm_n_jobs: int = 1,
     *,
-    min_samples_case: int | None = None,  # deprecated alias
     backend: str = "sequential",
     n_workers: int | None = None,
     glm_backend: str = "cpu",
@@ -374,7 +347,7 @@ def dmc(
         treatment/control sample lists.
     test : str
         One of ``"auto"``, ``"lr"``, ``"score"``, ``"logit_t"``,
-        ``"welch_t"`` (formerly ``"beta_binomial"`` -- deprecated alias),
+        ``"welch_t"`` (Welch t on raw betas),
         ``"bb_lr"`` (true quasi-binomial LRT), ``"cmh"``, ``"fisher"``,
         ``"glm"``. ``"auto"`` resolves to ``"fisher"`` at n<2 and ``"lr"``
         (the recommended default) at n>=2.
@@ -418,12 +391,9 @@ def dmc(
         that union-introduced zero-coverage rows aren't treated as real
         observations.
 
-        ``min_samples_case`` is accepted as a deprecated alias for
-        ``min_samples_treatment`` (S9 naming unification).
     """
-    min_samples_treatment = _resolve_min_samples_aliases(
-        min_samples_treatment, min_samples_case, default=0,
-    )
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
 
     # --- New contrast / multi-group path -------------------------------------
     if formula is not None or contrast is not None:
@@ -531,7 +501,6 @@ def dmc(
                         "unite": unite,
                         "min_samples_treatment": min_samples_treatment,
                         "min_samples_control": min_samples_control,
-                        "min_samples_case": min_samples_treatment,
                         "dispersion": dispersion,
                         "reference": reference,
                         "empirical_fdr": empirical_fdr,
@@ -668,9 +637,6 @@ def dmc(
         "unite": unite,
         "min_samples_treatment": min_samples_treatment,
         "min_samples_control": min_samples_control,
-        # Back-compat alias: legacy readers that look up "min_samples_case"
-        # still find the value; new code should read "min_samples_treatment".
-        "min_samples_case": min_samples_treatment,
         "dispersion": dispersion,
         "reference": reference,
         "empirical_fdr": empirical_fdr,
@@ -856,7 +822,6 @@ def _run_dmc_contrast(
         "treatment_col": treatment_col,
         "min_samples_treatment": min_samples_treatment,
         "min_samples_control": min_samples_control,
-        "min_samples_case": min_samples_treatment,
         "dispersion": dispersion,
         "reference": reference,
         "last_key": key,
@@ -904,7 +869,6 @@ def dmr(
     perm_seed: int = 42,
     perm_n_jobs: int = 1,
     *,
-    min_samples_case: int | None = None,  # deprecated alias
     backend: str = "sequential",
     n_workers: int | None = None,
     merge_adjacent: bool = True,
@@ -962,9 +926,7 @@ def dmr(
     chromosomes : list[str], optional
         Restrict tile-method processing to these chromosomes.
     min_samples_treatment, min_samples_control : int
-        Per-tile sample-count guard for tile-method .
-        ``min_samples_case`` is accepted as a deprecated alias for
-        ``min_samples_treatment`` (S9 naming unification).
+        Per-tile sample-count guard for tile-method.
     window_bp, step_bp, min_cpgs, min_sites_significant : int
         Sliding-window method options.
     alpha : float
@@ -982,9 +944,8 @@ def dmr(
         to the uncorrected p-value, which was not FDR-controlled across the
         DMR set.
     """
-    min_samples_treatment = _resolve_min_samples_aliases(
-        min_samples_treatment, min_samples_case, default=0,
-    )
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
     if method == "tile":
         _check_n1_and_union_footgun(
             md, allow_n1, min_samples_treatment, min_samples_control, unit="tiles",
@@ -1090,8 +1051,6 @@ def dmr(
             "min_mean_qvalue": min_mean_qvalue,
             "min_samples_treatment": min_samples_treatment,
             "min_samples_control": min_samples_control,
-            # Back-compat alias for legacy readers.
-            "min_samples_case": min_samples_treatment,
             "unite": unite,
             "dispersion": dispersion,
             "reference": reference,

@@ -21,6 +21,8 @@ import pytest
 import epykit as ep
 from epykit._smoothed_store import build_smoothed_pseudo_count_store
 
+pytestmark = pytest.mark.slow
+
 
 # ---- 1. Error when called without prior pp.smooth ------------------
 

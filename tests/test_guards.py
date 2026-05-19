@@ -133,26 +133,15 @@ def test_intersect_mode_never_warns_about_union(synth_md_filtered):
     assert union_warns == []
 
 
-# S9: deprecated min_samples_case kwarg on tl.dmc / tl.dmr
+# Removed min_samples_case kwarg
 
 
-def test_min_samples_case_kwarg_warns_on_dmc(synth_md_filtered):
-    """``tl.dmc(min_samples_case=...)`` still works but emits a DeprecationWarning."""
+def test_min_samples_case_kwarg_rejected_on_dmc(synth_md_filtered):
+    """``tl.dmc(min_samples_case=...)`` was removed; raises TypeError."""
     import epykit as ep
-    with pytest.warns(DeprecationWarning, match=r"min_samples_case is deprecated"):
+    with pytest.raises(TypeError):
         ep.tl.dmc(synth_md_filtered, test="lr",
                   min_samples_case=2, min_samples_control=2)
-
-
-def test_min_samples_case_and_treatment_together_raises(synth_md_filtered):
-    """Passing both the canonical kwarg and the deprecated alias is a TypeError."""
-    import epykit as ep
-    with pytest.raises(TypeError, match=r"either min_samples_treatment or min_samples_case"):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            ep.tl.dmc(synth_md_filtered, test="lr",
-                      min_samples_treatment=1, min_samples_case=2,
-                      min_samples_control=2)
 
 
 
