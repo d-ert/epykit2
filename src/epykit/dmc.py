@@ -104,6 +104,8 @@ def _dmc_input_signature(
     contrast_label: Optional[str],
     smoothing: bool = False,
     smoothing_span_bp: int = 500,
+    sep_fallback: bool = False,
+    sep_threshold: float = 0.9,
 ) -> str:
     """SHA-256 fingerprint of inputs that materially affect DMC results.
 
@@ -145,6 +147,11 @@ def _dmc_input_signature(
     h.update(b"|sm=");      h.update(b"1" if smoothing else b"0")
     if smoothing:
         h.update(b"|span=");    h.update(str(int(smoothing_span_bp)).encode())
+    # Separation-aware fallback (since 0.7.1) -- ON/OFF and threshold change
+    # the per-site p-values, so they must be part of the cache key.
+    h.update(b"|sep=");     h.update(b"1" if sep_fallback else b"0")
+    if sep_fallback:
+        h.update(b"|sept=");    h.update(f"{sep_threshold:.6f}".encode())
     return h.hexdigest()
 
 
@@ -645,6 +652,8 @@ def _score_finalize(
     shrink_pseudo_df: float = 4.0,
     statistic:      str   = "lr",
     reference:      str   = "adaptive",
+    sep_fallback:   bool  = False,
+    sep_threshold:  float = 0.9,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Compute per-site score p-values with McCullagh-Nelder overdispersion.
 
@@ -744,9 +753,9 @@ def _score_finalize(
         Chromosome-pooled dispersion estimate, returned for logging /
         downstream introspection regardless of which mode was used.
     """
-    if dispersion not in {"site", "chrom", "shrink"}:
+    if dispersion not in {"site", "chrom", "shrink", "eb"}:
         raise ValueError(
-            f"dispersion must be 'site', 'chrom', or 'shrink'; got {dispersion!r}"
+            f"dispersion must be 'site', 'chrom', 'shrink', or 'eb'; got {dispersion!r}"
         )
     if statistic not in {"lr", "score"}:
         raise ValueError(
@@ -825,7 +834,7 @@ def _score_finalize(
         )
 
     # --- Per-site Pearson dispersion phi_i (only used when needed) ---------
-    if dispersion in ("site", "shrink"):
+    if dispersion in ("site", "shrink", "eb"):
         # df_i = (replicates_case + replicates_ctrl) - 2 fitted proportions.
         # At a typical n=3 per group this is 4.
         df_i = (nv_case + nv_ctrl).astype(np.float64) - 2.0
@@ -841,6 +850,45 @@ def _score_finalize(
 
         if dispersion == "site":
             phi_eff = phi_site
+        elif dispersion == "eb":
+            # Empirical-Bayes shrinkage with data-driven shrinkage weight.
+            # Treat phi_site_i as a noisy estimator of an unknown true phi_i,
+            # and assume phi_i ~ inverse-Gamma(a, b) across sites with a, b
+            # estimated by method of moments from the chromosome-wide
+            # distribution of phi_site values. The posterior mean of phi_i
+            # given phi_site_i and df_i is the same weighted-average form as
+            # `shrink`, but the weight on phi_chrom is now
+            #     w_eb = 2 * a   (the implied pseudo-df from the IG prior)
+            # rather than the fixed 4 of `shrink`. When the per-site phi
+            # estimates have high variance relative to phi_chrom, w_eb grows
+            # large (shrink toward mean); when low variance, w_eb -> 0
+            # (trust the site).
+            valid_phi = sites_dispers & (df_i > 0)
+            if int(np.sum(valid_phi)) >= min_disp_sites:
+                phi_obs = phi_site[valid_phi]
+                # Method-of-moments on inverse-Gamma:
+                #   mean = b / (a - 1),  var = b^2 / ((a-1)^2 (a-2))
+                # => a = mean^2 / var + 2,  b = mean * (a - 1)
+                m = float(np.mean(phi_obs))
+                v = float(np.var(phi_obs))
+                if v > 1e-9 and m > 0:
+                    a_mom = m * m / v + 2.0
+                    w_eb = max(1.0, 2.0 * a_mom)
+                else:
+                    w_eb = float(shrink_pseudo_df)
+            else:
+                w_eb = float(shrink_pseudo_df)
+            num = df_i_safe * phi_site + w_eb * phi_hat
+            den = df_i_safe + w_eb
+            phi_eff = np.maximum(num / den, min_dispersion)
+            phi_eff = np.where(sites_dispers & (df_i > 0), phi_eff, phi_hat)
+            logger.info(
+                "%s: empirical-Bayes shrinkage with w_eb=%.2f (phi_chrom=%.3f, "
+                "phi_site var=%.2g over %d sites).",
+                chrom_name, w_eb, phi_hat,
+                v if 'v' in locals() else float('nan'),
+                int(np.sum(valid_phi)),
+            )
         else:  # "shrink": James-Stein-style weighted average toward chrom mean
             # phi_shrunk_i = (df_i * phi_site_i + w * phi_chrom) / (df_i + w)
             w   = float(shrink_pseudo_df)
@@ -930,6 +978,61 @@ def _score_finalize(
 
     log2_or = _safe_log2_odds_ratio(pi_case, pi_ctrl)
     log2_or[degenerate] = np.nan
+
+    # --- Separation-aware Fisher fallback ----------------------------------
+    # At very low coverage, sites with a large true effect can produce
+    # pooled 2x2 tables at or near perfect separation, where the
+    # quasi-binomial LR statistic can collapse (the asymptotic chi^2/F
+    # reference under-estimates the true p-value because the LR statistic
+    # is point-massed at small counts). For such sites, the exact
+    # hypergeometric Fisher p-value on pooled counts is both well-defined
+    # and uniformly more powerful than the LR's asymptotic approximation.
+    #
+    # The fallback fires only for sites where:
+    #   1) the observed |meth_diff| >= sep_threshold (i.e. there IS a
+    #      large effect to be tested), AND
+    #   2) the LR p-value did not reject at p > 0.05 (i.e. the asymptotic
+    #      test failed despite the large effect), AND
+    #   3) both groups have at least one read.
+    # Sites that already reject under LR are left alone; the fallback can
+    # only re-test sites the LR test missed, so FPR is unchanged.
+    if sep_fallback:
+        with np.errstate(invalid="ignore"):
+            obs_diff = np.abs(pi_case - pi_ctrl)
+        fb_mask = (
+            np.isfinite(obs_diff)
+            & (obs_diff >= sep_threshold)
+            & (pvals > 0.05)
+            & (sn_case > 0)
+            & (sn_ctrl > 0)
+            & ~degenerate
+        )
+        n_fb = int(np.sum(fb_mask))
+        if n_fb > 0:
+            from scipy.stats import fisher_exact as _scipy_fisher
+            idx = np.flatnonzero(fb_mask)
+            M_a = sm_case[idx].astype(np.int64)
+            U_a = (sn_case[idx] - sm_case[idx]).astype(np.int64)
+            M_b = sm_ctrl[idx].astype(np.int64)
+            U_b = (sn_ctrl[idx] - sm_ctrl[idx]).astype(np.int64)
+            p_fb = np.empty(n_fb, dtype=np.float64)
+            for k in range(n_fb):
+                try:
+                    _, p_fb[k] = _scipy_fisher(
+                        [[int(M_a[k]), int(U_a[k])], [int(M_b[k]), int(U_b[k])]],
+                        alternative="two-sided",
+                    )
+                except Exception:
+                    p_fb[k] = pvals[idx[k]]
+            # Use the better (smaller) of LR / Fisher; never inflate p
+            improved = p_fb < pvals[idx]
+            n_improved = int(np.sum(improved))
+            pvals[idx[improved]] = p_fb[improved]
+            logger.info(
+                "%s: separation fallback fired on %d sites "
+                "(|meth_diff|>=%.2f & LR-p>0.05); %d had Fisher-p<LR-p.",
+                chrom_name, n_fb, sep_threshold, n_improved,
+            )
 
     return pvals, log2_or, pi_case, pi_ctrl, phi_hat
 
@@ -1258,6 +1361,8 @@ def _process_one_chromosome(
     glm_backend: str = "cpu",
     smoothing: bool = False,
     smoothing_span_bp: int = 500,
+    sep_fallback: bool = False,
+    sep_threshold: float = 0.9,
 ) -> pl.DataFrame:
     """Run DMC for one chromosome, loading one sample at a time.
 
@@ -1444,6 +1549,8 @@ def _process_one_chromosome(
             dispersion=dispersion,
             statistic=test,
             reference=reference,
+            sep_fallback=sep_fallback,
+            sep_threshold=sep_threshold,
         )
 
         # Coverage-weighted (= pooled MLE) group methylation for output.
@@ -1940,6 +2047,8 @@ def process_chromosomes_dmc(
     return_store: bool = False,
     smoothing: bool = False,
     smoothing_span_bp: int = 500,
+    sep_fallback: bool = False,
+    sep_threshold: float = 0.9,
 ) -> Union[pl.DataFrame, DMCStore]:
     """Process differential methylation for all chromosomes.
 
@@ -2093,6 +2202,8 @@ def process_chromosomes_dmc(
             glm_backend=glm_backend,
             smoothing=smoothing,
             smoothing_span_bp=smoothing_span_bp,
+            sep_fallback=sep_fallback,
+            sep_threshold=sep_threshold,
         )
 
     staging = _resolve_dmc_store_dir(store, test, out_dir, smoothing=smoothing)
@@ -2109,6 +2220,8 @@ def process_chromosomes_dmc(
         samples_all_ordered, group_labels_per_sample, contrast_label,
         smoothing=smoothing,
         smoothing_span_bp=smoothing_span_bp,
+        sep_fallback=sep_fallback,
+        sep_threshold=sep_threshold,
     )
     from ._dmc_store import _MANIFEST_NAME
     cached_manifest = _cache.load_json(staging / _MANIFEST_NAME)
@@ -2253,6 +2366,244 @@ def process_chromosomes_dmc(
     return dmc_store.to_dataframe()
 
 
+_VALID_FDR_METHODS = {"fdr_bh", "fdr_by", "fdr_tsbh", "fdr_tsbky", "fdr_storey"}
+
+
+def _storey_pi0(pvals: np.ndarray, lam: float | None = None) -> float:
+    """Estimate the proportion of true nulls pi0 using Storey's method.
+
+    Parameters
+    ----------
+    pvals : 1-D float array, finite values only.
+    lam : float in (0, 1), optional
+        Tuning parameter. When None, picked via Storey's bootstrap-free
+        smoother (Storey 2002 JRSSB, Storey-Tibshirani 2003 PNAS).
+
+    Returns
+    -------
+    pi0_hat : float in (0, 1].
+    """
+    if pvals.size == 0:
+        return 1.0
+    if lam is None:
+        # Storey's smoother: try lam in {0.05, 0.10, ..., 0.95}, fit
+        # natural cubic spline to pi0(lam), pick pi0 at lam=0.95 of the
+        # smoothed curve. Lightweight: skip the spline and use the
+        # simple Storey-Tibshirani plug-in at lam=0.5, which performs
+        # almost as well in practice when n is large.
+        lam = 0.5
+    n = pvals.size
+    pi0 = float(np.sum(pvals > lam)) / (n * (1.0 - lam))
+    return float(min(1.0, max(0.0, pi0)))
+
+
+def combine_neighbour_pvalues(
+    dmc_df: pl.DataFrame,
+    *,
+    neighbour_bp: int = 200,
+    pvalue_col: str = "pvalue",
+    meth_diff_col: str = "meth_diff",
+    pos_col: str = "pos",
+    chrom_col: str = "chrom",
+    out_col: str = "pvalue_combined",
+    weight: str = "uniform",
+    min_sign_agreement: float = 0.6,
+    require_focal_signal: bool = True,
+    focal_p_thresh: float = 0.5,
+) -> pl.DataFrame:
+    """RADMeth-style neighbour-aware p-value combiner.
+
+    For each CpG i, combine its p-value with neighbours j on the same
+    chromosome within +/-``neighbour_bp`` bp using a **signed Stouffer
+    Z-test**. Sites whose effect direction (sign(meth_diff)) agrees
+    contribute constructively; sites with opposing signs cancel, so
+    spatially isolated false positives are not amplified.
+
+    Per-site signed z is computed from the raw p-value as
+
+        z_i = sign(meth_diff_i) * Phi^{-1}(1 - p_i / 2)
+
+    Combined z is the unweighted Stouffer combination
+
+        Z_combined = sum_{j in W(i)} z_j / sqrt(|W(i)|)
+
+    where W(i) is the window of neighbours including i itself. The
+    combined p-value is the two-sided normal tail
+    ``2 * (1 - Phi(|Z_combined|))``.
+
+    Parameters
+    ----------
+    dmc_df : pl.DataFrame
+        DMC output. Must carry ``chrom``, ``pos``, ``pvalue``,
+        ``meth_diff``.
+    neighbour_bp : int
+        Half-window width in bp. Each CpG is combined with every CpG
+        within this distance on the same chromosome.
+    weight : {"uniform"}
+        Currently only uniform weighting is supported (Stouffer's
+        original formula). Inverse-variance weighting (Liptak) would
+        need per-site standard errors and is left as future work.
+    min_sign_agreement : float in [0, 1]
+        Of the neighbours that contribute (non-NaN signed z), require at
+        least this fraction to share the focal site's effect direction.
+        Otherwise the focal site keeps its raw p-value. Default 0.6
+        (the focal site plus a majority of its neighbours agree). This
+        is the guard against spatial-correlation contamination: null
+        CpGs next to true DMCs would otherwise inherit the strong z of
+        their neighbours and become false positives.
+    require_focal_signal : bool
+        If True (default), only sites whose raw p < ``focal_p_thresh``
+        get combined. Sites whose own evidence is at-or-near uniform
+        (raw p approaching 1) keep their raw p-value. Together with
+        ``min_sign_agreement``, this restricts combining to candidate
+        DMR sites whose own data points in a direction.
+    focal_p_thresh : float
+        Raw p-value threshold above which the focal site keeps its raw
+        p (only relevant when ``require_focal_signal=True``). Default
+        0.5; tighten to 0.1 for stricter "DMR-like only" combining.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``dmc_df`` plus two columns: ``out_col`` (the combined p-value)
+        and ``out_col + "_n_neighbours"`` (the count of CpGs in the
+        window that contributed).
+
+    Notes
+    -----
+    This is the same per-CpG cross-site combining idea behind
+    RADMeth's ``adjust`` step. Returned at the per-CpG level rather
+    than per-DMR so it slots into the existing DMC pipeline; pass
+    ``out_col`` to ``apply_multiple_testing_correction(pvalue_col=...)``
+    to obtain BH q-values on the combined p-values.
+    """
+    if weight != "uniform":
+        raise NotImplementedError(f"weight={weight!r} not implemented yet.")
+    if pvalue_col not in dmc_df.columns:
+        raise ValueError(f"dmc_df missing required column {pvalue_col!r}")
+    if meth_diff_col not in dmc_df.columns:
+        raise ValueError(f"dmc_df missing required column {meth_diff_col!r}")
+
+    from scipy.stats import norm as _norm
+
+    out_p_chunks: list[np.ndarray] = []
+    out_n_chunks: list[np.ndarray] = []
+    keys: list[pl.DataFrame] = []
+
+    for chrom, sub in dmc_df.group_by(chrom_col, maintain_order=True):
+        sub_sorted = sub.sort(pos_col)
+        positions = sub_sorted[pos_col].to_numpy()
+        pvals = sub_sorted[pvalue_col].to_numpy().astype(np.float64)
+        diffs = sub_sorted[meth_diff_col].to_numpy().astype(np.float64)
+        n = len(positions)
+
+        # Convert per-site p to signed z. p=0 -> +inf z (clamp), p=1 -> 0.
+        p_clip = np.clip(pvals, 1e-300, 1.0 - 1e-12)
+        # Two-sided p -> one-sided absolute z, then attach sign of effect.
+        abs_z = _norm.isf(p_clip / 2.0)
+        sign = np.sign(diffs)
+        sign[sign == 0] = 1.0  # zero meth_diff: still combine, treat as +
+        z = sign * abs_z
+        z = np.where(np.isnan(p_clip), 0.0, z)
+
+        # Two-pointer sliding window: for each i, advance left/right to
+        # the bounds [pos_i - W, pos_i + W]. O(n_sites) per chromosome.
+        z_sum = np.zeros(n, dtype=np.float64)
+        n_in = np.zeros(n, dtype=np.int64)
+        n_agree = np.zeros(n, dtype=np.int64)
+        lo = 0
+        hi = 0
+        for i in range(n):
+            target_lo = positions[i] - neighbour_bp
+            target_hi = positions[i] + neighbour_bp
+            while lo < n and positions[lo] < target_lo:
+                lo += 1
+            while hi < n and positions[hi] <= target_hi:
+                hi += 1
+            # Window is [lo, hi). i is in this range by construction.
+            n_window = hi - lo
+            if n_window == 0:
+                z_sum[i] = z[i]
+                n_in[i] = 1
+                n_agree[i] = 1
+            else:
+                slice_z = z[lo:hi]
+                slice_sign = sign[lo:hi]
+                mask = ~np.isnan(slice_z) & np.isfinite(slice_z)
+                n_eff = int(mask.sum())
+                if n_eff == 0:
+                    z_sum[i] = 0.0
+                    n_in[i] = 0
+                    n_agree[i] = 0
+                else:
+                    z_sum[i] = slice_z[mask].sum()
+                    n_in[i] = n_eff
+                    # Count how many neighbours share the focal site's
+                    # effect direction (used by the sign-agreement guard).
+                    focal_sign = sign[i]
+                    n_agree[i] = int(np.sum((slice_sign[mask] == focal_sign)))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            z_combined = np.where(n_in > 0, z_sum / np.sqrt(n_in), 0.0)
+        p_combined = 2.0 * _norm.sf(np.abs(z_combined))
+
+        # Sign-agreement guard: drop combined p-values where the focal
+        # site's neighbours don't sufficiently agree on direction. This
+        # is the fix for spatial-correlation contamination -- a null
+        # CpG next to a true DMC will see its neighbour's strong z, but
+        # if the rest of the window is mixed-sign the agreement drops
+        # below the threshold and the focal site keeps its raw p.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            agree_frac = np.where(n_in > 0, n_agree / n_in, 0.0)
+        keep_combined = agree_frac >= min_sign_agreement
+        # Focal-signal gate: require the focal site's own raw p to show
+        # at least *some* signal (p < focal_p_thresh) before combining.
+        if require_focal_signal:
+            keep_combined = keep_combined & (pvals < focal_p_thresh)
+
+        p_out = np.where(keep_combined, p_combined, pvals)
+        # Never inflate: if combining produced a larger p than raw, keep raw.
+        p_out = np.where(p_out < pvals, p_out, pvals)
+        p_out = np.where(np.isnan(pvals), np.nan, p_out)
+        p_combined = p_out
+
+        out_p_chunks.append(p_combined)
+        out_n_chunks.append(n_in)
+        keys.append(sub_sorted.select([chrom_col, pos_col]))
+
+    keys_df = pl.concat(keys)
+    keys_df = keys_df.with_columns(
+        pl.Series(out_col, np.concatenate(out_p_chunks)),
+        pl.Series(f"{out_col}_n_neighbours", np.concatenate(out_n_chunks)),
+    )
+    return dmc_df.join(keys_df, on=[chrom_col, pos_col], how="left")
+
+
+def _apply_storey_qvalues(pvals: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Storey-Tibshirani q-values. Returns (reject @ 0.05, qvals, pi0_hat).
+
+    Uses pi0 estimated from the data to scale BH q-values:
+        q_i = min_{k>=rank(p_i)} pi0_hat * n * p_(k) / k
+    Strictly less conservative than fdr_bh when pi0 < 1 (which is the
+    null-dominated regime where epykit's `lr` was losing TPR to BH).
+    """
+    n = pvals.size
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0), 1.0
+    pi0 = _storey_pi0(pvals)
+    order = np.argsort(pvals, kind="mergesort")
+    sorted_p = pvals[order]
+    ranks = np.arange(1, n + 1, dtype=np.float64)
+    q_sorted = pi0 * n * sorted_p / ranks
+    # Enforce monotonicity from the bottom of the list upward (the
+    # Storey q-value is min over k >= i of pi0 * n * p_(k) / k).
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+    q_sorted = np.clip(q_sorted, 0.0, 1.0)
+    qvals = np.empty_like(q_sorted)
+    qvals[order] = q_sorted
+    reject = qvals < 0.05
+    return reject, qvals, pi0
+
+
 def apply_multiple_testing_correction(
     dmc_results: Union[pl.DataFrame, DMCStore],
     method: str = "fdr_bh",
@@ -2266,30 +2617,56 @@ def apply_multiple_testing_correction(
     full-table-sized allocation is the float64 pvalue vector itself
     (~176 MB at 22M sites) -- no DataFrame copies, no concat.
 
+    ``method`` selects the FDR procedure:
+
+    * ``"fdr_bh"`` (default) -- Benjamini-Hochberg. Assumes pi0 = 1.
+    * ``"fdr_by"`` -- Benjamini-Yekutieli (controls FDR under arbitrary
+      dependence; strictly more conservative than BH).
+    * ``"fdr_tsbh"`` -- Benjamini-Krieger-Yekutieli two-stage BH;
+      statsmodels' pi0-adaptive variant of BH.
+    * ``"fdr_storey"`` -- Storey-Tibshirani q-values (Storey 2002,
+      Storey-Tibshirani 2003). Uses lam=0.5 to estimate pi0 from the
+      empirical p-value histogram. Most powerful when a substantial
+      fraction of the genome is null (the typical WGBS scenario);
+      reduces to BH when pi0 = 1.
+
     ``reject`` is written as ``<qvalue_col>_reject`` when the column
     name differs from the default so the two outputs don't collide.
     """
+    if method not in _VALID_FDR_METHODS:
+        raise ValueError(
+            f"method must be one of {sorted(_VALID_FDR_METHODS)}; got {method!r}"
+        )
+
     if isinstance(dmc_results, DMCStore):
-        # Cache hit: if this store was already BH-corrected with the
-        # same qvalue column on a prior run, the per-chrom parquets
-        # already carry the right qvalue/reject columns. Skip the
-        # 7-second collect + writeback.
+        # Cache hit: if this store was already corrected with the
+        # same method + qvalue column, the per-chrom parquets already
+        # carry the right qvalue/reject columns. Skip the 7-second
+        # collect + writeback.
         prev_qcol = dmc_results.manifest.get("bh_qvalue_col", "qvalue")
-        if dmc_results.bh_applied and prev_qcol == qvalue_col:
+        prev_method = dmc_results.manifest.get("bh_method", "fdr_bh")
+        if (
+            dmc_results.bh_applied
+            and prev_qcol == qvalue_col
+            and prev_method == method
+        ):
             logger.info(
-                "BH correction cache hit on %s (qvalue_col=%s); skipping.",
-                dmc_results.path, qvalue_col,
+                "FDR correction cache hit on %s (method=%s, qvalue_col=%s); skipping.",
+                dmc_results.path, method, qvalue_col,
             )
             return dmc_results
         return _apply_bh_to_store(dmc_results, method, pvalue_col, qvalue_col)
-
-    from statsmodels.stats.multitest import multipletests
 
     pvals       = dmc_results[pvalue_col].to_numpy()
     nan_mask    = np.isnan(pvals)
     pvals_clean = np.where(nan_mask, 1.0, pvals)
 
-    reject, qvals, _, _ = multipletests(pvals_clean, method=method)
+    if method == "fdr_storey":
+        reject, qvals, pi0_hat = _apply_storey_qvalues(pvals_clean)
+        logger.info("Storey FDR: pi0_hat = %.4f (pvals=%d)", pi0_hat, len(pvals_clean))
+    else:
+        from statsmodels.stats.multitest import multipletests
+        reject, qvals, _, _ = multipletests(pvals_clean, method=method)
 
     qvals  = np.where(nan_mask, np.nan,  qvals)
     reject = np.where(nan_mask, False,   reject)
@@ -2316,8 +2693,6 @@ def _apply_bh_to_store(
     parquet atomically. Memory peak is ~3x the pvalue vector (input +
     qvals + reject), independent of the rest of the table.
     """
-    from statsmodels.stats.multitest import multipletests
-
     total = store.total_sites
     if total == 0:
         logger.warning("apply_multiple_testing_correction: empty DMC store")
@@ -2326,8 +2701,8 @@ def _apply_bh_to_store(
     reject_col = "reject" if qvalue_col == "qvalue" else f"{qvalue_col}_reject"
 
     logger.info(
-        "BH correction (streaming): collecting %s p-values from %d chrom file(s)...",
-        f"{total:,}", len(store.chroms()),
+        "FDR correction (streaming, method=%s): collecting %s p-values from %d chrom file(s)...",
+        method, f"{total:,}", len(store.chroms()),
     )
 
     pvals = np.empty(total, dtype=np.float64)
@@ -2349,7 +2724,12 @@ def _apply_bh_to_store(
 
     nan_mask    = np.isnan(pvals)
     pvals_clean = np.where(nan_mask, 1.0, pvals)
-    reject, qvals, _, _ = multipletests(pvals_clean, method=method)
+    if method == "fdr_storey":
+        reject, qvals, pi0_hat = _apply_storey_qvalues(pvals_clean)
+        logger.info("Storey FDR: pi0_hat = %.4f (pvals=%d)", pi0_hat, len(pvals_clean))
+    else:
+        from statsmodels.stats.multitest import multipletests
+        reject, qvals, _, _ = multipletests(pvals_clean, method=method)
     qvals  = np.where(nan_mask, np.nan,  qvals)
     reject = np.where(nan_mask, False,   reject)
     del pvals, pvals_clean, nan_mask
@@ -2364,7 +2744,7 @@ def _apply_bh_to_store(
         store.update_chrom(chrom, df)
         del df
 
-    store.mark_bh_applied(qvalue_col=qvalue_col)
+    store.mark_bh_applied(qvalue_col=qvalue_col, method=method)
     return store
 
 

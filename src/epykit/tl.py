@@ -297,6 +297,14 @@ def dmc(
     use_smoothed: bool = False,
     smoothing: bool = False,
     smoothing_span_bp: int = 500,
+    # FDR procedure (since 0.7.1) ----------------------------------------
+    fdr_method: str = "fdr_bh",
+    # Neighbour-aware p-value combining (since 0.7.1) --------------------
+    neighbour_combine: bool = False,
+    neighbour_bp: int = 500,
+    # Separation-aware Fisher fallback (since 0.7.1) ---------------------
+    sep_fallback: bool = False,
+    sep_threshold: float = 0.9,
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -569,8 +577,10 @@ def dmc(
             return_store=True,
             smoothing=smoothing,
             smoothing_span_bp=smoothing_span_bp,
+            sep_fallback=sep_fallback,
+            sep_threshold=sep_threshold,
         )
-        dmc_store = apply_multiple_testing_correction(dmc_store, method="fdr_bh")
+        dmc_store = apply_multiple_testing_correction(dmc_store, method=fdr_method)
 
         # Materialise the full DataFrame for md.varm back-compat
         # (plot.py / report.py / pl modules consume md.dmc as a
@@ -578,6 +588,24 @@ def dmc(
         # roughly 700 MB at 22M rows vs. ~2 GB before -- manageable
         # alongside the per-chrom DMR working set.
         result = dmc_store.to_dataframe()
+
+        # Neighbour-aware p-value combining (RADMeth-style, since 0.7.1).
+        # When enabled, run the signed-Stouffer combiner over the per-CpG
+        # raw p-values, swap the combined p-value into the `pvalue` column
+        # (preserving the raw under `pvalue_raw`), and re-apply BH/Storey
+        # on the combined p-values. Sites without enough neighbours fall
+        # back to their raw p-value identity.
+        if neighbour_combine and len(result) > 0:
+            from .dmc import combine_neighbour_pvalues
+            result = combine_neighbour_pvalues(result, neighbour_bp=neighbour_bp)
+            result = result.with_columns(
+                pl.col("pvalue").alias("pvalue_raw"),
+                pl.col("qvalue").alias("qvalue_raw"),
+            ).with_columns(
+                pl.col("pvalue_combined").alias("pvalue"),
+            ).drop("pvalue_combined")
+            # Re-apply the same FDR method on the new pvalue column.
+            result = apply_multiple_testing_correction(result, method=fdr_method)
 
         if empirical_fdr and len(result) > 0:
             result = empirical_fdr_for_dmc(

@@ -194,11 +194,12 @@ class DMCStore:
         self._manifest.clear()
         self._manifest.update(payload)
 
-    def mark_bh_applied(self, qvalue_col: str = "qvalue") -> None:
+    def mark_bh_applied(self, qvalue_col: str = "qvalue", method: str = "fdr_bh") -> None:
         """Flip the manifest's ``bh_qvalues_applied`` flag and persist."""
         payload = dict(self._manifest)
         payload["bh_qvalues_applied"] = True
         payload["bh_qvalue_col"] = qvalue_col
+        payload["bh_method"] = method
         self.write_manifest(payload)
 
     def cleanup(self) -> None:

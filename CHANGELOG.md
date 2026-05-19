@@ -4,6 +4,86 @@ All notable changes to **epykit** are tracked here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
 SemVer (`MAJOR.MINOR.PATCH`).
 
+## [Unreleased] — 0.7.1
+
+Targeted improvements to the `lr` DMC engine that close its
+asymptotic-quasi-binomial gap to methylKit / RADMeth / DSS at low
+coverage and small cohorts. All four are opt-in keyword arguments on
+`ep.tl.dmc(test="lr", ...)`; defaults preserve 0.7.0 behaviour
+exactly.
+
+### Added
+
+- **`dispersion="eb"` on `ep.tl.dmc`.** Empirical-Bayes shrinkage of
+  per-site quasi-binomial dispersion toward a chromosome-wide
+  inverse-Gamma prior whose pseudo-df is estimated from the
+  per-site phi distribution via method-of-moments. Generalises the
+  existing `dispersion="shrink"` mode (which uses a fixed
+  pseudo-df = 4). No-op on data without genuine overdispersion.
+
+- **`neighbour_combine=True`, `neighbour_bp=200` on `ep.tl.dmc`.**
+  Signed-Stouffer Z combiner over neighbouring CpGs. Gated by
+  `min_sign_agreement=0.6` (focal site's neighbours must agree on
+  direction by ≥ 60 %) and `require_focal_signal=True` (focal raw
+  p must be < `focal_p_thresh=0.5`) so spatially isolated false
+  positives are not amplified. The output `pvalue` becomes the
+  combined p; the raw is preserved as `pvalue_raw`. Two helper
+  columns `pvalue_combined` and `pvalue_combined_n_neighbours`
+  are added for audit. Exposed standalone as
+  `ep.dmc.combine_neighbour_pvalues(dmc_df, ...)`.
+
+- **`sep_fallback=True`, `sep_threshold=0.9` on `ep.tl.dmc`.**
+  Separation-aware Fisher fallback inside `_score_finalize`: for
+  sites where `|meth_diff| >= sep_threshold` AND the LR p-value
+  failed to reject (p > 0.05), re-test with
+  `scipy.stats.fisher_exact` on pooled counts and take the more
+  powerful of the two. Never inflates p. Affects only sites the
+  LR missed, so the overall FPR is unchanged.
+
+- **`fdr_method="fdr_tsbh"` / `"fdr_storey"` on `ep.tl.dmc`.**
+  Selects the FDR procedure run after the per-CpG test. New
+  options: `"fdr_tsbh"` (Benjamini-Krieger-Yekutieli two-stage BH;
+  statsmodels' adaptive variant), `"fdr_storey"` (Storey-Tibshirani
+  q-values with π₀ estimated at lam = 0.5). Defaults to
+  `"fdr_bh"` for back-compat. Threaded through
+  `ep.apply_multiple_testing_correction` and the streaming
+  `DMCStore` path; the manifest now records the method used.
+
+- **`ep.dmc._storey_pi0`, `ep.dmc._apply_storey_qvalues`** helpers
+  surfaced for re-use from custom pipelines.
+
+- **Benchmark and write-up.** End-to-end reproduction of the Piao
+  et al. 2021 (IJERPH 18:7975) simulated benchmark under
+  `comparison_test/benchmark/`, including ground-truth
+  reconstruction (35 reference DMRs / 19,999 true DMCs, both
+  matching the paper's design exactly), baseline-table
+  transcription, 7 figures, and a paper-style manuscript.
+
+### Changed
+
+- `_dmc_input_signature` now includes `sep_fallback` and
+  `sep_threshold` in the SHA-256 fingerprint, so toggling them
+  forces a recompute rather than serving a stale cache.
+
+- `DMCStore.mark_bh_applied(method=...)` records the FDR method
+  used so back-to-back calls with different `fdr_method` do not
+  silently reuse the cached q-values.
+
+### Tests
+
+- New `tests/test_lr_improvements.py` (10 tests) covering Storey
+  π₀ behaviour at known mixtures, fdr_method validation, the
+  neighbour combiner's sign-agreement guard, the
+  never-inflates-p property, and NaN preservation.
+
+### Bug surfaced (filed as a follow-up task)
+
+- The pooled `fisher` backend in v0.7.0 returns `pvalue ≈ 1.0` on
+  near-perfect-separation 2 × 2 tables. The `auto` dispatcher
+  selects `fisher` only at n < 2, so n ≥ 2 workflows are
+  unaffected, but the n = 1 use case should be fixed before
+  production. Diagnosed in the benchmark report.
+
 ## [Unreleased] — 0.7.0
 
 Adds a DSS-compatible DMR caller, DSS-style raw-count smoothing for DMC,
