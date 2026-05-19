@@ -294,13 +294,13 @@ def fisher_exact_vectorized(
         with np.errstate(divide="ignore", invalid="ignore"):
             log2_or[valid] = np.where(odds_ratio > 0, np.log2(odds_ratio), np.nan)
 
-        pvals_valid = sp_stats.hypergeom.sf(
-            meth_a[valid] - 1,
-            total[valid],
-            col1[valid],
-            row1[valid],
-        )
-        pvals[valid] = np.minimum(2.0 * pvals_valid, 1.0)
+        ma = meth_a[valid]
+        t, c1, r1 = total[valid], col1[valid], row1[valid]
+        expected = r1.astype(np.float64) * c1.astype(np.float64) / t.astype(np.float64)
+        p_upper = sp_stats.hypergeom.sf(ma - 1, t, c1, r1)
+        p_lower = sp_stats.hypergeom.cdf(ma, t, c1, r1)
+        one_tail = np.where(ma >= expected, p_upper, p_lower)
+        pvals[valid] = np.minimum(2.0 * one_tail, 1.0)
 
     return pvals, log2_or
 
@@ -1600,6 +1600,15 @@ def _process_one_chromosome(
         # binomial model.
         all_samples = samples_case + samples_control
         n_samples = len(all_samples)
+        if n_samples < 6 and dispersion == "site":
+            logger.warning(
+                "[WARN]  bb_lr with n=%d total samples (df_resid=%d) has very "
+                "noisy per-site dispersion estimates. Promoting dispersion to "
+                "'shrink' to stabilise estimates. Consider test='lr' for "
+                "higher power.",
+                n_samples, n_samples - 2,
+            )
+            dispersion = "shrink"
         meth_stack = np.zeros((n_sites, n_samples), dtype=np.int32)
         cov_stack  = np.zeros((n_sites, n_samples), dtype=np.int32)
         # DSS-style smoothing (smoothing=True): per-sample uniform-box
@@ -1989,12 +1998,27 @@ def _validate_sample_size_and_warn(n_case: int, n_ctrl: int, test: str) -> None:
             "   Statistical power is very low. Many true positives will be missed.\n"
             "   Recommendation: Use n>=3 for reliable differential methylation calling."
         )
+    elif min_n <= 2 and test in ("welch_t", "beta_binomial"):
+        logger.warning(
+            "[WARN]  CRITICAL: welch_t with n=%d per group produces degenerate "
+            "Welch-Satterthwaite DOF and near-zero power. "
+            "Use test='lr' instead.",
+            min_n,
+        )
     elif min_n < 6 and test in ("welch_t", "beta_binomial"):
         logger.warning(
             "[WARN]  Welch t (test='welch_t', formerly 'beta_binomial') with "
             "n<6 may have poor variance estimates.\n"
             "   Consider using test='lr' (recommended) or test='bb_lr' "
             "(true quasi-binomial LRT)."
+        )
+
+    if test == "bb_lr" and min_n < 3:
+        logger.warning(
+            "[WARN]  bb_lr requires at least 3 replicates per group for "
+            "reliable dispersion estimation (got min_n=%d). "
+            "Use test='lr' instead.",
+            min_n,
         )
 
     if test == "fisher" and min_n >= 2:

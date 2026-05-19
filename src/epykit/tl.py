@@ -10,7 +10,10 @@ Public entry points: ``qc``, ``dmc``, ``dmr``, ``annotate``,
 from __future__ import annotations
 
 import gc
+import logging
 import polars as pl
+
+logger = logging.getLogger(__name__)
 
 from .annotate import annotate_cpg_islands, annotate_features, _GTF_CACHE
 from .dmc import (
@@ -275,7 +278,7 @@ def dmc(
     chromosomes: list[str] | None = None,
     min_samples_treatment: int | None = None,
     min_samples_control: int = 0,
-    dispersion: str = "site",
+    dispersion: str = "eb",
     reference: str = "adaptive",
     allow_n1: bool = False,
     # Section 1 of multi-group / continuous-covariate contrasts
@@ -305,6 +308,8 @@ def dmc(
     # Separation-aware Fisher fallback (since 0.7.1) ---------------------
     sep_fallback: bool = False,
     sep_threshold: float = 0.9,
+    # Power stack convenience (since 0.7.2) --------------------------------
+    power_stack: str | bool = False,
 ) -> None:
     """Run DMC calling and store result in md.varm['dmc_<test>'].
 
@@ -449,6 +454,29 @@ def dmc(
         md, allow_n1, min_samples_treatment, min_samples_control,
     )
     selected_test = _auto_test(md, allow_n1=allow_n1) if test == "auto" else test
+
+    # lr+ power-stack auto-engagement (since 0.7.2).
+    if power_stack == "auto" and selected_test == "lr":
+        _min_n = min(len(md.treatment_ids), len(md.control_ids))
+        if _min_n <= 2:
+            if not neighbour_combine:
+                neighbour_combine = True
+                logger.info(
+                    "Auto-enabling neighbour_combine (lr+ stack) for "
+                    "n=%d per group. Pass power_stack=False to disable.",
+                    _min_n,
+                )
+            if not sep_fallback:
+                sep_fallback = True
+                logger.info(
+                    "Auto-enabling sep_fallback (lr+ stack) for "
+                    "n=%d per group. Pass power_stack=False to disable.",
+                    _min_n,
+                )
+    elif power_stack is True:
+        neighbour_combine = True
+        sep_fallback = True
+
     if selected_test == "fisher":
         _warn_fisher_once()
     unite_info = md.uns.get("unite")
@@ -838,7 +866,7 @@ def _run_dmc_contrast(
 
 def dmr(
     md: MethylData,
-    method: str = "tile",
+    method: str = "chain_merge",
     # Parameter preset bundle (chain_merge only; see DMR_PRESETS) ----------
     preset: str | None = None,
     # Tile-method options ---------------------------------------------------
@@ -860,7 +888,7 @@ def dmr(
     min_cpgs: int = 5,
     min_sites_significant: int = 3,
     # Chain-merge options (DSS callDMR semantics) --------------------------
-    dis_merge_bp: int = 100,
+    dis_merge_bp: int = 500,
     pct_sig: float = 0.5,
     minlen_bp: int = 50,
     use_q_for_sig: bool = False,
@@ -879,6 +907,7 @@ def dmr(
     min_samples_case: int | None = None,  # deprecated alias
     backend: str = "sequential",
     n_workers: int | None = None,
+    merge_adjacent: bool = True,
 ) -> None:
     """Run DMR calling and store result in ``md.uns['dmr']``.
 
@@ -1010,6 +1039,7 @@ def dmr(
             coef_idx=coef_idx,
             backend=backend,
             n_workers=n_workers,
+            merge_adjacent=merge_adjacent,
         )
 
         # Optional q-value post-filter (the tile path already filtered at

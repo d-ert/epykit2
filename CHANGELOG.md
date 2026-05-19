@@ -4,6 +4,101 @@ All notable changes to **epykit** are tracked here. Format roughly follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses
 SemVer (`MAJOR.MINOR.PATCH`).
 
+## [Unreleased] — 0.7.2
+
+Eight targeted fixes identified by a full benchmark comparison against
+methylKit, DSS, RADMeth, BiSeq, methylSig, and Fisher (Piao et al.
+2021). Two bugs fixed, three default changes, three guardrail
+improvements. Existing user code that passes explicit parameters is
+unaffected; only implicit defaults change.
+
+### Fixed
+
+- **Fisher calibration bug (`dmc.py`).** `fisher_exact_vectorized`
+  computed only the upper tail via `hypergeom.sf(meth_a - 1, ...)`.
+  When group A had less methylation (hypo direction), `meth_a - 1`
+  could be -1, making `sf(-1, ...)` return 1.0. Fixed to compute both
+  tails and pick the correct one based on whether observed >= expected.
+  Fisher TPR went from 0.000 to 0.668-0.998 across all coverage levels.
+
+- **chain_merge DMR fragmentation (`dmr.py`).** Default `dis_merge_bp=100`
+  was too narrow for real genomic CpG spacing (median 100-200 bp in
+  dense regions, 500-1000 bp in intergenic/intronic). DMRs spanning
+  500-2000 bp with CpGs >100 bp apart were fragmented into 4-5 pieces.
+  Widened defaults: `strict` 100->250, `default` 100->500, `permissive`
+  200->1000, function default 100->500, `_SIG_DEFAULTS` 100->500.
+  chain_merge TPR went from 0.086 to 0.971-1.000.
+
+### Added
+
+- **`power_stack` parameter on `ep.tl.dmc` (default `False`).**
+  Pass `power_stack=True` to enable `neighbour_combine=True` and
+  `sep_fallback=True` (the lr+ stack) in one switch. Pass
+  `power_stack="auto"` to auto-enable the stack at n <= 2 replicates
+  per group. Default is `False` — no silent auto-engagement.
+
+- **Adjacent tile merging in `ep.tl.dmr(method="tile")`.**
+  `merge_adjacent` parameter (default `True`) on `call_dmr_tile_based`
+  merges adjacent significant tiles on the same chromosome with the same
+  direction via Stouffer Z-combination. P-values are re-corrected with
+  BH after merging. Pass `merge_adjacent=False` for exact old behaviour.
+
+- **bb_lr auto-shrink guardrail (`dmc.py`).** When `n_samples < 6` and
+  `dispersion="site"`, bb_lr auto-promotes to `dispersion="shrink"` with
+  a warning, since per-site dispersion from Pearson residuals with
+  `df_resid <= 4` is extremely noisy.
+
+- **`dispersion="eb"` support in bb_lr (`_glm.py`).** The bb_lr path
+  now accepts `dispersion="eb"` (empirical-Bayes shrinkage), matching
+  the lr engine. Previously bb_lr only accepted `site/chrom/shrink`
+  and raised `ValueError` on `"eb"`.
+
+### Changed
+
+- **`dispersion` default on `ep.tl.dmc` changed from `"site"` to
+  `"eb"`.** Empirical-Bayes shrinkage of per-site quasi-binomial
+  dispersion toward a chromosome-wide inverse-Gamma prior. At high n
+  (large per-site df), the weight on the per-site estimate dominates
+  and `"eb"` reduces to `"site"`. At low n, `"eb"` shrinks toward the
+  chromosome mean, stabilising noisy dispersion estimates without losing
+  site-level resolution. The change improves power at n <= 3 per group
+  on real WGBS data with heterogeneous overdispersion; on underdispersed
+  simulation data (Piao et al. 2021) it is a no-op (per-site phi is
+  clamped at 1.0 either way). Pass `dispersion="site"` to restore
+  exact pre-0.7.2 behaviour.
+
+- **`method` default on `ep.tl.dmr` changed from `"tile"` to
+  `"chain_merge"`.** On the Piao et al. 2021 DMR simulation,
+  chain_merge recovers 97-100% of truth DMRs at all coverage levels
+  while tile recovers 54-100%. chain_merge is also more adaptive to
+  irregular CpG spacing. The tile engine remains available via
+  `method="tile"`. Pass `method="tile"` to restore pre-0.7.2 behaviour.
+
+- **welch_t warning tiers (`dmc.py`).** Split `_validate_sample_size_and_warn`
+  into severity tiers: CRITICAL at `min_n <= 2` (degenerate
+  Welch-Satterthwaite DOF, near-zero power), softer warning at `min_n < 6`.
+
+- **bb_lr low-n warning (`dmc.py`).** Added specific warning when
+  `test="bb_lr"` and `min_n < 3`: recommends `test="lr"` instead.
+
+- **`dis_merge_bp` default in `ep.tl.dmr`** changed from 100 to 500 to
+  match the updated chain_merge defaults.
+
+- **Docstring tuning guidance in `dmr.py`** updated: "loosen dis_merge_bp
+  100 -> 200" changed to "500 -> 1000" to reflect the new defaults.
+
+### Tests
+
+- `test_primitives.py`: `test_fisher_reverse_separation_significant` and
+  `test_fisher_symmetry` covering the dual-tail Fisher fix.
+- `test_dmr_chain_merge.py`: `test_chain_merge_default_merges_300bp_gap`
+  verifying sig CpGs 300 bp apart chain at the new 500 bp default.
+- New `test_dmr_tile_merge.py` (6 tests): adjacent tile merging,
+  direction-aware non-merging, gap handling, multi-chromosome, three-way
+  merge, empty input.
+
+---
+
 ## [Unreleased] — 0.7.1
 
 Targeted improvements to the `lr` DMC engine that close its
@@ -76,13 +171,11 @@ exactly.
   neighbour combiner's sign-agreement guard, the
   never-inflates-p property, and NaN preservation.
 
-### Bug surfaced (filed as a follow-up task)
+### Bug surfaced (fixed in 0.7.2)
 
 - The pooled `fisher` backend in v0.7.0 returns `pvalue ≈ 1.0` on
-  near-perfect-separation 2 × 2 tables. The `auto` dispatcher
-  selects `fisher` only at n < 2, so n ≥ 2 workflows are
-  unaffected, but the n = 1 use case should be fixed before
-  production. Diagnosed in the benchmark report.
+  near-perfect-separation 2 × 2 tables. Fixed in 0.7.2 with a
+  dual-tail hypergeometric computation.
 
 ## [Unreleased] — 0.7.0
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import logging
+import math
 import tempfile
 from pathlib import Path
 from typing import Iterator, Union
@@ -637,7 +638,7 @@ DMR_PRESETS: dict[str, dict] = {
     # tolerate false positives (e.g. follow-up validation experiments).
     # Higher alpha bar, larger effect-size floor, more CpGs required.
     "strict": dict(
-        alpha=1e-6, min_abs_meth_diff=0.20, dis_merge_bp=100,
+        alpha=1e-6, min_abs_meth_diff=0.20, dis_merge_bp=250,
         min_cpgs=5, pct_sig=0.5, minlen_bp=100,
     ),
     # "default": balanced preset for general WGBS analyses. alpha=1e-4 is
@@ -649,7 +650,7 @@ DMR_PRESETS: dict[str, dict] = {
     # validation-ready DMRs (DSS-strict alpha) or 'permissive' for
     # exploratory / recall-oriented analyses.
     "default": dict(
-        alpha=1e-4, min_abs_meth_diff=0.10, dis_merge_bp=100,
+        alpha=1e-4, min_abs_meth_diff=0.10, dis_merge_bp=500,
         min_cpgs=3, pct_sig=0.5, minlen_bp=50,
     ),
     # "permissive": recall-oriented. Loosens alpha and the gap rule, drops
@@ -657,7 +658,7 @@ DMR_PRESETS: dict[str, dict] = {
     # set enrichment, or comparisons where false negatives are costlier
     # than false positives. Expect noticeably lower PPV.
     "permissive": dict(
-        alpha=1e-4, min_abs_meth_diff=0.05, dis_merge_bp=200,
+        alpha=1e-4, min_abs_meth_diff=0.05, dis_merge_bp=1000,
         min_cpgs=3, pct_sig=0.5, minlen_bp=50,
     ),
 }
@@ -669,7 +670,7 @@ def call_dmr_chain_merge(
     preset: str | None = None,
     alpha: float = 0.05,
     min_abs_meth_diff: float = 0.1,
-    dis_merge_bp: int = 100,
+    dis_merge_bp: int = 500,
     min_cpgs: int = 3,
     pct_sig: float = 0.5,
     minlen_bp: int = 50,
@@ -705,7 +706,7 @@ def call_dmr_chain_merge(
     Tuning guidance
     ---------------
     If recall is too low for your use case, **loosen ``dis_merge_bp``
-    first** (e.g. 100 -> 200). It's the single highest-leverage knob:
+    first** (e.g. 500 -> 1000). It's the single highest-leverage knob:
     CpG-poor intergenic and intronic regions need wider gap-merging just
     to recover real DMRs whose CpGs are spread out. Loosening
     ``dis_merge_bp`` typically gains 5-10 pp of recall for only ~6 pp of
@@ -778,7 +779,7 @@ def call_dmr_chain_merge(
         bundle = DMR_PRESETS[preset]
         # Default sentinels match the signature defaults above.
         _SIG_DEFAULTS = dict(
-            alpha=0.05, min_abs_meth_diff=0.1, dis_merge_bp=100,
+            alpha=0.05, min_abs_meth_diff=0.1, dis_merge_bp=500,
             min_cpgs=3, pct_sig=0.5, minlen_bp=50,
         )
         if alpha == _SIG_DEFAULTS["alpha"]:                       alpha = bundle["alpha"]
@@ -1019,6 +1020,61 @@ def _aggregate_sample_to_tiles(
     return tiled
 
 
+def _merge_adjacent_tiles(dmr_df: pl.DataFrame) -> pl.DataFrame:
+    """Merge adjacent significant tiles on the same chromosome with same direction."""
+    if dmr_df.is_empty():
+        return dmr_df
+
+    sorted_df = dmr_df.sort(["chrom", "start"])
+    rows = sorted_df.to_dicts()
+    merged: list[dict] = []
+    current: dict | None = None
+
+    for row in rows:
+        if current is None:
+            current = dict(row)
+            current["_count"] = 1
+            continue
+        if (
+            row["chrom"] == current["chrom"]
+            and row["start"] <= current["end"]
+            and row["dmr_type"] == current["dmr_type"]
+        ):
+            prev_n = current["_count"]
+            current["end"] = row["end"]
+            current["n_cpgs"] = current["n_cpgs"] + row["n_cpgs"]
+            for col in ("meth_diff", "log2_odds_ratio",
+                        "mean_beta_case", "mean_beta_control"):
+                if col in current and current[col] is not None and row.get(col) is not None:
+                    current[col] = (current[col] * prev_n + row[col]) / (prev_n + 1)
+            for col in ("n_case", "n_control"):
+                if col in current and current[col] is not None and row.get(col) is not None:
+                    current[col] = max(current[col], row[col])
+            z1 = sp_stats.norm.isf(max(current["pvalue"], 1e-300))
+            z2 = sp_stats.norm.isf(max(row["pvalue"], 1e-300))
+            current["pvalue"] = float(sp_stats.norm.sf(
+                (z1 + z2) / math.sqrt(2)
+            ))
+            current["_count"] = prev_n + 1
+        else:
+            merged.append(current)
+            current = dict(row)
+            current["_count"] = 1
+    if current is not None:
+        merged.append(current)
+
+    for m in merged:
+        m.pop("_count", None)
+
+    if not merged:
+        return dmr_df.clear()
+
+    result = pl.DataFrame(merged, schema=dmr_df.schema)
+    from .dmc import apply_multiple_testing_correction
+    result = apply_multiple_testing_correction(result, method="fdr_bh")
+    return result.sort(["chrom", "start"])
+
+
 def call_dmr_tile_based(
     methylstore_path: str,
     samples_treatment: list[str] | None = None,
@@ -1042,6 +1098,7 @@ def call_dmr_tile_based(
     min_samples_case: int | None = None,           # deprecated alias
     backend: str = "sequential",
     n_workers: int | None = None,
+    merge_adjacent: bool = True,
 ) -> pl.DataFrame:
     """Call DMRs by aggregating read counts within fixed-size tiles.
 
@@ -1242,6 +1299,9 @@ def call_dmr_tile_based(
         if extra in dmr_df.columns:
             out_cols.append(extra)
     dmr_df = dmr_df.select(out_cols).sort(["chrom", "start"])
+
+    if merge_adjacent:
+        dmr_df = _merge_adjacent_tiles(dmr_df)
 
     logger.info("Tile-based DMR: %s tiles -> %s significant DMRs",
                 f"{len(tile_dmc):,}", f"{len(dmr_df):,}")

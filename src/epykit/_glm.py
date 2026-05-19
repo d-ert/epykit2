@@ -517,9 +517,9 @@ def compute_dispersion_phi(
     phi_eff      (n_sites,) per-site dispersion used by the test
     phi_hat      scalar chromosome-pooled phi (logged / returned for audit)
     """
-    if dispersion not in {"site", "chrom", "shrink"}:
+    if dispersion not in {"site", "chrom", "shrink", "eb"}:
         raise ValueError(
-            f"dispersion must be 'site', 'chrom', or 'shrink'; got {dispersion!r}"
+            f"dispersion must be 'site', 'chrom', 'shrink', or 'eb'; got {dispersion!r}"
         )
 
     usable = (df_per_site > 0) & np.isfinite(pearson_per_site)
@@ -558,6 +558,29 @@ def compute_dispersion_phi(
 
     if dispersion == "site":
         return phi_site, phi_hat
+
+    if dispersion == "eb":
+        n_usable_eb = int(usable.sum())
+        if n_usable_eb >= min_disp_sites:
+            phi_obs = phi_site[usable]
+            m = float(np.mean(phi_obs))
+            v = float(np.var(phi_obs))
+            if v > 1e-9 and m > 0:
+                a_mom = m * m / v + 2.0
+                w_eb = max(1.0, 2.0 * a_mom)
+            else:
+                w_eb = float(shrink_pseudo_df)
+        else:
+            w_eb = float(shrink_pseudo_df)
+        num = df_safe * phi_site + w_eb * phi_hat
+        den = df_safe + w_eb
+        phi_eff = np.maximum(num / den, min_dispersion)
+        phi_eff = np.where(usable, phi_eff, phi_hat)
+        logger.info(
+            "%s: bb_lr empirical-Bayes shrinkage w_eb=%.2f",
+            chrom_name, w_eb,
+        )
+        return phi_eff, phi_hat
 
     # shrink
     w = float(shrink_pseudo_df)

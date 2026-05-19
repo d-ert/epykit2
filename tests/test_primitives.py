@@ -50,6 +50,30 @@ def test_fisher_identical_groups_not_significant():
     assert pvals[0] > 0.5
 
 
+def test_fisher_reverse_separation_significant():
+    """All-unmethylated A vs all-methylated B (hypo direction) must be significant."""
+    from epykit.dmc import fisher_exact_vectorized
+    pvals, _ = fisher_exact_vectorized(
+        np.array([0]),  np.array([50]),
+        np.array([50]), np.array([0]),
+    )
+    assert pvals[0] < 1e-5
+
+
+def test_fisher_symmetry():
+    """Swapping group A and B should yield the same p-value."""
+    from epykit.dmc import fisher_exact_vectorized
+    p_fwd, _ = fisher_exact_vectorized(
+        np.array([50]), np.array([0]),
+        np.array([0]),  np.array([50]),
+    )
+    p_rev, _ = fisher_exact_vectorized(
+        np.array([0]),  np.array([50]),
+        np.array([50]), np.array([0]),
+    )
+    np.testing.assert_allclose(p_fwd, p_rev, rtol=1e-10)
+
+
 def test_fisher_degenerate_row_returns_nan():
     """A row with zero total in one group should yield NaN p-value."""
     from epykit.dmc import fisher_exact_vectorized

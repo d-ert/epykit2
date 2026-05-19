@@ -59,6 +59,24 @@ def test_chain_links_within_dis_merge():
     assert out["dmr_type"][0] == "hyper"
 
 
+def test_chain_merge_default_merges_300bp_gap():
+    """Sig CpGs 300 bp apart should chain at the default dis_merge_bp=500."""
+    df = _mk_dmc_frame([
+        {"chrom": "chr1", "pos": 100,  "meth_diff": 0.30, "pvalue": 1e-4},
+        {"chrom": "chr1", "pos": 400,  "meth_diff": 0.30, "pvalue": 1e-4},
+        {"chrom": "chr1", "pos": 700,  "meth_diff": 0.30, "pvalue": 1e-4},
+        {"chrom": "chr1", "pos": 1000, "meth_diff": 0.30, "pvalue": 1e-4},
+    ])
+    out = call_dmr_chain_merge(
+        df,
+        alpha=1e-3, min_abs_meth_diff=0.0,
+        min_cpgs=3, pct_sig=0.5, minlen_bp=50,
+    )
+    assert len(out) == 1
+    assert out["start"][0] == 100
+    assert out["end"][0] == 1001
+
+
 def test_chain_breaks_beyond_dis_merge():
     """A 200 bp gap between sig CpGs breaks the chain when dis_merge_bp=100."""
     df = _mk_dmc_frame([
