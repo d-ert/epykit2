@@ -1,0 +1,120 @@
+site_name: epykit
+site_description: "A Python-native WGBS methylation analysis pipeline built on Parquet partitioning and lazy I/O"
+repo_name: epykit
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - getting-started/installation.md
+    - getting-started/quickstart.md
+    - getting-started/concepts.md
+    - getting-started/samplesheet.md
+  - I/O:
+    - io/index.md
+    - Bismark: io/read-bismark.md
+    - MethylDackel: io/read-methyldackel.md
+    - Combined-strand BED: io/read-combined-strand-bed.md
+    - nf-core/methylseq: io/read-nfcore.md
+    - Load & Save: io/load-save.md
+  - Preprocessing:
+    - preprocessing/index.md
+    - Filter Coverage: preprocessing/filter-coverage.md
+    - Normalize Coverage: preprocessing/normalize-coverage.md
+    - Unite Sites: preprocessing/unite.md
+    - Smoothing: preprocessing/smooth.md
+    - Aggregate Regions: preprocessing/aggregate-regions.md
+  - Analysis:
+    - analysis/index.md
+    - Quality Control: analysis/qc.md
+    - DMC Calling: analysis/dmc.md
+    - "lr+ Power Stack": analysis/lr-plus.md
+    - Covariate & Multi-group: analysis/covariates.md
+    - DMR Calling: analysis/dmr.md
+    - Differential Variability: analysis/dvc.md
+    - Annotation: analysis/annotate.md
+    - Epigenetic Age Clocks: analysis/age-clock.md
+    - Cell-type Deconvolution: analysis/deconvolve.md
+    - Allele-specific Methylation: analysis/asm.md
+    - Methylation Entropy: analysis/entropy.md
+    - Partially Methylated Domains: analysis/pmd.md
+    - HMR / LMR Calling: analysis/hmr.md
+  - Plotting:
+    - plotting/index.md
+    - Differential Plots: plotting/differential.md
+    - QC Plots: plotting/qc-plots.md
+    - Clustering & Embedding: plotting/clustering.md
+    - Metaplots: plotting/metaplots.md
+    - Genomic Context: plotting/genomic.md
+    - DMR Plots: plotting/dmr-plots.md
+    - Annotation Plots: plotting/annotation-plots.md
+    - Figure Grid: plotting/figure-grid.md
+  - Query:
+    - query/index.md
+  - Export & Interop:
+    - export/index.md
+    - Genome Browsers: export/genome-browsers.md
+    - AnnData / MuData: export/anndata.md
+    - methylKit Tabix: export/methylkit.md
+    - MultiQC: export/multiqc.md
+    - HTML Report: export/html-report.md
+  - CLI Reference: cli/index.md
+  - Advanced:
+    - advanced/methylstore.md
+    - Low-level Engines: advanced/low-level-engines.md
+    - Distributed Backends: advanced/distributed.md
+    - Imputation: advanced/imputation.md
+    - Effect-size Shrinkage: advanced/shrinkage.md
+  - Cookbook:
+    - cookbook/end-to-end.md
+    - Choosing a DMC Test: cookbook/comparing-dmc-tests.md
+    - nf-core Integration: cookbook/nfcore-integration.md
+  - Reference:
+    - MethylData API: reference/methyldata.md
+    - Changelog: reference/changelog.md
