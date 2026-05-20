@@ -56,6 +56,8 @@ from ._dmc_store import DMCStore, _chrom_filename
 
 logger = logging.getLogger(__name__)
 
+_SMOOTH_BOX_NJIT_FN = None
+
 _EMPTY_SCHEMA = {
     "chrom":             pl.Utf8,
     "pos":               pl.Int32,
@@ -512,6 +514,53 @@ def _score_update(
     n_valid += valid.astype(np.int32)
 
 
+def _smooth_box_kernel_py(
+    pos:      np.ndarray,
+    cum_meth: np.ndarray,
+    cum_cov:  np.ndarray,
+    half:     int,
+    n:        int,
+    meth_sm:  np.ndarray,
+    cov_sm:   np.ndarray,
+    meth_raw: np.ndarray,
+    cov_raw:  np.ndarray,
+) -> None:
+    """Two-pointer sweep for box smoothing (pure-Python / numba target)."""
+    lo = 0
+    hi = 0
+    for i in range(n):
+        anchor = pos[i]
+        while lo < n and (anchor - pos[lo]) > half:
+            lo += 1
+        if hi < lo:
+            hi = lo
+        while hi < n and (pos[hi] - anchor) <= half:
+            hi += 1
+        n_window = hi - lo
+        if n_window <= 0:
+            meth_sm[i] = float(meth_raw[i])
+            cov_sm[i]  = float(cov_raw[i])
+        else:
+            meth_sm[i] = (cum_meth[hi] - cum_meth[lo]) / n_window
+            cov_sm[i]  = (cum_cov[hi]  - cum_cov[lo])  / n_window
+
+
+def _smooth_box_make_njit():
+    """Build and cache the numba-compiled smoothing kernel."""
+    global _SMOOTH_BOX_NJIT_FN
+    if _SMOOTH_BOX_NJIT_FN is not None:
+        return _SMOOTH_BOX_NJIT_FN
+    try:
+        from numba import njit
+    except ImportError:
+        njit = None
+    if njit is not None:
+        _SMOOTH_BOX_NJIT_FN = njit(cache=True)(_smooth_box_kernel_py)
+    else:
+        _SMOOTH_BOX_NJIT_FN = _smooth_box_kernel_py
+    return _SMOOTH_BOX_NJIT_FN
+
+
 def _smooth_sample_counts_box(
     meth:       np.ndarray,
     cov:        np.ndarray,
@@ -530,7 +579,7 @@ def _smooth_sample_counts_box(
 
     Implementation mirrors DSS's ``nitem.c`` + ``filter.c``: a single
     cumulative-sum pass plus a two-pointer sweep over sorted positions.
-    O(n) total.
+    O(n) total. The sweep is compiled via ``numba.njit`` when available.
 
     Parameters
     ----------
@@ -558,7 +607,6 @@ def _smooth_sample_counts_box(
     half = int(window_bp) // 2
     pos  = positions.astype(np.int64, copy=False)
 
-    # Cumulative sums: cum[k] = sum of x[0..k-1]; cum[hi] - cum[lo] = sum of x[lo..hi-1].
     cum_meth = np.empty(n + 1, dtype=np.int64)
     cum_cov  = np.empty(n + 1, dtype=np.int64)
     cum_meth[0] = 0
@@ -569,26 +617,9 @@ def _smooth_sample_counts_box(
     meth_sm = np.empty(n, dtype=np.float64)
     cov_sm  = np.empty(n, dtype=np.float64)
 
-    lo = 0
-    hi = 0
-    for i in range(n):
-        anchor = pos[i]
-        # Advance lo until positions[lo] is within the left half-window.
-        while lo < n and (anchor - pos[lo]) > half:
-            lo += 1
-        # Advance hi past every position within the right half-window.
-        if hi < lo:
-            hi = lo
-        while hi < n and (pos[hi] - anchor) <= half:
-            hi += 1
-        n_window = hi - lo
-        if n_window <= 0:
-            # Degenerate (shouldn't happen -- the anchor itself is in window).
-            meth_sm[i] = float(meth[i])
-            cov_sm[i]  = float(cov[i])
-            continue
-        meth_sm[i] = (cum_meth[hi] - cum_meth[lo]) / n_window
-        cov_sm[i]  = (cum_cov[hi]  - cum_cov[lo])  / n_window
+    kernel = _smooth_box_make_njit()
+    kernel(pos, cum_meth, cum_cov, half, n, meth_sm, cov_sm,
+           meth.astype(np.float64), cov.astype(np.float64))
 
     return meth_sm, cov_sm
 
@@ -1164,8 +1195,15 @@ def _intersect_chrom(
     on `pos` would multiply rows downstream -- silently breaking the
     one-row-per-site contract that _load_sample_chrom relies on.
     """
-    intersect: Optional[pl.DataFrame] = None
+    _empty = pl.DataFrame({
+        "pos":    pl.Series([], dtype=pl.Int32),
+        "strand": pl.Series([], dtype=pl.Utf8),
+    })
+    n_samples = len(samples)
+    if n_samples == 0:
+        return _empty
 
+    site_dfs: list[pl.DataFrame] = []
     for sample in samples:
         part_file = (
             methylstore_path / f"sample={sample}" / f"chrom={chrom}" / "part-0.parquet"
@@ -1175,53 +1213,39 @@ def _intersect_chrom(
                 "  Sample '%s' missing %s; chromosome excluded from intersection",
                 sample, chrom,
             )
-            return pl.DataFrame({
-                "pos":    pl.Series([], dtype=pl.Int32),
-                "strand": pl.Series([], dtype=pl.Utf8),
-            })
-
-        # dedupe on pos to prevent duplicate-row blow-up from unmerged
-        # +/- strand pairs of a single CpG dinucleotide.
-        sites = (
+            return _empty
+        site_dfs.append(
             pl.read_parquet(str(part_file), columns=["pos", "strand"])
             .unique(subset=["pos"], keep="first")
         )
 
-        if intersect is None:
-            intersect = sites
-        else:
-            # Join on pos only to avoid strand-value mismatches between
-            # samples converted with and without a reference FASTA.
-            # Keep the strand column from the left frame; if it is "*",
-            # prefer the right frame's value (may carry real strand info).
-            intersect = (
-                intersect
-                .join(sites.rename({"strand": "_strand_r"}), on="pos", how="inner")
-                .with_columns(
-                    pl.when(pl.col("strand") == "*")
-                    .then(pl.col("_strand_r"))
-                    .otherwise(pl.col("strand"))
-                    .alias("strand")
-                )
-                .drop("_strand_r")
-            )
+    combined = pl.concat(site_dfs)
+    intersected = (
+        combined
+        .group_by("pos")
+        .agg([
+            pl.len().alias("_n"),
+            pl.col("strand").filter(pl.col("strand") != "*").first().alias("_strand_real"),
+            pl.col("strand").first().alias("_strand_fb"),
+        ])
+        .filter(pl.col("_n") == n_samples)
+        .with_columns(
+            pl.when(pl.col("_strand_real").is_not_null())
+            .then(pl.col("_strand_real"))
+            .otherwise(pl.col("_strand_fb"))
+            .alias("strand")
+        )
+        .select(["pos", "strand"])
+        .sort("pos")
+    )
 
-        if len(intersect) == 0:
-            logger.warning(
-                "  Intersection is empty after adding sample '%s' on %s. "
-                "Check strand consistency across samples.", sample, chrom,
-            )
-            break
+    if len(intersected) == 0:
+        logger.warning(
+            "  Intersection is empty on %s. "
+            "Check strand consistency across samples.", chrom,
+        )
 
-    if intersect is None:
-        return pl.DataFrame({
-            "pos":    pl.Series([], dtype=pl.Int32),
-            "strand": pl.Series([], dtype=pl.Utf8),
-        })
-
-    # belt-and-braces dedupe in case a left-frame pos had multiple
-    # right-frame strand variants after a join.
-    return intersect.unique(subset=["pos"], keep="first").sort("pos")
+    return intersected
 
 
 def _union_chrom(
@@ -1273,16 +1297,15 @@ def _load_sample_chrom(
             np.zeros(n_sites, dtype=np.int32),
         )
 
-    df = (
-        pl.read_parquet(str(part_file), columns=["pos", "N_meth", "coverage"])
-        # collapse any duplicate-pos rows by summing reads so the
-        # left-join below yields exactly one row per canonical position.
-        .group_by("pos")
-        .agg([
-            pl.sum("N_meth").alias("N_meth"),
-            pl.sum("coverage").alias("coverage"),
-        ])
-    )
+    df = pl.read_parquet(str(part_file), columns=["pos", "N_meth", "coverage"])
+    if df.height != df["pos"].n_unique():
+        df = (
+            df.group_by("pos")
+            .agg([
+                pl.sum("N_meth").alias("N_meth"),
+                pl.sum("coverage").alias("coverage"),
+            ])
+        )
     aligned = canonical_pos.join(df, on="pos", how="left").fill_null(0)
 
     return (
